@@ -1,0 +1,21 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - run: cargo fmt --check
+      - run: cargo test
+      - run: python3 -m py_compile archbridge-gui.py
+      - run: python3 -m unittest tests/source_contract.py

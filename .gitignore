@@ -1,0 +1,16 @@
+# Local source/reference artifacts
+main.txt
+main.tex
+ui/
+stitch_ui_clone_generator/
+context.md
+
+# Build and Python-generated files
+target/
+__pycache__/
+*.py[cod]
+
+# Desktop and editor-local metadata
+.directory
+.codex/
+.agents/
