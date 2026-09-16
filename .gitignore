@@ -4,6 +4,7 @@ main.tex
 ui/
 stitch_ui_clone_generator/
 context.md
+/.md
 
 # Build and Python-generated files
 target/
