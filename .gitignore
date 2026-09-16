@@ -5,6 +5,7 @@ ui/
 stitch_ui_clone_generator/
 context.md
 /.md
+/EXPLANATION.md
 
 # Build and Python-generated files
 target/
