@@ -1,0 +1,60 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and publish release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Run validation gates
+        run: |
+          cargo fmt --check
+          cargo test
+          python3 -m py_compile archbridge-gui.py
+          python3 -m unittest tests/source_contract.py
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Package release files
+        run: |
+          version="${GITHUB_REF_NAME}"
+          bundle="archbridge-${version}-linux-x86_64"
+          mkdir "$bundle"
+          cp target/release/archbridge "$bundle/"
+          cp archbridge-gui.py README.md LICENSE "$bundle/"
+          tar -czf "${bundle}.tar.gz" "$bundle"
+          sha256sum "${bundle}.tar.gz" > "${bundle}.tar.gz.sha256"
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${GITHUB_REF_NAME}"
+          bundle="archbridge-${version}-linux-x86_64"
+          gh release create "$version" \
+            "${bundle}.tar.gz" \
+            "${bundle}.tar.gz.sha256" \
+            --title "ArchBridge ${version}" \
+            --generate-notes
