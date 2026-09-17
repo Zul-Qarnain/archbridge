@@ -2357,11 +2357,43 @@ class ArchBridgeWindow(QMainWindow):
                     self.cached_sudo_password = None
                     self.has_saved_sudo = False
                     self.update_sudo_ui_status()
-                QMessageBox.information(
-                    self,
-                    "Package Removed" if action == "uninstall" else "Installation Complete",
-                    result.get("message", "Success"),
-                )
+                # Refresh desktop database & menu caches automatically on the host
+                try:
+                    subprocess.run(["update-desktop-database", os.path.expanduser("~/.local/share/applications")], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    subprocess.run(["update-desktop-database", "/usr/share/applications"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    subprocess.run(["kbuildsycoca6"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                except Exception:
+                    pass
+
+                # Detect if there is a primary executable installed to offer direct launch
+                exec_cmd = None
+                if action == "install" and hasattr(self, "current_built_package"):
+                    pkg_base = os.path.basename(self.current_built_package or "")
+                    m = re.match(r"^([a-zA-Z0-9_\-]+?)-\d", pkg_base)
+                    pkg_name = m.group(1) if m else ""
+                    if pkg_name and shutil.which(pkg_name):
+                        exec_cmd = pkg_name
+
+                if action == "install" and exec_cmd:
+                    box = QMessageBox(self)
+                    box.setWindowTitle("Installation Complete")
+                    box.setText(
+                        f"<h3 style='color:#10b981; margin:0;'>Installation Successful!</h3><br>"
+                        f"The package <b>{exec_cmd}</b> has been installed on your system.<br><br>"
+                        f"Would you like to launch <b>{exec_cmd}</b> now?"
+                    )
+                    btn_launch = box.addButton(f"▶ Launch {exec_cmd}", QMessageBox.ButtonRole.AcceptRole)
+                    btn_close = box.addButton("Close", QMessageBox.ButtonRole.RejectRole)
+                    box.setDefaultButton(btn_launch)
+                    box.exec()
+                    if box.clickedButton() == btn_launch:
+                        subprocess.Popen([exec_cmd])
+                else:
+                    QMessageBox.information(
+                        self,
+                        "Package Removed" if action == "uninstall" else "Installation Complete",
+                        result.get("message", "Success"),
+                    )
                 if hasattr(self, "reload_uninstall_packages"):
                     self.reload_uninstall_packages()
         else:
