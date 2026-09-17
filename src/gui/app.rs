@@ -107,12 +107,13 @@ impl ArchBridgeApp {
             .output()
         {
             let text = String::from_utf8_lossy(&out.stdout);
-            for line in text.lines().take(50) {
+            for line in text.lines() {
                 let parts: Vec<&str> = line.split_whitespace().collect();
                 if !parts.is_empty() {
                     let name = parts[0].to_string();
                     let version = parts.get(1).copied().unwrap_or("").to_string();
                     let desc = match name.as_str() {
+                        "grok-bot" => "Grok Bot desktop agent",
                         "alacritty" => "A cross-platform, GPU-accelerated terminal emulator",
                         "accountsservice" => "D-Bus interface for user account query and manipulation",
                         "antigravity" => "Google Antigravity multi-agent orchestration platform",
