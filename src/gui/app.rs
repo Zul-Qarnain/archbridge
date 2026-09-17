@@ -45,6 +45,56 @@ impl ArchBridgeApp {
         };
 
         app.reload_installed();
+
+        if let Ok(tab) = std::env::var("ARCHBRIDGE_START_TAB") {
+            match tab.to_lowercase().as_str() {
+                "discovery" => app.state.active_tab = ActiveTab::Discover,
+                "inspect" => app.state.active_tab = ActiveTab::Inspect,
+                "build" => app.state.active_tab = ActiveTab::Build,
+                "uninstall" => app.state.active_tab = ActiveTab::Uninstall,
+                "doctor" => app.state.active_tab = ActiveTab::Doctor,
+                "settings" => app.state.active_tab = ActiveTab::Settings,
+                _ => {}
+            }
+        }
+
+        if let Ok(query) = std::env::var("ARCHBRIDGE_SEARCH_SAMPLE") {
+            app.state.search_query = query.clone();
+            if !app.state.search_history.contains(&query) {
+                app.state.search_history.insert(0, query.clone());
+            }
+            app.state.search_results = vec![
+                SearchResult {
+                    name: "vlc".into(),
+                    version: "3.0.21-1".into(),
+                    description: "Multi-platform MPEG, VCD/DVD, and DivX player".into(),
+                    source: "official".into(),
+                    score: 1.0,
+                    repo: "extra".into(),
+                    is_recommended: true,
+                    license: "GPL-2.0-or-later LGPL-2.1-or-later".into(),
+                    arch: "x86_64".into(),
+                    size: "41.97 MiB".into(),
+                    maintainer: "Christian Heusel <gromit@archlinux.org>".into(),
+                },
+                SearchResult {
+                    name: "org.videolan.VLC".into(),
+                    version: "3.0.21".into(),
+                    description: "VLC media player flatpak release".into(),
+                    source: "flatpak".into(),
+                    score: 0.90,
+                    repo: "Flathub".into(),
+                    is_recommended: false,
+                    license: "GPL-2.0+".into(),
+                    arch: "x86_64".into(),
+                    size: "82.4 MiB".into(),
+                    maintainer: "VideoLAN Organization".into(),
+                },
+            ];
+            app.state.selected_result = Some(0);
+            app.state.recommended_item = app.state.search_results.first().cloned();
+        }
+
         app
     }
 
@@ -669,14 +719,22 @@ impl Render for ArchBridgeApp {
             .child(
                 div()
                     .flex_1()
+                    .h_full()
                     .flex()
                     .flex_col()
                     .bg(rgb(BG_DARK))
                     .min_w(px(0.0))
                     .p_5()
-                    .gap_4()
-                    // Top Bar Surface with 4 Cells
-                    .child(render_top_bar(self, cx))
+                    .gap_3()
+                    // Top Bar Surface with 4 Cells (fixed height, left-aligned)
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .justify_start()
+                            .child(render_top_bar(self, cx)),
+                    )
                     // Active Tab View Content
                     .child(
                         div()
@@ -697,38 +755,39 @@ impl Render for ArchBridgeApp {
 
 fn render_top_bar(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> impl IntoElement {
     div()
-        .w_full()
-        .bg(rgb(0x0c1829))
+        .flex_none()
+        .h(px(54.0))
+        .bg(rgb(0x09101d))
         .border_1()
-        .border_color(rgb(0x1c304a))
+        .border_color(rgb(0x16243b))
         .rounded_xl()
-        .p_1_5()
+        .px_3()
+        .py_1()
         .flex()
+        .flex_row()
         .items_center()
-        .justify_between()
-        .gap_2()
+        .gap_3()
         // Cell 1: Engine Ready
         .child(
             div()
-                .flex_1()
-                .h(px(48.0))
+                .h(px(40.0))
                 .px_3()
                 .rounded_lg()
-                .bg(rgb(0x0f1a2a))
+                .bg(rgb(0x0c1626))
                 .flex()
                 .items_center()
-                .gap_3()
+                .gap_2_5()
                 .child(
                     div()
-                        .w(px(28.0))
-                        .h(px(28.0))
+                        .w(px(26.0))
+                        .h(px(26.0))
                         .rounded_md()
-                        .bg(rgb(0x133026))
+                        .bg(rgb(0x0f2b24))
                         .flex()
                         .items_center()
                         .justify_center()
                         .text_color(rgb(ACCENT_GREEN))
-                        .text_size(px(14.0))
+                        .text_size(px(13.0))
                         .child("⚯"),
                 )
                 .child(
@@ -754,11 +813,10 @@ fn render_top_bar(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> i
         .child(
             div()
                 .id("history-cell")
-                .flex_1()
-                .h(px(48.0))
+                .h(px(40.0))
                 .px_3()
                 .rounded_lg()
-                .bg(rgb(0x0f1a2a))
+                .bg(rgb(0x0c1626))
                 .cursor_pointer()
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.state.show_history_menu = !this.state.show_history_menu;
@@ -766,18 +824,18 @@ fn render_top_bar(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> i
                 }))
                 .flex()
                 .items_center()
-                .gap_3()
+                .gap_2_5()
                 .child(
                     div()
-                        .w(px(28.0))
-                        .h(px(28.0))
+                        .w(px(26.0))
+                        .h(px(26.0))
                         .rounded_md()
-                        .bg(rgb(0x14253d))
+                        .bg(rgb(0x102138))
                         .flex()
                         .items_center()
                         .justify_center()
                         .text_color(rgb(ACCENT_CYAN))
-                        .text_size(px(13.0))
+                        .text_size(px(12.0))
                         .child("🕒"),
                 )
                 .child(
@@ -806,25 +864,24 @@ fn render_top_bar(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> i
         // Cell 3: System Ready
         .child(
             div()
-                .flex_1()
-                .h(px(48.0))
+                .h(px(40.0))
                 .px_3()
                 .rounded_lg()
-                .bg(rgb(0x0f1a2a))
+                .bg(rgb(0x0c1626))
                 .flex()
                 .items_center()
-                .gap_3()
+                .gap_2_5()
                 .child(
                     div()
-                        .w(px(28.0))
-                        .h(px(28.0))
+                        .w(px(26.0))
+                        .h(px(26.0))
                         .rounded_md()
-                        .bg(rgb(0x133026))
+                        .bg(rgb(0x0f2b24))
                         .flex()
                         .items_center()
                         .justify_center()
                         .text_color(rgb(ACCENT_GREEN))
-                        .text_size(px(13.0))
+                        .text_size(px(12.0))
                         .child("🛡️"),
                 )
                 .child(
@@ -836,7 +893,7 @@ fn render_top_bar(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> i
                                 .text_color(rgb(TEXT_PRIMARY))
                                 .text_size(px(11.0))
                                 .font_weight(FontWeight::BOLD)
-                                .child("System ready"),
+                                .child(if app.state.doctor_ready { "System ready" } else { "System warning" }),
                         )
                         .child(
                             div()
@@ -850,11 +907,10 @@ fn render_top_bar(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> i
         .child(
             div()
                 .id("sudo-cell")
-                .flex_1()
-                .h(px(48.0))
+                .h(px(40.0))
                 .px_3()
                 .rounded_lg()
-                .bg(rgb(0x0f1a2a))
+                .bg(rgb(0x0c1626))
                 .cursor_pointer()
                 .on_click(cx.listener(|this, _, _, cx| {
                     if this.state.sudo_session_active {
@@ -870,18 +926,18 @@ fn render_top_bar(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> i
                 }))
                 .flex()
                 .items_center()
-                .gap_3()
+                .gap_2_5()
                 .child(
                     div()
-                        .w(px(28.0))
-                        .h(px(28.0))
+                        .w(px(26.0))
+                        .h(px(26.0))
                         .rounded_md()
-                        .bg(if app.state.sudo_session_active { rgb(0x133026) } else { rgb(0x2d1a1a) })
+                        .bg(if app.state.sudo_session_active { rgb(0x0f2b24) } else { rgb(0x24151b) })
                         .flex()
                         .items_center()
                         .justify_center()
                         .text_color(if app.state.sudo_session_active { rgb(ACCENT_GREEN) } else { rgb(0x94a3b8) })
-                        .text_size(px(13.0))
+                        .text_size(px(12.0))
                         .child("🔒"),
                 )
                 .child(
@@ -911,7 +967,8 @@ fn render_top_bar(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> i
 
 fn render_sidebar(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> impl IntoElement {
     div()
-        .w(px(230.0))
+        .w(px(215.0))
+        .flex_none()
         .h_full()
         .bg(rgb(0x080d16))
         .border_r_1()
@@ -1329,46 +1386,50 @@ fn render_discover(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> 
                         .flex()
                         .flex_col()
                         .gap_3()
-                        .child(section_header("Available Sources"))
-                        .child(if !has_results {
+                        .child(
                             div()
-                                .w_full()
-                                .h(px(220.0))
-                                .border_1()
-                                .border_color(rgb(0x16263b))
-                                .rounded_xl()
                                 .flex()
-                                .flex_col()
                                 .items_center()
-                                .justify_center()
-                                .gap_2()
-                                .child(div().text_size(px(24.0)).child("🔍"))
+                                .justify_between()
                                 .child(
                                     div()
+                                        .text_color(rgb(TEXT_PRIMARY))
+                                        .text_size(px(14.0))
+                                        .font_weight(FontWeight::BOLD)
+                                        .child("Available Sources"),
+                                )
+                                .child(
+                                    div()
+                                        .px_3()
+                                        .py_1()
+                                        .rounded_lg()
+                                        .border_1()
+                                        .border_color(rgb(0x1c304a))
                                         .text_color(rgb(TEXT_MUTED))
-                                        .text_size(px(13.0))
-                                        .child("Enter a package name or select a suggestion above to search."),
-                                )
-                                .into_any_element()
-                        } else {
-                            div()
-                                .id("sources-cards-container")
-                                .w_full()
-                                .flex()
-                                .flex_col()
-                                .gap_2_5()
-                                .children(
-                                    app.state
-                                        .search_results
-                                        .iter()
-                                        .enumerate()
-                                        .map(|(i, result)| {
-                                            let selected = app.state.selected_result == Some(i);
-                                            source_candidate_card(i, result, selected, cx)
-                                        })
-                                        .collect::<Vec<_>>(),
-                                )
-                                .into_any_element()
+                                        .text_size(px(12.0))
+                                        .child("Recommended"),
+                                ),
+                        )
+                        .when(has_results, |this| {
+                            this.child(
+                                div()
+                                    .id("sources-cards-container")
+                                    .w_full()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_2_5()
+                                    .children(
+                                        app.state
+                                            .search_results
+                                            .iter()
+                                            .enumerate()
+                                            .map(|(i, result)| {
+                                                let selected = app.state.selected_result == Some(i);
+                                                source_candidate_card(i, result, selected, cx)
+                                            })
+                                            .collect::<Vec<_>>(),
+                                    ),
+                            )
                         }),
                 ),
         )
@@ -1516,12 +1577,13 @@ fn render_right_inspector(
         .cloned();
 
     div()
-        .w(px(320.0))
+        .w(px(340.0))
+        .flex_none()
         .h_full()
-        .bg(rgb(0x0c1829))
+        .bg(rgb(0x0a1220))
         .border_1()
-        .border_color(rgb(0x16263b))
-        .rounded_xl()
+        .border_color(rgb(0x142236))
+        .rounded_2xl()
         .p_5()
         .flex()
         .flex_col()
@@ -1533,8 +1595,8 @@ fn render_right_inspector(
                 .items_center()
                 .justify_center()
                 .h_full()
-                .gap_3()
-                .child(div().text_size(px(24.0)).text_color(rgb(ACCENT_CYAN)).child("✦"))
+                .gap_2()
+                .child(div().text_size(px(20.0)).text_color(rgb(ACCENT_CYAN)).child("✦"))
                 .child(
                     div()
                         .text_color(rgb(TEXT_PRIMARY))
@@ -1545,9 +1607,9 @@ fn render_right_inspector(
                 .child(
                     div()
                         .text_color(rgb(TEXT_MUTED))
-                        .text_size(px(12.0))
+                        .text_size(px(11.5))
                         .text_center()
-                        .child("Choose a verified result from the source list to inspect its details."),
+                        .child("Choose a verified result from the source list to\ninspect its details."),
                 )
                 .into_any_element(),
 
@@ -1798,17 +1860,29 @@ fn render_inspect(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> i
             div()
                 .w_full()
                 .p_3()
-                .bg(rgb(0x062a22))
+                .bg(rgb(0x0c1b2c))
                 .border_1()
-                .border_color(rgb(0x10b981))
+                .border_color(rgb(0x1a334d))
                 .rounded_lg()
                 .flex()
                 .items_center()
                 .gap_3()
-                .child(div().text_color(rgb(ACCENT_GREEN)).text_size(px(16.0)).child("🛡️"))
                 .child(
                     div()
-                        .text_color(rgb(ACCENT_GREEN))
+                        .w(px(28.0))
+                        .h(px(28.0))
+                        .bg(rgb(0x12253b))
+                        .rounded_md()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_color(rgb(ACCENT_CYAN))
+                        .text_size(px(14.0))
+                        .child("🛡️"),
+                )
+                .child(
+                    div()
+                        .text_color(rgb(0x38bdf8))
                         .text_size(px(12.0))
                         .font_weight(FontWeight::BOLD)
                         .child("Safety Guarantee: Foreign maintainer scripts are analyzed in data-only mode and are NEVER executed."),
@@ -1834,19 +1908,17 @@ fn render_inspect_body(
     match &app.state.inspect_data {
         None => div()
             .w_full()
-            .h(px(280.0))
+            .flex_1()
+            .min_h(px(340.0))
             .border_1()
-            .border_color(rgb(0x16263b))
+            .border_color(rgb(0x13243a))
             .rounded_xl()
-            .flex()
-            .flex_col()
-            .items_center()
-            .justify_center()
-            .gap_2()
+            .bg(rgb(0x060b14))
+            .p_4()
             .child(
                 div()
                     .text_color(rgb(TEXT_MUTED))
-                    .text_size(px(13.0))
+                    .text_size(px(12.0))
                     .font_family("monospace")
                     .child("Inspection report containing metadata, dependencies, desktop files, systemd units, and maintainer scripts will be displayed here..."),
             )
@@ -2051,24 +2123,11 @@ fn render_build(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> imp
                 .text_size(px(11.0))
                 .child("▾ Advanced Build Options (optional name, version, entry, dependencies)"),
         )
-        // 4-Stage Stepper Tracker
         .child(
             div()
-                .flex()
-                .items_center()
-                .justify_between()
-                .bg(rgb(0x0c1829))
-                .border_1()
-                .border_color(rgb(0x1c304a))
-                .rounded_xl()
-                .p_3()
-                .child(build_step_pill(1, "1. Prepare Plan", app.state.build_stage >= 1))
-                .child(div().text_color(rgb(TEXT_MUTED)).child("→"))
-                .child(build_step_pill(2, "2. PKGBUILD Review", app.state.build_stage >= 2))
-                .child(div().text_color(rgb(TEXT_MUTED)).child("→"))
-                .child(build_step_pill(3, "3. Clean Chroot Build", app.state.build_stage >= 3))
-                .child(div().text_color(rgb(TEXT_MUTED)).child("→"))
-                .child(build_step_pill(4, "4. Smoke Test & Install", app.state.build_stage >= 4)),
+                .text_color(rgb(TEXT_MUTED))
+                .text_size(px(12.0))
+                .child("Ready — choose a package or build target."),
         )
         .when_some(app.state.build_msg.clone(), |this, msg| {
             this.child(status_msg_bar(&msg))
@@ -2166,18 +2225,6 @@ fn render_build(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> imp
                         }),
                 ),
         )
-}
-
-fn build_step_pill(_num: usize, label: &'static str, active: bool) -> impl IntoElement {
-    div()
-        .px_3()
-        .py_1_5()
-        .rounded_lg()
-        .bg(if active { rgb(ACCENT_BLUE) } else { rgb(0x0f1a2a) })
-        .text_color(if active { rgb(0xffffff) } else { rgb(TEXT_MUTED) })
-        .text_size(px(11.5))
-        .font_weight(FontWeight::BOLD)
-        .child(label)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2316,126 +2363,136 @@ fn render_uninstall(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) ->
         .when_some(app.state.uninstall_msg.clone(), |this, msg| {
             this.child(status_msg_bar(&msg))
         })
-        // Table Header
+        // Packages Table Container
         .child(
             div()
-                .w_full()
-                .px_4()
-                .py_2()
-                .bg(rgb(0x0c1829))
-                .border_1()
-                .border_color(rgb(0x1c304a))
-                .rounded_t_lg()
-                .flex()
-                .items_center()
-                .child(
-                    div()
-                        .w(px(200.0))
-                        .text_color(rgb(TEXT_MUTED))
-                        .text_size(px(12.0))
-                        .font_weight(FontWeight::BOLD)
-                        .child("Software Name"),
-                )
-                .child(
-                    div()
-                        .w(px(140.0))
-                        .text_color(rgb(TEXT_MUTED))
-                        .text_size(px(12.0))
-                        .font_weight(FontWeight::BOLD)
-                        .child("Installed Version"),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .text_color(rgb(TEXT_MUTED))
-                        .text_size(px(12.0))
-                        .font_weight(FontWeight::BOLD)
-                        .child("Description"),
-                )
-                .child(
-                    div()
-                        .w(px(100.0))
-                        .text_color(rgb(TEXT_MUTED))
-                        .text_size(px(12.0))
-                        .font_weight(FontWeight::BOLD)
-                        .text_right()
-                        .child("Action"),
-                ),
-        )
-        // Packages Scroll List
-        .child(
-            div()
-                .id("uninstall-table-scroll")
                 .flex_1()
-                .overflow_y_scroll()
+                .min_h(px(0.0))
+                .border_1()
+                .border_color(rgb(0x16243b))
+                .rounded_xl()
+                .overflow_hidden()
+                .bg(rgb(0x080e18))
                 .flex()
                 .flex_col()
-                .border_1()
-                .border_color(rgb(0x1c304a))
-                .rounded_b_lg()
-                .bg(rgb(0x080e18))
-                .children(
-                    filtered
-                        .into_iter()
-                        .map(|(real_idx, pkg)| {
-                            let selected = app.state.uninstall_selected == Some(real_idx);
+                // Table Header
+                .child(
+                    div()
+                        .flex_none()
+                        .h(px(38.0))
+                        .w_full()
+                        .px_4()
+                        .bg(rgb(0x0c1524))
+                        .border_b_1()
+                        .border_color(rgb(0x16243b))
+                        .flex()
+                        .items_center()
+                        .child(
                             div()
-                                .id(SharedString::from(format!("pkg-row-{}", real_idx)))
-                                .w_full()
-                                .h(px(46.0))
-                                .px_4()
-                                .flex()
-                                .items_center()
-                                .bg(if selected { rgb(0x14253d) } else { rgba(0x00000000) })
-                                .border_b_1()
-                                .border_color(rgb(0x101b2a))
-                                .cursor_pointer()
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.state.uninstall_selected = Some(real_idx);
-                                    cx.notify();
-                                }))
-                                .child(
+                                .w(px(200.0))
+                                .text_color(rgb(TEXT_MUTED))
+                                .text_size(px(12.0))
+                                .font_weight(FontWeight::BOLD)
+                                .child("Software Name"),
+                        )
+                        .child(
+                            div()
+                                .w(px(140.0))
+                                .text_color(rgb(TEXT_MUTED))
+                                .text_size(px(12.0))
+                                .font_weight(FontWeight::BOLD)
+                                .child("Installed Version"),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .text_color(rgb(TEXT_MUTED))
+                                .text_size(px(12.0))
+                                .font_weight(FontWeight::BOLD)
+                                .child("Description"),
+                        )
+                        .child(
+                            div()
+                                .w(px(100.0))
+                                .text_color(rgb(TEXT_MUTED))
+                                .text_size(px(12.0))
+                                .font_weight(FontWeight::BOLD)
+                                .text_right()
+                                .child("Action"),
+                        ),
+                )
+                // Packages Scroll List
+                .child(
+                    div()
+                        .id("uninstall-table-scroll")
+                        .flex_1()
+                        .min_h(px(0.0))
+                        .overflow_y_scroll()
+                        .flex()
+                        .flex_col()
+                        .children(
+                            filtered
+                                .into_iter()
+                                .map(|(real_idx, pkg)| {
+                                    let selected = app.state.uninstall_selected == Some(real_idx);
                                     div()
-                                        .w(px(200.0))
-                                        .text_color(rgb(TEXT_PRIMARY))
-                                        .text_size(px(13.0))
-                                        .font_weight(FontWeight::BOLD)
-                                        .child(pkg.name.clone()),
-                                )
-                                .child(
-                                    div()
-                                        .w(px(140.0))
-                                        .text_color(rgb(TEXT_MUTED))
-                                        .text_size(px(12.0))
-                                        .font_family("monospace")
-                                        .child(pkg.version.clone()),
-                                )
-                                .child(
-                                    div()
-                                        .flex_1()
-                                        .text_color(rgb(TEXT_SECONDARY))
-                                        .text_size(px(12.0))
-                                        .child(pkg.description.clone()),
-                                )
-                                .child(
-                                    div()
-                                        .w(px(100.0))
+                                        .id(SharedString::from(format!("pkg-row-{}", real_idx)))
+                                        .w_full()
+                                        .h(px(46.0))
+                                        .px_4()
                                         .flex()
-                                        .justify_end()
-                                        .child(action_button(
-                                            "row-uninstall-btn",
-                                            "Uninstall",
-                                            0x3a1414,
-                                            0xf87171,
-                                            cx.listener(move |this, _, _, cx| {
-                                                this.state.uninstall_selected = Some(real_idx);
-                                                this.run_uninstall(cx);
-                                            }),
-                                        )),
-                                )
-                                .into_any_element()
-                        })
-                        .collect::<Vec<_>>(),
+                                        .items_center()
+                                        .bg(if selected { rgb(0x14253d) } else { rgba(0x00000000) })
+                                        .border_b_1()
+                                        .border_color(rgb(0x101b2a))
+                                        .cursor_pointer()
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.state.uninstall_selected = Some(real_idx);
+                                            cx.notify();
+                                        }))
+                                        .child(
+                                            div()
+                                                .w(px(200.0))
+                                                .text_color(rgb(TEXT_PRIMARY))
+                                                .text_size(px(13.0))
+                                                .font_weight(FontWeight::BOLD)
+                                                .child(pkg.name.clone()),
+                                        )
+                                        .child(
+                                            div()
+                                                .w(px(140.0))
+                                                .text_color(rgb(TEXT_MUTED))
+                                                .text_size(px(12.0))
+                                                .font_family("monospace")
+                                                .child(pkg.version.clone()),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .text_color(rgb(TEXT_SECONDARY))
+                                                .text_size(px(12.0))
+                                                .child(pkg.description.clone()),
+                                        )
+                                        .child(
+                                            div()
+                                                .w(px(100.0))
+                                                .flex()
+                                                .justify_end()
+                                                .child(action_button(
+                                                    "row-uninstall-btn",
+                                                    "Uninstall",
+                                                    0x261318,
+                                                    0xf87171,
+                                                    cx.listener(move |this, _, _, cx| {
+                                                        this.state.uninstall_selected = Some(real_idx);
+                                                        this.run_uninstall(cx);
+                                                    }),
+                                                )),
+                                        )
+                                        .into_any_element()
+                                })
+                                .collect::<Vec<_>>(),
+                        ),
                 ),
         )
 }
@@ -2486,107 +2543,117 @@ fn render_doctor(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> im
         .when_some(app.state.doctor_msg.clone(), |this, msg| {
             this.child(status_msg_bar(&msg))
         })
-        // Table Header
+        // Diagnostics Table Container
         .child(
             div()
-                .w_full()
-                .px_4()
-                .py_2()
-                .bg(rgb(0x0c1829))
-                .border_1()
-                .border_color(rgb(0x1c304a))
-                .rounded_t_lg()
-                .flex()
-                .items_center()
-                .child(
-                    div()
-                        .w(px(180.0))
-                        .text_color(rgb(TEXT_MUTED))
-                        .text_size(px(12.0))
-                        .font_weight(FontWeight::BOLD)
-                        .child("Check Name"),
-                )
-                .child(
-                    div()
-                        .w(px(120.0))
-                        .text_color(rgb(TEXT_MUTED))
-                        .text_size(px(12.0))
-                        .font_weight(FontWeight::BOLD)
-                        .child("Status"),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .text_color(rgb(TEXT_MUTED))
-                        .text_size(px(12.0))
-                        .font_weight(FontWeight::BOLD)
-                        .child("Diagnostic Details"),
-                ),
-        )
-        // 8 Diagnostic Status Checks Rows
-        .child(
-            div()
-                .id("doctor-checks-scroll")
                 .flex_1()
-                .overflow_y_scroll()
+                .min_h(px(0.0))
+                .border_1()
+                .border_color(rgb(0x16243b))
+                .rounded_xl()
+                .overflow_hidden()
+                .bg(rgb(0x080e18))
                 .flex()
                 .flex_col()
-                .border_1()
-                .border_color(rgb(0x1c304a))
-                .rounded_b_lg()
-                .bg(rgb(0x080e18))
-                .children(
-                    app.state
-                        .health_checks
-                        .iter()
-                        .map(|check| {
+                // Table Header
+                .child(
+                    div()
+                        .flex_none()
+                        .h(px(38.0))
+                        .w_full()
+                        .px_4()
+                        .bg(rgb(0x0c1524))
+                        .border_b_1()
+                        .border_color(rgb(0x16243b))
+                        .flex()
+                        .items_center()
+                        .child(
                             div()
-                                .w_full()
-                                .h(px(46.0))
-                                .px_4()
-                                .flex()
-                                .items_center()
-                                .border_b_1()
-                                .border_color(rgb(0x101b2a))
-                                .child(
+                                .w(px(180.0))
+                                .text_color(rgb(TEXT_MUTED))
+                                .text_size(px(12.0))
+                                .font_weight(FontWeight::BOLD)
+                                .child("Check Name"),
+                        )
+                        .child(
+                            div()
+                                .w(px(120.0))
+                                .text_color(rgb(TEXT_MUTED))
+                                .text_size(px(12.0))
+                                .font_weight(FontWeight::BOLD)
+                                .child("Status"),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .text_color(rgb(TEXT_MUTED))
+                                .text_size(px(12.0))
+                                .font_weight(FontWeight::BOLD)
+                                .child("Diagnostic Details"),
+                        ),
+                )
+                // 8 Diagnostic Status Checks Rows
+                .child(
+                    div()
+                        .id("doctor-checks-scroll")
+                        .flex_1()
+                        .min_h(px(0.0))
+                        .overflow_y_scroll()
+                        .flex()
+                        .flex_col()
+                        .children(
+                            app.state
+                                .health_checks
+                                .iter()
+                                .map(|check| {
                                     div()
-                                        .w(px(180.0))
-                                        .text_color(rgb(TEXT_PRIMARY))
-                                        .text_size(px(13.0))
-                                        .font_weight(FontWeight::BOLD)
-                                        .child(check.name.clone()),
-                                )
-                                .child(
-                                    div()
-                                        .w(px(120.0))
+                                        .w_full()
+                                        .h(px(46.0))
+                                        .px_4()
                                         .flex()
                                         .items_center()
-                                        .gap_1_5()
+                                        .border_b_1()
+                                        .border_color(rgb(0x101b2a))
                                         .child(
                                             div()
-                                                .w(px(8.0))
-                                                .h(px(8.0))
-                                                .rounded_full()
-                                                .bg(if check.ok { rgb(ACCENT_GREEN) } else { rgb(ACCENT_RED) }),
+                                                .w(px(180.0))
+                                                .text_color(rgb(TEXT_PRIMARY))
+                                                .text_size(px(13.0))
+                                                .font_weight(FontWeight::BOLD)
+                                                .child(check.name.clone()),
                                         )
                                         .child(
                                             div()
-                                                .text_color(if check.ok { rgb(ACCENT_GREEN) } else { rgb(ACCENT_RED) })
+                                                .w(px(120.0))
+                                                .flex()
+                                                .items_center()
+                                                .gap_1_5()
+                                                .child(
+                                                    div()
+                                                        .w(px(8.0))
+                                                        .h(px(8.0))
+                                                        .rounded_full()
+                                                        .bg(if check.ok { rgb(ACCENT_GREEN) } else { rgb(ACCENT_RED) }),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .text_color(if check.ok { rgb(ACCENT_GREEN) } else { rgb(ACCENT_RED) })
+                                                        .text_size(px(12.0))
+                                                        .font_weight(FontWeight::BOLD)
+                                                        .child(if check.ok { "PASS" } else { "FAIL" }),
+                                                ),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .text_color(rgb(TEXT_SECONDARY))
                                                 .text_size(px(12.0))
-                                                .font_weight(FontWeight::BOLD)
-                                                .child(if check.ok { "PASS" } else { "FAIL" }),
-                                        ),
-                                )
-                                .child(
-                                    div()
-                                        .flex_1()
-                                        .text_color(rgb(TEXT_SECONDARY))
-                                        .text_size(px(12.0))
-                                        .child(check.message.clone()),
-                                )
-                                .into_any_element()
-                        })
-                        .collect::<Vec<_>>(),
+                                                .child(check.message.clone()),
+                                        )
+                                        .into_any_element()
+                                })
+                                .collect::<Vec<_>>(),
+                        ),
                 ),
         )
 }
@@ -2597,10 +2664,12 @@ fn render_doctor(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> im
 
 fn render_settings(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> impl IntoElement {
     div()
+        .id("settings-scroll")
         .flex()
         .flex_col()
         .gap_4()
         .size_full()
+        .overflow_y_scroll()
         // Header
         .child(
             div()
@@ -2664,7 +2733,6 @@ fn render_settings(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> 
                                 .flex()
                                 .items_center()
                                 .gap_2()
-                                .child(div().w(px(8.0)).h(px(8.0)).rounded_full().bg(if app.state.sudo_session_active { rgb(ACCENT_GREEN) } else { rgb(0x94a3b8) }))
                                 .child(
                                     div()
                                         .text_color(rgb(TEXT_PRIMARY))
@@ -2694,6 +2762,7 @@ fn render_settings(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> 
                 .child(
                     div()
                         .flex()
+                        .flex_row()
                         .items_center()
                         .gap_2()
                         .pt_1()
@@ -2706,7 +2775,7 @@ fn render_settings(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> 
                         ),
                 ),
         )
-        // Card 2: Source Routing Checkboxes
+        // Card 2: Source Routing Checkboxes & Save Button
         .child(
             div()
                 .w_full()
@@ -2717,32 +2786,32 @@ fn render_settings(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> 
                 .p_4()
                 .flex()
                 .flex_col()
-                .gap_2_5()
+                .gap_2()
                 .child(settings_checkbox("Official Arch Linux Repositories (pacman)", app.state.opt_official))
                 .child(settings_checkbox("Arch User Repository (AUR RPC)", app.state.opt_aur))
                 .child(settings_checkbox("Flatpak Release Bundles (Flathub)", app.state.opt_flatpak))
                 .child(settings_checkbox("AppImage Standalone Assets", app.state.opt_appimage))
                 .child(settings_checkbox("Upstream Git Release Sources (GitHub/GitLab)", app.state.opt_upstream))
                 .child(settings_checkbox("DEB Package Inspection", app.state.opt_deb))
-                .child(settings_checkbox("RPM Package Inspection", app.state.opt_rpm)),
-        )
-        // Save Preferences Button
-        .child(
-            div()
-                .w_full()
-                .child(action_button(
-                    "save-prefs-btn",
-                    "Save Preferences",
-                    ACCENT_GREEN,
-                    0xffffff,
-                    cx.listener(|this, _, _, cx| {
-                        this.state.settings_msg = Some(StatusMsg {
-                            level: MsgLevel::Success,
-                            text: "Preferences saved to $XDG_CONFIG_HOME/archbridge/config.json".to_string(),
-                        });
-                        cx.notify();
-                    }),
-                )),
+                .child(settings_checkbox("RPM Package Inspection", app.state.opt_rpm))
+                .child(
+                    div()
+                        .pt_3()
+                        .w_full()
+                        .child(action_button(
+                            "save-prefs-btn",
+                            "Save Preferences",
+                            0x059669,
+                            0xffffff,
+                            cx.listener(|this, _, _, cx| {
+                                this.state.settings_msg = Some(StatusMsg {
+                                    level: MsgLevel::Success,
+                                    text: "Preferences saved to $XDG_CONFIG_HOME/archbridge/config.json".to_string(),
+                                });
+                                cx.notify();
+                            }),
+                        )),
+                ),
         )
         .when_some(app.state.settings_msg.clone(), |this, msg| {
             this.child(status_msg_bar(&msg))
@@ -2752,11 +2821,14 @@ fn render_settings(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> 
 fn settings_checkbox(label: &'static str, checked: bool) -> impl IntoElement {
     div()
         .flex()
+        .flex_row()
         .items_center()
-        .gap_2_5()
+        .gap_3()
         .py_1()
         .child(
             div()
+                .flex_none()
+                .w(px(18.0))
                 .text_color(if checked { rgb(ACCENT_CYAN) } else { rgb(TEXT_MUTED) })
                 .text_size(px(14.0))
                 .child(if checked { "☑" } else { "☐" }),

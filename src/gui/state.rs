@@ -139,12 +139,12 @@ impl Default for AppState {
     fn default() -> Self {
         Self {
             active_tab: ActiveTab::Discover,
-            search_history: vec!["brave".into(), "vlc".into(), "vscode".into(), "docker".into()],
+            search_history: Vec::new(),
             show_history_menu: false,
             doctor_ready: true,
             sudo_session_active: false,
             active_chroot: "None".into(),
-            free_disk_space: "142 GiB Free".into(),
+            free_disk_space: "47 GiB Free".into(),
             keyring_status: "Verified".into(),
 
             // Clean default Discovery state
