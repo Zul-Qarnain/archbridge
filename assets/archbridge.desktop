@@ -1,0 +1,11 @@
+[Desktop Entry]
+Name=ArchBridge
+GenericName=Package Builder & Installer
+Comment=Safe, Native Arch Linux Package Builder & Foreign Format Translator
+Exec=python3 /home/zulqarnain/archbridge/archbridge-gui.py
+Icon=archbridge
+Terminal=false
+Type=Application
+StartupWMClass=archbridge
+Categories=System;Utility;PackageManager;Development;
+Keywords=arch;package;deb;rpm;install;aur;build;chroot;pacman;

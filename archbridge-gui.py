@@ -476,6 +476,10 @@ class ArchBridgeWindow(QMainWindow):
         self.current_built_package = None
 
         self.setWindowTitle("ArchBridge — Software Discovery & Packaging Assistant")
+        script_dir = Path(__file__).resolve().parent
+        icon_file = script_dir / "assets" / "archbridge.png"
+        if icon_file.exists():
+            self.setWindowIcon(QIcon(str(icon_file)))
         self.resize(1280, 840)
         self.setMinimumSize(1100, 720)
 
@@ -653,8 +657,14 @@ class ArchBridgeWindow(QMainWindow):
         layout.setSpacing(6)
 
         brand_box = QHBoxLayout()
-        logo_icon = QLabel("▲")
-        logo_icon.setStyleSheet("color: #00a4e4; font-size: 26px; font-weight: bold;")
+        logo_icon = QLabel()
+        script_dir = Path(__file__).resolve().parent
+        icon_file = script_dir / "assets" / "archbridge.png"
+        if icon_file.exists():
+            logo_icon.setPixmap(QPixmap(str(icon_file)).scaled(32, 32, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+        else:
+            logo_icon.setText("▲")
+            logo_icon.setStyleSheet("color: #00a4e4; font-size: 26px; font-weight: bold;")
         brand_box.addWidget(logo_icon)
 
         title_col = QVBoxLayout()
@@ -2973,6 +2983,9 @@ class ArchBridgeWindow(QMainWindow):
 def main():
     app = QApplication(sys.argv)
     script_dir = Path(__file__).resolve().parent
+    icon_file = script_dir / "assets" / "archbridge.png"
+    if icon_file.exists():
+        app.setWindowIcon(QIcon(str(icon_file)))
     binary_path = str(script_dir / "target" / "release" / "archbridge")
     if not Path(binary_path).exists():
         binary_path = str(script_dir / "target" / "debug" / "archbridge")
