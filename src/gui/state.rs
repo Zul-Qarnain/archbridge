@@ -3,6 +3,15 @@ use crate::rpc::{JsonRpcRequest, RpcServer};
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
 
+/// Application Theme mode
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AppTheme {
+    #[default]
+    Dark,
+    Midnight,
+    Light,
+}
+
 /// Which tab is currently active in the sidebar
 #[derive(Debug, Clone, PartialEq, Default)]
 pub enum ActiveTab {
@@ -133,6 +142,11 @@ pub struct AppState {
     pub auth_pending_action: Option<String>,
     pub auth_error: Option<String>,
     pub auth_focus_active: bool,
+
+    // ──────────────────── theme & focus ──────────────────
+    pub theme: AppTheme,
+    pub search_focused: bool,
+    pub uninstall_focused: bool,
 }
 
 impl Default for AppState {
@@ -238,6 +252,10 @@ impl Default for AppState {
             auth_pending_action: None,
             auth_error: None,
             auth_focus_active: false,
+
+            theme: AppTheme::Dark,
+            search_focused: false,
+            uninstall_focused: false,
         }
     }
 }

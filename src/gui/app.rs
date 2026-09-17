@@ -1,5 +1,5 @@
 use crate::gui::state::{
-    ActiveTab, AppState, HealthCheck, InstalledPackage, MsgLevel, SearchResult, SharedEngine,
+    ActiveTab, AppState, AppTheme, HealthCheck, InstalledPackage, MsgLevel, SearchResult, SharedEngine,
     StatusMsg, rpc_call,
 };
 use crate::gui::theme::*;
@@ -755,31 +755,42 @@ impl Render for ArchBridgeApp {
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn render_top_bar(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> impl IntoElement {
+    let theme_mode = app.state.theme;
+    let (theme_icon, theme_name) = match theme_mode {
+        AppTheme::Dark => ("🌙", "Dark"),
+        AppTheme::Midnight => ("🌌", "Midnight"),
+        AppTheme::Light => ("☀️", "Light"),
+    };
+
     div()
         .flex_none()
-        .h(px(54.0))
+        .w(px(710.0))
+        .h(px(50.0))
         .bg(rgb(0x09101d))
         .border_1()
         .border_color(rgb(0x16243b))
         .rounded_xl()
-        .px_3()
+        .px_2_5()
         .py_1()
         .flex()
         .flex_row()
         .items_center()
-        .gap_3()
+        .gap_2()
         // Cell 1: Engine Ready
         .child(
             div()
-                .h(px(40.0))
-                .px_3()
+                .flex_none()
+                .w(px(150.0))
+                .h(px(38.0))
+                .px_2_5()
                 .rounded_lg()
                 .bg(rgb(0x0c1626))
                 .flex()
                 .items_center()
-                .gap_2_5()
+                .gap_2()
                 .child(
                     div()
+                        .flex_none()
                         .w(px(26.0))
                         .h(px(26.0))
                         .rounded_md()
@@ -789,23 +800,28 @@ fn render_top_bar(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> i
                         .justify_center()
                         .text_color(rgb(ACCENT_GREEN))
                         .text_size(px(13.0))
-                        .child("⚯"),
+                        .child("⚡"),
                 )
                 .child(
                     div()
+                        .flex_1()
+                        .min_w(px(0.0))
                         .flex()
                         .flex_col()
+                        .justify_center()
                         .child(
                             div()
                                 .text_color(rgb(TEXT_PRIMARY))
                                 .text_size(px(11.0))
                                 .font_weight(FontWeight::BOLD)
+                                .whitespace_nowrap()
                                 .child("Engine ready"),
                         )
                         .child(
                             div()
                                 .text_color(rgb(TEXT_MUTED))
-                                .text_size(px(9.0))
+                                .text_size(px(8.5))
+                                .whitespace_nowrap()
                                 .child("Local service connected"),
                         ),
                 ),
@@ -814,8 +830,10 @@ fn render_top_bar(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> i
         .child(
             div()
                 .id("history-cell")
-                .h(px(40.0))
-                .px_3()
+                .flex_none()
+                .w(px(135.0))
+                .h(px(38.0))
+                .px_2_5()
                 .rounded_lg()
                 .bg(rgb(0x0c1626))
                 .cursor_pointer()
@@ -825,9 +843,10 @@ fn render_top_bar(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> i
                 }))
                 .flex()
                 .items_center()
-                .gap_2_5()
+                .gap_2()
                 .child(
                     div()
+                        .flex_none()
                         .w(px(26.0))
                         .h(px(26.0))
                         .rounded_md()
@@ -841,19 +860,24 @@ fn render_top_bar(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> i
                 )
                 .child(
                     div()
+                        .flex_1()
+                        .min_w(px(0.0))
                         .flex()
                         .flex_col()
+                        .justify_center()
                         .child(
                             div()
                                 .text_color(rgb(TEXT_PRIMARY))
                                 .text_size(px(11.0))
                                 .font_weight(FontWeight::BOLD)
+                                .whitespace_nowrap()
                                 .child("History ▾"),
                         )
                         .child(
                             div()
                                 .text_color(rgb(TEXT_MUTED))
-                                .text_size(px(9.0))
+                                .text_size(px(8.5))
+                                .whitespace_nowrap()
                                 .child(if let Some(first) = app.state.search_history.first() {
                                     format!("Recent: {}", first)
                                 } else {
@@ -865,15 +889,18 @@ fn render_top_bar(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> i
         // Cell 3: System Ready
         .child(
             div()
-                .h(px(40.0))
-                .px_3()
+                .flex_none()
+                .w(px(145.0))
+                .h(px(38.0))
+                .px_2_5()
                 .rounded_lg()
                 .bg(rgb(0x0c1626))
                 .flex()
                 .items_center()
-                .gap_2_5()
+                .gap_2()
                 .child(
                     div()
+                        .flex_none()
                         .w(px(26.0))
                         .h(px(26.0))
                         .rounded_md()
@@ -887,19 +914,24 @@ fn render_top_bar(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> i
                 )
                 .child(
                     div()
+                        .flex_1()
+                        .min_w(px(0.0))
                         .flex()
                         .flex_col()
+                        .justify_center()
                         .child(
                             div()
                                 .text_color(rgb(TEXT_PRIMARY))
                                 .text_size(px(11.0))
                                 .font_weight(FontWeight::BOLD)
+                                .whitespace_nowrap()
                                 .child(if app.state.doctor_ready { "System ready" } else { "System warning" }),
                         )
                         .child(
                             div()
                                 .text_color(rgb(TEXT_MUTED))
-                                .text_size(px(9.0))
+                                .text_size(px(8.5))
+                                .whitespace_nowrap()
                                 .child("Health checks passing"),
                         ),
                 ),
@@ -908,8 +940,10 @@ fn render_top_bar(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> i
         .child(
             div()
                 .id("sudo-cell")
-                .h(px(40.0))
-                .px_3()
+                .flex_none()
+                .w(px(135.0))
+                .h(px(38.0))
+                .px_2_5()
                 .rounded_lg()
                 .bg(rgb(0x0c1626))
                 .cursor_pointer()
@@ -927,9 +961,10 @@ fn render_top_bar(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> i
                 }))
                 .flex()
                 .items_center()
-                .gap_2_5()
+                .gap_2()
                 .child(
                     div()
+                        .flex_none()
                         .w(px(26.0))
                         .h(px(26.0))
                         .rounded_md()
@@ -943,20 +978,84 @@ fn render_top_bar(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> i
                 )
                 .child(
                     div()
+                        .flex_1()
+                        .min_w(px(0.0))
                         .flex()
                         .flex_col()
+                        .justify_center()
                         .child(
                             div()
                                 .text_color(rgb(TEXT_PRIMARY))
                                 .text_size(px(11.0))
                                 .font_weight(FontWeight::BOLD)
+                                .whitespace_nowrap()
                                 .child(if app.state.sudo_session_active { "Sudo Active" } else { "Sudo Inactive" }),
                         )
                         .child(
                             div()
                                 .text_color(rgb(TEXT_MUTED))
-                                .text_size(px(9.0))
+                                .text_size(px(8.5))
+                                .whitespace_nowrap()
                                 .child(if app.state.sudo_session_active { "Password cached" } else { "No saved password" }),
+                        ),
+                ),
+        )
+        // Cell 5: Quick Theme Switcher
+        .child(
+            div()
+                .id("theme-toggle-cell")
+                .flex_none()
+                .w(px(100.0))
+                .h(px(38.0))
+                .px_2()
+                .rounded_lg()
+                .bg(rgb(0x0c1626))
+                .cursor_pointer()
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.state.theme = match this.state.theme {
+                        AppTheme::Dark => AppTheme::Midnight,
+                        AppTheme::Midnight => AppTheme::Light,
+                        AppTheme::Light => AppTheme::Dark,
+                    };
+                    cx.notify();
+                }))
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(
+                    div()
+                        .flex_none()
+                        .w(px(26.0))
+                        .h(px(26.0))
+                        .rounded_md()
+                        .bg(rgb(0x152238))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_size(px(12.0))
+                        .child(theme_icon),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .flex()
+                        .flex_col()
+                        .justify_center()
+                        .child(
+                            div()
+                                .text_color(rgb(TEXT_PRIMARY))
+                                .text_size(px(11.0))
+                                .font_weight(FontWeight::BOLD)
+                                .whitespace_nowrap()
+                                .child("Theme"),
+                        )
+                        .child(
+                            div()
+                                .text_color(rgb(ACCENT_CYAN))
+                                .text_size(px(8.5))
+                                .whitespace_nowrap()
+                                .child(theme_name),
                         ),
                 ),
         )
@@ -1108,11 +1207,8 @@ fn sidebar_nav_btn(
         .border_color(if is_active { rgb(0x285485) } else { rgba(0x00000000) })
         .on_click(cx.listener(move |this, _, _, cx| {
             this.state.active_tab = tab_clone.clone();
-            if tab_clone == ActiveTab::Uninstall {
-                this.reload_installed();
-            } else if tab_clone == ActiveTab::Doctor {
-                this.run_doctor(cx);
-            }
+            this.state.search_focused = false;
+            this.state.uninstall_focused = false;
             cx.notify();
         }))
         .child(div().text_size(px(14.0)).child(icon))
@@ -1202,9 +1298,9 @@ fn render_discover(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> 
                                         .track_focus(&app.search_focus)
                                         .flex_1()
                                         .h(px(40.0))
-                                        .bg(rgb(0x0c192b))
+                                        .bg(if app.state.search_focused { rgb(0x0e2238) } else { rgb(0x0c192b) })
                                         .border_1()
-                                        .border_color(if app.state.search_busy { rgb(ACCENT_CYAN) } else { rgb(0x29415f) })
+                                        .border_color(if app.state.search_focused { rgb(ACCENT_CYAN) } else if app.state.search_busy { rgb(0x0ea5e9) } else { rgb(0x29415f) })
                                         .rounded_lg()
                                         .px_3()
                                         .flex()
@@ -1212,6 +1308,8 @@ fn render_discover(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> 
                                         .cursor_pointer()
                                         .on_click(cx.listener(|this, _, window, cx| {
                                             window.focus(&this.search_focus);
+                                            this.state.search_focused = true;
+                                            this.state.uninstall_focused = false;
                                             cx.notify();
                                         }))
                                         .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
@@ -1238,15 +1336,53 @@ fn render_discover(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> 
                                         }))
                                         .child(
                                             div()
-                                                .text_color(if app.state.search_query.is_empty() {
-                                                    rgb(TEXT_PLACEHOLDER)
-                                                } else {
-                                                    rgb(TEXT_PRIMARY)
-                                                })
+                                                .flex_1()
+                                                .flex()
+                                                .items_center()
                                                 .child(if app.state.search_query.is_empty() {
-                                                    "Search package name or upstream git URL...".to_string()
+                                                    div()
+                                                        .flex()
+                                                        .items_center()
+                                                        .when(app.state.search_focused, |this| {
+                                                            this.child(
+                                                                div()
+                                                                    .w(px(2.0))
+                                                                    .h(px(16.0))
+                                                                    .bg(rgb(ACCENT_CYAN))
+                                                                    .mr_1(),
+                                                            )
+                                                        })
+                                                        .child(
+                                                            div()
+                                                                .text_color(rgb(TEXT_PLACEHOLDER))
+                                                                .text_size(px(13.0))
+                                                                .child(if app.state.search_focused {
+                                                                    "Type package name (e.g. vlc, brave, discord)..."
+                                                                } else {
+                                                                    "Search package name or upstream git URL..."
+                                                                }),
+                                                        )
+                                                        .into_any_element()
                                                 } else {
-                                                    app.state.search_query.clone()
+                                                    div()
+                                                        .flex()
+                                                        .items_center()
+                                                        .child(
+                                                            div()
+                                                                .text_color(rgb(TEXT_PRIMARY))
+                                                                .text_size(px(13.0))
+                                                                .child(app.state.search_query.clone()),
+                                                        )
+                                                        .when(app.state.search_focused, |this| {
+                                                            this.child(
+                                                                div()
+                                                                    .w(px(2.0))
+                                                                    .h(px(16.0))
+                                                                    .bg(rgb(ACCENT_CYAN))
+                                                                    .ml(px(2.0)),
+                                                            )
+                                                        })
+                                                        .into_any_element()
                                                 }),
                                         ),
                                 )
@@ -2297,9 +2433,9 @@ fn render_uninstall(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) ->
                         .track_focus(&app.uninstall_focus)
                         .flex_1()
                         .h(px(40.0))
-                        .bg(rgb(0x0c192b))
+                        .bg(if app.state.uninstall_focused { rgb(0x0e2238) } else { rgb(0x0c192b) })
                         .border_1()
-                        .border_color(rgb(0x29415f))
+                        .border_color(if app.state.uninstall_focused { rgb(ACCENT_CYAN) } else { rgb(0x29415f) })
                         .rounded_lg()
                         .px_3()
                         .flex()
@@ -2307,6 +2443,8 @@ fn render_uninstall(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) ->
                         .cursor_pointer()
                         .on_click(cx.listener(|this, _, window, cx| {
                             window.focus(&this.uninstall_focus);
+                            this.state.uninstall_focused = true;
+                            this.state.search_focused = false;
                             cx.notify();
                         }))
                         .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
@@ -2327,15 +2465,53 @@ fn render_uninstall(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) ->
                         }))
                         .child(
                             div()
-                                .text_color(if app.state.uninstall_query.is_empty() {
-                                    rgb(TEXT_PLACEHOLDER)
-                                } else {
-                                    rgb(TEXT_PRIMARY)
-                                })
+                                .flex_1()
+                                .flex()
+                                .items_center()
                                 .child(if app.state.uninstall_query.is_empty() {
-                                    "Type software name to find and uninstall (e.g. grok-bot, vlc, discord, steam)...".to_string()
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .when(app.state.uninstall_focused, |this| {
+                                            this.child(
+                                                div()
+                                                    .w(px(2.0))
+                                                    .h(px(16.0))
+                                                    .bg(rgb(ACCENT_CYAN))
+                                                    .mr_1(),
+                                            )
+                                        })
+                                        .child(
+                                            div()
+                                                .text_color(rgb(TEXT_PLACEHOLDER))
+                                                .text_size(px(13.0))
+                                                .child(if app.state.uninstall_focused {
+                                                    "Type software name (e.g. grok-bot, vlc, discord)..."
+                                                } else {
+                                                    "Type software name to find and uninstall (e.g. grok-bot, vlc, discord, steam)..."
+                                                }),
+                                        )
+                                        .into_any_element()
                                 } else {
-                                    app.state.uninstall_query.clone()
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .child(
+                                            div()
+                                                .text_color(rgb(TEXT_PRIMARY))
+                                                .text_size(px(13.0))
+                                                .child(app.state.uninstall_query.clone()),
+                                        )
+                                        .when(app.state.uninstall_focused, |this| {
+                                            this.child(
+                                                div()
+                                                    .w(px(2.0))
+                                                    .h(px(16.0))
+                                                    .bg(rgb(ACCENT_CYAN))
+                                                    .ml(px(2.0)),
+                                            )
+                                        })
+                                        .into_any_element()
                                 }),
                         ),
                 )
@@ -2691,6 +2867,85 @@ fn render_settings(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> 
                         .child("Enable or disable package discovery sources according to your workflow."),
                 ),
         )
+        // Card 0: Appearance & Theme Selection
+        .child(
+            div()
+                .w_full()
+                .bg(rgb(0x0c1829))
+                .border_1()
+                .border_color(rgb(0x1c304a))
+                .rounded_xl()
+                .p_4()
+                .flex()
+                .flex_col()
+                .gap_3()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(div().text_size(px(14.0)).child("🎨"))
+                        .child(
+                            div()
+                                .text_color(rgb(TEXT_PRIMARY))
+                                .text_size(px(14.0))
+                                .font_weight(FontWeight::BOLD)
+                                .child("Appearance & Theme Selection"),
+                        ),
+                )
+                .child(
+                    div()
+                        .text_color(rgb(TEXT_MUTED))
+                        .text_size(px(12.0))
+                        .child("Customize visual style, surface contrast, and accent highlights."),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .gap_3()
+                        .pt_1()
+                        .child(theme_option_pill(
+                            "theme-opt-dark",
+                            "🌙 Arch Navy (Dark)",
+                            app.state.theme == AppTheme::Dark,
+                            cx.listener(|this, _, _, cx| {
+                                this.state.theme = AppTheme::Dark;
+                                this.state.settings_msg = Some(StatusMsg {
+                                    level: MsgLevel::Success,
+                                    text: "Theme switched to Arch Navy (Dark).".to_string(),
+                                });
+                                cx.notify();
+                            }),
+                        ))
+                        .child(theme_option_pill(
+                            "theme-opt-midnight",
+                            "🌌 Midnight OLED",
+                            app.state.theme == AppTheme::Midnight,
+                            cx.listener(|this, _, _, cx| {
+                                this.state.theme = AppTheme::Midnight;
+                                this.state.settings_msg = Some(StatusMsg {
+                                    level: MsgLevel::Success,
+                                    text: "Theme switched to Midnight OLED.".to_string(),
+                                });
+                                cx.notify();
+                            }),
+                        ))
+                        .child(theme_option_pill(
+                            "theme-opt-light",
+                            "☀️ Modern Light",
+                            app.state.theme == AppTheme::Light,
+                            cx.listener(|this, _, _, cx| {
+                                this.state.theme = AppTheme::Light;
+                                this.state.settings_msg = Some(StatusMsg {
+                                    level: MsgLevel::Success,
+                                    text: "Theme switched to Modern Light.".to_string(),
+                                });
+                                cx.notify();
+                            }),
+                        )),
+                ),
+        )
         // Card 1: Security & Sudo Authorization
         .child(
             div()
@@ -2840,6 +3095,34 @@ fn settings_checkbox(label: &'static str, checked: bool) -> impl IntoElement {
                 .text_size(px(13.0))
                 .child(label),
         )
+}
+
+fn theme_option_pill<F>(
+    id: &'static str,
+    label: &'static str,
+    is_active: bool,
+    on_click: F,
+) -> impl IntoElement
+where
+    F: Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+{
+    div()
+        .id(SharedString::from(id))
+        .h(px(36.0))
+        .px_4()
+        .rounded_lg()
+        .cursor_pointer()
+        .bg(if is_active { rgb(0x163456) } else { rgb(0x0c1626) })
+        .border_1()
+        .border_color(if is_active { rgb(ACCENT_CYAN) } else { rgb(0x1c304a) })
+        .flex()
+        .items_center()
+        .justify_center()
+        .text_color(if is_active { rgb(ACCENT_CYAN) } else { rgb(TEXT_SECONDARY) })
+        .text_size(px(12.5))
+        .font_weight(if is_active { FontWeight::BOLD } else { FontWeight::MEDIUM })
+        .on_click(on_click)
+        .child(label)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
