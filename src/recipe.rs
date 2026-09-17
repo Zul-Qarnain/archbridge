@@ -165,6 +165,16 @@ source=('{source_tar}')\n\
 sha256sums=('{sha256}')\n\n\
 package() {{\n\
   {extract_cmd}\n\
+  mkdir -p \"$pkgdir/usr/bin\"\n\
+  if [ ! -f \"$pkgdir/usr/bin/{pkgname}\" ] && [ ! -L \"$pkgdir/usr/bin/{pkgname}\" ]; then\n\
+    for candidate in \"$pkgdir\"/opt/*/{pkgname} \"$pkgdir\"/opt/*/*; do\n\
+      if [ -f \"$candidate\" ] && [ -x \"$candidate\" ]; then\n\
+        target_rel=\"${{candidate#$pkgdir}}\"\n\
+        ln -s \"$target_rel\" \"$pkgdir/usr/bin/{pkgname}\"\n\
+        break\n\
+      fi\n\
+    done\n\
+  fi\n\
 }}\n"
             ))
         }
