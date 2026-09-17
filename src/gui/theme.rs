@@ -46,17 +46,39 @@ pub const PILL_WARN_TEXT: u32 = 0xfbbf24;
 pub const PILL_ERR: u32 = 0x450a0a;
 pub const PILL_ERR_TEXT: u32 = 0xf87171;
 
-pub fn bg_darkest() -> Hsla { rgb(BG_DARKEST).into() }
-pub fn bg_dark() -> Hsla { rgb(BG_DARK).into() }
-pub fn bg_sidebar() -> Hsla { rgb(BG_SIDEBAR).into() }
-pub fn bg_card() -> Hsla { rgb(BG_CARD).into() }
-pub fn border_subtle() -> Hsla { rgb(BORDER_SUBTLE).into() }
-pub fn text_primary() -> Hsla { rgb(TEXT_PRIMARY).into() }
-pub fn text_secondary() -> Hsla { rgb(TEXT_SECONDARY).into() }
-pub fn text_muted() -> Hsla { rgb(TEXT_MUTED).into() }
-pub fn accent_cyan() -> Hsla { rgb(ACCENT_CYAN).into() }
-pub fn accent_green() -> Hsla { rgb(ACCENT_GREEN).into() }
-pub fn accent_blue() -> Hsla { rgb(ACCENT_BLUE).into() }
+pub fn bg_darkest() -> Hsla {
+    rgb(BG_DARKEST).into()
+}
+pub fn bg_dark() -> Hsla {
+    rgb(BG_DARK).into()
+}
+pub fn bg_sidebar() -> Hsla {
+    rgb(BG_SIDEBAR).into()
+}
+pub fn bg_card() -> Hsla {
+    rgb(BG_CARD).into()
+}
+pub fn border_subtle() -> Hsla {
+    rgb(BORDER_SUBTLE).into()
+}
+pub fn text_primary() -> Hsla {
+    rgb(TEXT_PRIMARY).into()
+}
+pub fn text_secondary() -> Hsla {
+    rgb(TEXT_SECONDARY).into()
+}
+pub fn text_muted() -> Hsla {
+    rgb(TEXT_MUTED).into()
+}
+pub fn accent_cyan() -> Hsla {
+    rgb(ACCENT_CYAN).into()
+}
+pub fn accent_green() -> Hsla {
+    rgb(ACCENT_GREEN).into()
+}
+pub fn accent_blue() -> Hsla {
+    rgb(ACCENT_BLUE).into()
+}
 
 use crate::gui::state::AppTheme;
 
@@ -78,6 +100,12 @@ pub struct ThemePalette {
     pub accent_cyan: u32,
     pub accent_green: u32,
     pub accent_red: u32,
+}
+
+impl ThemePalette {
+    pub fn is_light(&self) -> bool {
+        self.bg_darkest > 0x888888
+    }
 }
 
 pub fn get_palette(theme: AppTheme) -> ThemePalette {

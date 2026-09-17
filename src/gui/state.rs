@@ -116,6 +116,8 @@ pub struct AppState {
     pub installed_packages: Vec<InstalledPackage>,
     pub uninstall_query: String,
     pub uninstall_selected: Option<usize>,
+    pub uninstall_confirm_idx: Option<usize>,
+    pub uninstall_display_limit: usize,
     pub uninstall_busy: bool,
     pub uninstall_msg: Option<StatusMsg>,
 
@@ -187,6 +189,8 @@ impl Default for AppState {
             installed_packages: Vec::new(),
             uninstall_query: "".into(),
             uninstall_selected: None,
+            uninstall_confirm_idx: None,
+            uninstall_display_limit: 50,
             uninstall_busy: false,
             uninstall_msg: None,
 

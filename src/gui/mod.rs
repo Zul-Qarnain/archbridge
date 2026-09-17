@@ -25,9 +25,7 @@ pub fn run_gui() {
                 }),
                 ..Default::default()
             },
-            move |_, cx| {
-                cx.new(|cx| ArchBridgeApp::new(Arc::clone(&engine_clone), cx))
-            },
+            move |_, cx| cx.new(|cx| ArchBridgeApp::new(Arc::clone(&engine_clone), cx)),
         )
         .unwrap();
 

@@ -1,6 +1,6 @@
 use crate::gui::state::{
-    ActiveTab, AppState, AppTheme, HealthCheck, InstalledPackage, MsgLevel, SearchResult, SharedEngine,
-    StatusMsg, rpc_call,
+    rpc_call, ActiveTab, AppState, AppTheme, HealthCheck, InstalledPackage, MsgLevel, SearchResult,
+    SharedEngine, StatusMsg,
 };
 use crate::gui::theme::*;
 use gpui::prelude::*;
@@ -100,109 +100,52 @@ impl ArchBridgeApp {
 
     pub fn reload_installed(&mut self) {
         let mut packages = Vec::new();
+        self.state.uninstall_selected = None;
+        self.state.uninstall_confirm_idx = None;
+        self.state.uninstall_display_limit = 50;
 
-        // 1. Try explicitly installed pacman packages
-        if let Ok(out) = std::process::Command::new("pacman")
+        // Only show packages confirmed by pacman. Never display demo data as
+        // installed software because this view can remove live-system packages.
+        match std::process::Command::new("pacman")
             .args(["-Qe", "--color=never"])
             .output()
         {
-            let text = String::from_utf8_lossy(&out.stdout);
-            for line in text.lines() {
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if !parts.is_empty() {
-                    let name = parts[0].to_string();
-                    let version = parts.get(1).copied().unwrap_or("").to_string();
-                    let desc = match name.as_str() {
-                        "grok-bot" => "Grok Bot desktop agent",
-                        "alacritty" => "A cross-platform, GPU-accelerated terminal emulator",
-                        "accountsservice" => "D-Bus interface for user account query and manipulation",
-                        "antigravity" => "Google Antigravity multi-agent orchestration platform",
-                        "apache" => "A high performance Unix-based HTTP server",
-                        "ark" => "Archiving Tool",
-                        "firefox" => "Fast, Private & Safe Web Browser",
-                        "discord" => "All-in-one voice and text chat for gamers and developers",
-                        "vlc" => "Multi-platform MPEG, VCD/DVD, and DivX player",
-                        "brave-bin" | "brave" => "A privacy focused web browser",
-                        "docker" => "Pack, ship and run any application as a lightweight container",
-                        "neovim" => "Vim-fork focused on extensibility and usability",
-                        "steam" => "Valve's digital software delivery platform",
-                        _ => "Native Arch Linux package",
-                    };
-
-                    packages.push(InstalledPackage {
-                        name,
-                        version,
-                        description: desc.to_string(),
-                        size: "Installed".to_string(),
-                    });
+            Ok(out) if out.status.success() => {
+                let text = String::from_utf8_lossy(&out.stdout);
+                for line in text.lines() {
+                    let parts: Vec<&str> = line.split_whitespace().collect();
+                    if let Some(name) = parts.first() {
+                        packages.push(InstalledPackage {
+                            name: (*name).to_string(),
+                            version: parts.get(1).copied().unwrap_or("").to_string(),
+                            description: "Explicitly installed Arch package".to_string(),
+                            size: "Installed".to_string(),
+                        });
+                    }
                 }
+            }
+            Ok(out) => {
+                self.state.uninstall_msg = Some(StatusMsg {
+                    level: MsgLevel::Error,
+                    text: format!(
+                        "Could not load installed packages: {}",
+                        String::from_utf8_lossy(&out.stderr).trim()
+                    ),
+                });
+            }
+            Err(err) => {
+                self.state.uninstall_msg = Some(StatusMsg {
+                    level: MsgLevel::Error,
+                    text: format!("Could not run pacman to load installed packages: {err}"),
+                });
             }
         }
 
-        // Fallback demo packages if empty or running in minimal test env
         if packages.is_empty() {
-            packages = vec![
-                InstalledPackage {
-                    name: "accountsservice".into(),
-                    version: "26.27.3-1.1".into(),
-                    description: "D-Bus interface for user account query and manipulation".into(),
-                    size: "Installed".into(),
-                },
-                InstalledPackage {
-                    name: "alacritty".into(),
-                    version: "0.17.0-1.2".into(),
-                    description: "A cross-platform, GPU-accelerated terminal emulator".into(),
-                    size: "Installed".into(),
-                },
-                InstalledPackage {
-                    name: "alsa-firmware".into(),
-                    version: "1.2.4-4".into(),
-                    description: "Firmware binaries for loader programs in alsa-tools and hotplug firmware loader".into(),
-                    size: "Installed".into(),
-                },
-                InstalledPackage {
-                    name: "alsa-plugins".into(),
-                    version: "1:1.2.12-6.1".into(),
-                    description: "Additional ALSA plugins".into(),
-                    size: "Installed".into(),
-                },
-                InstalledPackage {
-                    name: "alsa-utils".into(),
-                    version: "1.2.16-1.1".into(),
-                    description: "Advanced Linux Sound Architecture - Utilities".into(),
-                    size: "Installed".into(),
-                },
-                InstalledPackage {
-                    name: "antigravity".into(),
-                    version: "2.11.0-1".into(),
-                    description: "Google Antigravity 2.0 multi-agent orchestration platform".into(),
-                    size: "Installed".into(),
-                },
-                InstalledPackage {
-                    name: "apache".into(),
-                    version: "2.4.68-1.1".into(),
-                    description: "A high performance Unix-based HTTP server".into(),
-                    size: "Installed".into(),
-                },
-                InstalledPackage {
-                    name: "ark".into(),
-                    version: "26.08.1-1.1".into(),
-                    description: "Archiving Tool".into(),
-                    size: "Installed".into(),
-                },
-                InstalledPackage {
-                    name: "awesome-terminal-fonts".into(),
-                    version: "1.1.0-5".into(),
-                    description: "fonts/icons for powerlines".into(),
-                    size: "Installed".into(),
-                },
-                InstalledPackage {
-                    name: "base".into(),
-                    version: "3-3".into(),
-                    description: "Minimal package set to define a basic Arch Linux installation".into(),
-                    size: "Installed".into(),
-                },
-            ];
+            self.state.uninstall_msg.get_or_insert(StatusMsg {
+                level: MsgLevel::Info,
+                text: "No explicitly installed packages were reported by pacman.".to_string(),
+            });
         }
 
         self.state.installed_packages = packages;
@@ -245,7 +188,11 @@ impl ArchBridgeApp {
                     self.state.health_checks = checks;
                 }
                 self.state.doctor_msg = Some(StatusMsg {
-                    level: if ready { MsgLevel::Success } else { MsgLevel::Warning },
+                    level: if ready {
+                        MsgLevel::Success
+                    } else {
+                        MsgLevel::Warning
+                    },
                     text: if ready {
                         "All system health diagnostics verified and passing!".to_string()
                     } else {
@@ -287,74 +234,32 @@ impl ArchBridgeApp {
 
         match result {
             Ok(val) => {
-                let mut parsed = parse_search_results(&val);
+                let parsed = parse_search_results(&val);
                 if parsed.is_empty() {
-                    // Provide rich multi-source candidates for the query
-                    let q = query.to_lowercase();
-                    parsed = vec![
-                        SearchResult {
-                            name: q.clone(),
-                            version: "3.0.21-14".into(),
-                            description: format!("Official {} package from Arch Linux repositories", query),
-                            source: "official".into(),
-                            score: 1.0,
-                            repo: "extra".into(),
-                            is_recommended: true,
-                            license: "GPL-2.0-or-later / LGPL-2.1-or-later".into(),
-                            arch: "x86_64".into(),
-                            size: "41.97 MiB".into(),
-                            maintainer: "Arch Linux Package Maintainers".into(),
-                        },
-                        SearchResult {
-                            name: format!("{}-bin", q),
-                            version: "3.0.21-1".into(),
-                            description: format!("Pre-built binary package for {} from AUR", query),
-                            source: "aur".into(),
-                            score: 0.95,
-                            repo: "AUR (community)".into(),
-                            is_recommended: false,
-                            license: "Open Source".into(),
-                            arch: "x86_64".into(),
-                            size: "42.1 MiB".into(),
-                            maintainer: "AUR Contributor".into(),
-                        },
-                        SearchResult {
-                            name: format!("org.videolan.{}", query.to_uppercase()),
-                            version: "3.0.21".into(),
-                            description: format!("{} official flatpak release", query),
-                            source: "flatpak".into(),
-                            score: 0.90,
-                            repo: "Flathub".into(),
-                            is_recommended: false,
-                            license: "GPL-2.0+".into(),
-                            arch: "x86_64".into(),
-                            size: "84.5 MiB".into(),
-                            maintainer: "Flathub Maintainers".into(),
-                        },
-                        SearchResult {
-                            name: format!("github.com/videolan/{}", q),
-                            version: "master".into(),
-                            description: format!("Source code repository for {}", query),
-                            source: "upstream".into(),
-                            score: 0.80,
-                            repo: "GitHub".into(),
-                            is_recommended: false,
-                            license: "GPL".into(),
-                            arch: "source".into(),
-                            size: "Source Repo".into(),
-                            maintainer: "VideoLAN Organization".into(),
-                        },
-                    ];
+                    self.state.search_results.clear();
+                    self.state.selected_result = None;
+                    self.state.recommended_item = None;
+                    self.state.search_msg = Some(StatusMsg {
+                        level: MsgLevel::Warning,
+                        text: format!(
+                            "No packages or upstream repositories found matching '{}'",
+                            query
+                        ),
+                    });
+                } else {
+                    let n = parsed.len();
+                    self.state.recommended_item = parsed
+                        .iter()
+                        .find(|r| r.is_recommended)
+                        .cloned()
+                        .or_else(|| parsed.first().cloned());
+                    self.state.search_results = parsed;
+                    self.state.selected_result = Some(0);
+                    self.state.search_msg = Some(StatusMsg {
+                        level: MsgLevel::Info,
+                        text: format!("Found {} source candidate(s) for '{}'", n, query),
+                    });
                 }
-
-                self.state.search_results = parsed;
-                self.state.selected_result = Some(0);
-                self.state.recommended_item = self.state.search_results.first().cloned();
-                let n = self.state.search_results.len();
-                self.state.search_msg = Some(StatusMsg {
-                    level: MsgLevel::Info,
-                    text: format!("Found {} source candidate(s) for '{}'", n, query),
-                });
             }
             Err(e) => {
                 self.state.search_msg = Some(StatusMsg {
@@ -382,7 +287,8 @@ impl ArchBridgeApp {
                 self.state.inspect_data = Some(val);
                 self.state.inspect_msg = Some(StatusMsg {
                     level: MsgLevel::Success,
-                    text: "Foreign package analyzed in data-only mode (EXECUTED: FALSE)".to_string(),
+                    text: "Foreign package analyzed in data-only mode (EXECUTED: FALSE)"
+                        .to_string(),
                 });
             }
             Err(e) => {
@@ -401,7 +307,11 @@ impl ArchBridgeApp {
         } else if !self.state.inspect_path.trim().is_empty() {
             self.state.inspect_path.trim().to_string()
         } else if let Some(idx) = self.state.selected_result {
-            self.state.search_results.get(idx).map(|r| r.name.clone()).unwrap_or_else(|| "vlc".to_string())
+            self.state
+                .search_results
+                .get(idx)
+                .map(|r| r.name.clone())
+                .unwrap_or_else(|| "vlc".to_string())
         } else {
             "vlc".to_string()
         };
@@ -424,7 +334,8 @@ impl ArchBridgeApp {
                     self.state.active_tab = ActiveTab::Build;
                     self.state.build_msg = Some(StatusMsg {
                         level: MsgLevel::Info,
-                        text: "Build Plan Prepared. Review PKGBUILD manifest and execute.".to_string(),
+                        text: "Build Plan Prepared. Review PKGBUILD manifest and execute."
+                            .to_string(),
                     });
                 }
             }
@@ -462,7 +373,11 @@ impl ArchBridgeApp {
                     self.state.build_stage = if ok { 4 } else { 3 };
                     self.state.build_log = exec.output.clone().unwrap_or_default();
                     self.state.build_msg = Some(StatusMsg {
-                        level: if ok { MsgLevel::Success } else { MsgLevel::Error },
+                        level: if ok {
+                            MsgLevel::Success
+                        } else {
+                            MsgLevel::Error
+                        },
                         text: exec.message.clone(),
                     });
                     self.state.build_result = Some(exec);
@@ -519,7 +434,11 @@ impl ArchBridgeApp {
                         Ok(r) => {
                             let ok = r.get("ok").and_then(|o| o.as_bool()).unwrap_or(false);
                             self.state.uninstall_msg = Some(StatusMsg {
-                                level: if ok { MsgLevel::Success } else { MsgLevel::Error },
+                                level: if ok {
+                                    MsgLevel::Success
+                                } else {
+                                    MsgLevel::Error
+                                },
                                 text: r
                                     .get("message")
                                     .and_then(|m| m.as_str())
@@ -556,36 +475,189 @@ impl ArchBridgeApp {
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
+pub fn app_icon_for_name(name: &str) -> &'static str {
+    let lower = name.to_lowercase();
+    if lower.contains("brave") {
+        "🦁"
+    } else if lower.contains("vlc")
+        || lower.contains("video")
+        || lower.contains("media")
+        || lower.contains("mpv")
+    {
+        "🎬"
+    } else if lower.contains("discord") {
+        "💬"
+    } else if lower.contains("telegram") {
+        "✈️"
+    } else if lower.contains("chrome")
+        || lower.contains("chromium")
+        || lower.contains("firefox")
+        || lower.contains("browser")
+    {
+        "🌐"
+    } else if lower.contains("code")
+        || lower.contains("vscode")
+        || lower.contains("nvim")
+        || lower.contains("neovim")
+        || lower.contains("vim")
+    {
+        "💻"
+    } else if lower.contains("docker") || lower.contains("podman") || lower.contains("container") {
+        "🐳"
+    } else if lower.contains("steam")
+        || lower.contains("game")
+        || lower.contains("lutris")
+        || lower.contains("heroic")
+    {
+        "🎮"
+    } else if lower.contains("music")
+        || lower.contains("spotify")
+        || lower.contains("audio")
+        || lower.contains("alsa")
+        || lower.contains("pipewire")
+    {
+        "🎵"
+    } else if lower.contains("terminal")
+        || lower.contains("alacritty")
+        || lower.contains("kitty")
+        || lower.contains("bash")
+        || lower.contains("zsh")
+        || lower.contains("fish")
+    {
+        "💻"
+    } else if lower.contains("git")
+        || lower.contains("ninja")
+        || lower.contains("cmake")
+        || lower.contains("cargo")
+        || lower.contains("rust")
+        || lower.contains("gcc")
+    {
+        "⚙"
+    } else {
+        "📦"
+    }
+}
+
 fn parse_search_results(val: &serde_json::Value) -> Vec<SearchResult> {
     let mut out = Vec::new();
-    if let Some(candidates) = val.get("candidates").and_then(|c| c.as_array()) {
-        for (idx, item) in candidates.iter().enumerate() {
-            let src = item.get("source").and_then(|s| s.as_str()).unwrap_or("official").to_string();
-            let name = item.get("name").and_then(|n| n.as_str()).unwrap_or("unknown").to_string();
-            let version = item.get("version").and_then(|v| v.as_str()).unwrap_or("3.0.21").to_string();
-            let desc = item.get("description").and_then(|d| d.as_str()).unwrap_or("Multi-platform media player").to_string();
 
-            out.push(SearchResult {
-                name,
-                version,
-                description: desc,
-                source: src.clone(),
-                score: item.get("confidence_score").and_then(|s| s.as_f64()).unwrap_or(0.95),
-                repo: match src.as_str() {
-                    "official" => "extra".to_string(),
-                    "aur" => "AUR (community)".to_string(),
-                    "flatpak" => "Flathub".to_string(),
-                    "appimage" => "Official Release".to_string(),
-                    _ => "GitHub".to_string(),
-                },
-                is_recommended: idx == 0,
-                license: "GPL / Open Source".to_string(),
-                arch: "x86_64".to_string(),
-                size: "41.97 MiB".to_string(),
-                maintainer: "Arch Linux Package Maintainers".to_string(),
-            });
+    // 1. Parse DecisionReport format from v1.search (decision_table)
+    if let Some(table) = val.get("decision_table").and_then(|t| t.as_array()) {
+        for row in table {
+            let source = row
+                .get("source")
+                .and_then(|s| s.as_str())
+                .unwrap_or("unknown")
+                .to_string();
+            let is_row_rec = row
+                .get("recommended")
+                .and_then(|r| r.as_bool())
+                .unwrap_or(false);
+
+            if let Some(candidates) = row.get("candidates").and_then(|c| c.as_array()) {
+                for (cand_idx, item) in candidates.iter().enumerate() {
+                    let name = item
+                        .get("name")
+                        .and_then(|n| n.as_str())
+                        .unwrap_or("unknown")
+                        .to_string();
+                    let version = item
+                        .get("version")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("latest")
+                        .to_string();
+                    let desc = item
+                        .get("description")
+                        .and_then(|d| d.as_str())
+                        .unwrap_or("Package candidate")
+                        .to_string();
+
+                    let repo = match source.as_str() {
+                        "official" => "Arch Official (pacman)".to_string(),
+                        "aur" => "AUR (Community PKGBUILD)".to_string(),
+                        "flatpak" => "Flathub Sandbox".to_string(),
+                        "appimage" => "AppImage Binary".to_string(),
+                        "upstream" => "GitHub / Git Source".to_string(),
+                        "deb" => "DEB Foreign Package".to_string(),
+                        "rpm" => "RPM Foreign Package".to_string(),
+                        _ => source.clone(),
+                    };
+
+                    out.push(SearchResult {
+                        name,
+                        version,
+                        description: desc,
+                        source: source.clone(),
+                        score: if is_row_rec && cand_idx == 0 {
+                            1.0
+                        } else {
+                            0.85
+                        },
+                        repo,
+                        is_recommended: is_row_rec && cand_idx == 0 && out.is_empty(),
+                        license: "Open Source / Package License".to_string(),
+                        arch: "x86_64".to_string(),
+                        size: "Package Source".to_string(),
+                        maintainer: match source.as_str() {
+                            "official" => "Arch Linux Maintainers".to_string(),
+                            "aur" => "AUR Contributor".to_string(),
+                            "upstream" => "Upstream Project".to_string(),
+                            _ => "Package Provider".to_string(),
+                        },
+                    });
+                }
+            }
         }
     }
+
+    // 2. Direct candidates array fallback
+    if out.is_empty() {
+        if let Some(candidates) = val.get("candidates").and_then(|c| c.as_array()) {
+            for (idx, item) in candidates.iter().enumerate() {
+                let src = item
+                    .get("source")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("official")
+                    .to_string();
+                let name = item
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+                let version = item
+                    .get("version")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("latest")
+                    .to_string();
+                let desc = item
+                    .get("description")
+                    .and_then(|d| d.as_str())
+                    .unwrap_or("Package candidate")
+                    .to_string();
+
+                out.push(SearchResult {
+                    name,
+                    version,
+                    description: desc,
+                    source: src.clone(),
+                    score: 0.90,
+                    repo: match src.as_str() {
+                        "official" => "extra".to_string(),
+                        "aur" => "AUR (community)".to_string(),
+                        "flatpak" => "Flathub".to_string(),
+                        "appimage" => "Official Release".to_string(),
+                        _ => "GitHub".to_string(),
+                    },
+                    is_recommended: idx == 0,
+                    license: "Open Source".to_string(),
+                    arch: "x86_64".to_string(),
+                    size: "Package".to_string(),
+                    maintainer: "Package Maintainer".to_string(),
+                });
+            }
+        }
+    }
+
     out
 }
 
@@ -620,12 +692,41 @@ where
         .child(label)
 }
 
-fn status_msg_bar(msg: &StatusMsg) -> impl IntoElement {
+fn small_button(
+    id: impl Into<SharedString>,
+    label: impl Into<SharedString>,
+    bg: u32,
+    text: u32,
+    handler: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    div()
+        .id(id.into())
+        .h(px(32.0))
+        .px_3()
+        .bg(rgb(bg))
+        .rounded_lg()
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_center()
+        .cursor_pointer()
+        .text_color(rgb(text))
+        .text_size(px(12.0))
+        .font_weight(FontWeight::BOLD)
+        .whitespace_nowrap()
+        .on_click(handler)
+        .child(label.into())
+}
+
+fn status_msg_bar(msg: &StatusMsg, pal: &ThemePalette) -> impl IntoElement {
     let (bg, text) = match msg.level {
         MsgLevel::Success => (PILL_OK, PILL_OK_TEXT),
         MsgLevel::Warning => (PILL_WARN, PILL_WARN_TEXT),
         MsgLevel::Error => (PILL_ERR, PILL_ERR_TEXT),
-        MsgLevel::Info => (BG_HOVER, TEXT_SECONDARY),
+        MsgLevel::Info => (
+            if pal.is_light() { 0xe2e8f0 } else { 0x16243b },
+            pal.text_secondary,
+        ),
     };
     div()
         .w_full()
@@ -640,7 +741,7 @@ fn status_msg_bar(msg: &StatusMsg) -> impl IntoElement {
         .child(msg.text.clone())
 }
 
-fn section_header(title: &'static str) -> impl IntoElement {
+fn section_header(title: &'static str, pal: &ThemePalette) -> impl IntoElement {
     div()
         .flex()
         .items_center()
@@ -648,15 +749,15 @@ fn section_header(title: &'static str) -> impl IntoElement {
         .py_1()
         .child(
             div()
-                .text_color(rgb(TEXT_MUTED))
+                .text_color(rgb(pal.text_muted))
                 .text_size(px(11.0))
                 .font_weight(FontWeight::BOLD)
                 .child(title.to_uppercase()),
         )
-        .child(div().flex_1().h_px().bg(rgb(BORDER_SUBTLE)))
+        .child(div().flex_1().h_px().bg(rgb(pal.border_subtle)))
 }
 
-fn detail_row(key: &str, value: &str) -> impl IntoElement {
+fn detail_row(key: &str, value: &str, pal: &ThemePalette) -> impl IntoElement {
     div()
         .flex()
         .items_center()
@@ -664,13 +765,13 @@ fn detail_row(key: &str, value: &str) -> impl IntoElement {
         .py_1()
         .child(
             div()
-                .text_color(rgb(TEXT_MUTED))
+                .text_color(rgb(pal.text_muted))
                 .text_size(px(12.0))
                 .child(key.to_string()),
         )
         .child(
             div()
-                .text_color(rgb(TEXT_PRIMARY))
+                .text_color(rgb(pal.text_primary))
                 .text_size(px(12.0))
                 .font_weight(FontWeight::MEDIUM)
                 .child(value.to_string()),
@@ -706,12 +807,13 @@ fn source_badge(source: &str) -> impl IntoElement {
 
 impl Render for ArchBridgeApp {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let pal = get_palette(self.state.theme);
         div()
             .id("root")
             .track_focus(&self.focus_handle)
             .flex()
             .flex_row()
-            .bg(rgb(BG_DARKEST))
+            .bg(rgb(pal.bg_darkest))
             .size_full()
             .font_family("sans-serif")
             // ── Sidebar ──────────────────────────────────────────────
@@ -723,20 +825,20 @@ impl Render for ArchBridgeApp {
                     .h_full()
                     .flex()
                     .flex_col()
-                    .bg(rgb(BG_DARK))
+                    .bg(rgb(pal.bg_dark))
                     .min_w(px(0.0))
-                    .p_5()
+                    .p_4()
                     .gap_3()
-                    // Top Bar Surface with 4 Cells (fixed height, left-aligned)
+                    // Sleek Modern Top Navbar (Fixed 46px height)
                     .child(
                         div()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .justify_start()
+                            .w_full()
+                            .h(px(46.0))
+                            .max_h(px(46.0))
+                            .flex_none()
                             .child(render_top_bar(self, cx)),
                     )
-                    // Active Tab View Content
+                    // Active Tab View Content (Expands to take 90%+ of vertical space)
                     .child(
                         div()
                             .flex_1()
@@ -745,316 +847,292 @@ impl Render for ArchBridgeApp {
                             .child(render_active_view(self, cx)),
                     )
                     // Bottom Status Bar
-                    .child(render_bottom_bar(self)),
+                    .child(
+                        div()
+                            .w_full()
+                            .h(px(24.0))
+                            .max_h(px(24.0))
+                            .flex_none()
+                            .child(render_bottom_bar(self)),
+                    ),
             )
     }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Top Bar Surface with 4 Cells (Matching Previous Screenshots)
+// Modern Sleek Web-Style Top Navbar
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn render_top_bar(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> impl IntoElement {
+    let pal = get_palette(app.state.theme);
     let theme_mode = app.state.theme;
     let (theme_icon, theme_name) = match theme_mode {
         AppTheme::Dark => ("🌙", "Dark"),
-        AppTheme::Midnight => ("🌌", "Midnight"),
+        AppTheme::Midnight => ("🌌", "OLED"),
         AppTheme::Light => ("☀️", "Light"),
     };
 
+    let active_title = match app.state.active_tab {
+        ActiveTab::Discover => "Discover Packages",
+        ActiveTab::Inspect => "Foreign Package Inspector",
+        ActiveTab::Build => "Clean Chroot Build Studio",
+        ActiveTab::Uninstall => "Installed Software",
+        ActiveTab::Doctor => "System Health & Doctor",
+        ActiveTab::Settings => "Settings & Preferences",
+    };
+
     div()
+        .w_full()
+        .h(px(46.0))
         .flex_none()
-        .w(px(710.0))
-        .h(px(50.0))
-        .bg(rgb(0x09101d))
+        .bg(rgb(pal.bg_topbar))
         .border_1()
-        .border_color(rgb(0x16243b))
+        .border_color(rgb(pal.border_subtle))
         .rounded_xl()
-        .px_2_5()
-        .py_1()
+        .px_4()
         .flex()
         .flex_row()
         .items_center()
-        .gap_2()
-        // Cell 1: Engine Ready
+        .justify_between()
+        // Left: Breadcrumb / Active Page Title
         .child(
             div()
-                .flex_none()
-                .w(px(150.0))
-                .h(px(38.0))
-                .px_2_5()
-                .rounded_lg()
-                .bg(rgb(0x0c1626))
                 .flex()
                 .items_center()
                 .gap_2()
                 .child(
                     div()
-                        .flex_none()
-                        .w(px(26.0))
-                        .h(px(26.0))
-                        .rounded_md()
-                        .bg(rgb(0x0f2b24))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .text_color(rgb(ACCENT_GREEN))
-                        .text_size(px(13.0))
-                        .child("⚡"),
+                        .text_color(rgb(pal.text_muted))
+                        .text_size(px(12.5))
+                        .font_weight(FontWeight::MEDIUM)
+                        .child("ArchBridge"),
                 )
                 .child(
                     div()
-                        .flex_1()
-                        .min_w(px(0.0))
-                        .flex()
-                        .flex_col()
-                        .justify_center()
-                        .child(
-                            div()
-                                .text_color(rgb(TEXT_PRIMARY))
-                                .text_size(px(11.0))
-                                .font_weight(FontWeight::BOLD)
-                                .whitespace_nowrap()
-                                .child("Engine ready"),
-                        )
-                        .child(
-                            div()
-                                .text_color(rgb(TEXT_MUTED))
-                                .text_size(px(8.5))
-                                .whitespace_nowrap()
-                                .child("Local service connected"),
-                        ),
+                        .text_color(rgb(pal.border_subtle))
+                        .text_size(px(12.0))
+                        .child("›"),
+                )
+                .child(
+                    div()
+                        .text_color(rgb(pal.text_primary))
+                        .text_size(px(13.0))
+                        .font_weight(FontWeight::BOLD)
+                        .child(active_title),
+                )
+                .child(
+                    div()
+                        .ml_2()
+                        .px_2()
+                        .py_0p5()
+                        .rounded_full()
+                        .bg(if pal.is_light() {
+                            rgb(0xdbeafe)
+                        } else {
+                            rgb(0x10233d)
+                        })
+                        .border_1()
+                        .border_color(if pal.is_light() {
+                            rgb(0xbfdbfe)
+                        } else {
+                            rgb(0x1c3a63)
+                        })
+                        .text_color(rgb(pal.accent_cyan))
+                        .text_size(px(10.0))
+                        .font_weight(FontWeight::BOLD)
+                        .child(format!("v{}", APP_VERSION)),
                 ),
         )
-        // Cell 2: History Menu
+        // Center & Right Status Items
         .child(
             div()
-                .id("history-cell")
-                .flex_none()
-                .w(px(135.0))
-                .h(px(38.0))
-                .px_2_5()
-                .rounded_lg()
-                .bg(rgb(0x0c1626))
-                .cursor_pointer()
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.state.show_history_menu = !this.state.show_history_menu;
-                    cx.notify();
-                }))
                 .flex()
                 .items_center()
-                .gap_2()
+                .gap_3()
+                // Engine Online Pill
                 .child(
                     div()
-                        .flex_none()
-                        .w(px(26.0))
-                        .h(px(26.0))
-                        .rounded_md()
-                        .bg(rgb(0x102138))
+                        .px_3()
+                        .h(px(30.0))
+                        .rounded_lg()
+                        .bg(if pal.is_light() {
+                            rgb(0xecfdf5)
+                        } else {
+                            rgb(0x0a1f18)
+                        })
+                        .border_1()
+                        .border_color(if pal.is_light() {
+                            rgb(0xa7f3d0)
+                        } else {
+                            rgb(0x134e3a)
+                        })
                         .flex()
                         .items_center()
-                        .justify_center()
-                        .text_color(rgb(ACCENT_CYAN))
-                        .text_size(px(12.0))
-                        .child("🕒"),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w(px(0.0))
-                        .flex()
-                        .flex_col()
-                        .justify_center()
+                        .gap_2()
                         .child(
                             div()
-                                .text_color(rgb(TEXT_PRIMARY))
-                                .text_size(px(11.0))
-                                .font_weight(FontWeight::BOLD)
-                                .whitespace_nowrap()
-                                .child("History ▾"),
+                                .w(px(7.0))
+                                .h(px(7.0))
+                                .rounded_full()
+                                .bg(rgb(ACCENT_GREEN)),
                         )
                         .child(
                             div()
-                                .text_color(rgb(TEXT_MUTED))
-                                .text_size(px(8.5))
-                                .whitespace_nowrap()
-                                .child(if let Some(first) = app.state.search_history.first() {
-                                    format!("Recent: {}", first)
+                                .text_color(if pal.is_light() {
+                                    rgb(0x065f46)
                                 } else {
-                                    "No recent searches".to_string()
+                                    rgb(0x34d399)
+                                })
+                                .text_size(px(11.5))
+                                .font_weight(FontWeight::MEDIUM)
+                                .child("Engine Online"),
+                        ),
+                )
+                // Health Check Pill
+                .child(
+                    div()
+                        .id("top-doctor-pill")
+                        .px_3()
+                        .h(px(30.0))
+                        .rounded_lg()
+                        .cursor_pointer()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.state.active_tab = ActiveTab::Doctor;
+                            this.run_doctor(cx);
+                        }))
+                        .bg(if pal.is_light() {
+                            rgb(0xf1f5f9)
+                        } else {
+                            rgb(0x0f172a)
+                        })
+                        .border_1()
+                        .border_color(rgb(pal.border_subtle))
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(div().text_size(px(12.0)).child("🛡"))
+                        .child(
+                            div()
+                                .text_color(rgb(pal.text_secondary))
+                                .text_size(px(11.5))
+                                .font_weight(FontWeight::MEDIUM)
+                                .child(if app.state.doctor_ready {
+                                    "System Ready"
+                                } else {
+                                    "Diagnostics"
                                 }),
                         ),
-                ),
-        )
-        // Cell 3: System Ready
-        .child(
-            div()
-                .flex_none()
-                .w(px(145.0))
-                .h(px(38.0))
-                .px_2_5()
-                .rounded_lg()
-                .bg(rgb(0x0c1626))
-                .flex()
-                .items_center()
-                .gap_2()
+                )
+                // Sudo Toggle Pill
                 .child(
                     div()
-                        .flex_none()
-                        .w(px(26.0))
-                        .h(px(26.0))
-                        .rounded_md()
-                        .bg(rgb(0x0f2b24))
+                        .id("top-sudo-pill")
+                        .px_3()
+                        .h(px(30.0))
+                        .rounded_lg()
+                        .cursor_pointer()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.state.sudo_session_active = !this.state.sudo_session_active;
+                            this.state.settings_msg = Some(StatusMsg {
+                                level: MsgLevel::Info,
+                                text: if this.state.sudo_session_active {
+                                    "Sudo credentials cached for this session.".to_string()
+                                } else {
+                                    "Sudo session revoked.".to_string()
+                                },
+                            });
+                            cx.notify();
+                        }))
+                        .bg(if app.state.sudo_session_active {
+                            if pal.is_light() {
+                                rgb(0xecfdf5)
+                            } else {
+                                rgb(0x0a1f18)
+                            }
+                        } else {
+                            if pal.is_light() {
+                                rgb(0xf8fafc)
+                            } else {
+                                rgb(0x131a26)
+                            }
+                        })
+                        .border_1()
+                        .border_color(if app.state.sudo_session_active {
+                            if pal.is_light() {
+                                rgb(0xa7f3d0)
+                            } else {
+                                rgb(0x134e3a)
+                            }
+                        } else {
+                            rgb(pal.border_subtle)
+                        })
                         .flex()
                         .items_center()
-                        .justify_center()
-                        .text_color(rgb(ACCENT_GREEN))
-                        .text_size(px(12.0))
-                        .child("🛡️"),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w(px(0.0))
-                        .flex()
-                        .flex_col()
-                        .justify_center()
+                        .gap_2()
                         .child(
                             div()
-                                .text_color(rgb(TEXT_PRIMARY))
-                                .text_size(px(11.0))
-                                .font_weight(FontWeight::BOLD)
-                                .whitespace_nowrap()
-                                .child(if app.state.doctor_ready { "System ready" } else { "System warning" }),
+                                .text_size(px(12.0))
+                                .child(if app.state.sudo_session_active {
+                                    "🔓"
+                                } else {
+                                    "🔒"
+                                }),
                         )
                         .child(
                             div()
-                                .text_color(rgb(TEXT_MUTED))
-                                .text_size(px(8.5))
-                                .whitespace_nowrap()
-                                .child("Health checks passing"),
+                                .text_color(if app.state.sudo_session_active {
+                                    if pal.is_light() {
+                                        rgb(0x065f46)
+                                    } else {
+                                        rgb(0x34d399)
+                                    }
+                                } else {
+                                    rgb(pal.text_muted)
+                                })
+                                .text_size(px(11.5))
+                                .font_weight(FontWeight::MEDIUM)
+                                .child(if app.state.sudo_session_active {
+                                    "Sudo Active"
+                                } else {
+                                    "Sudo Inactive"
+                                }),
                         ),
-                ),
-        )
-        // Cell 4: Sudo Status
-        .child(
-            div()
-                .id("sudo-cell")
-                .flex_none()
-                .w(px(135.0))
-                .h(px(38.0))
-                .px_2_5()
-                .rounded_lg()
-                .bg(rgb(0x0c1626))
-                .cursor_pointer()
-                .on_click(cx.listener(|this, _, _, cx| {
-                    if this.state.sudo_session_active {
-                        this.state.sudo_session_active = false;
-                        this.state.settings_msg = Some(StatusMsg {
-                            level: MsgLevel::Info,
-                            text: "Sudo authorization session cleared.".to_string(),
-                        });
-                    } else {
-                        this.state.auth_dialog_open = true;
-                    }
-                    cx.notify();
-                }))
-                .flex()
-                .items_center()
-                .gap_2()
-                .child(
-                    div()
-                        .flex_none()
-                        .w(px(26.0))
-                        .h(px(26.0))
-                        .rounded_md()
-                        .bg(if app.state.sudo_session_active { rgb(0x0f2b24) } else { rgb(0x24151b) })
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .text_color(if app.state.sudo_session_active { rgb(ACCENT_GREEN) } else { rgb(0x94a3b8) })
-                        .text_size(px(12.0))
-                        .child("🔒"),
                 )
+                // Vertical Divider
+                .child(div().w_px().h(px(18.0)).bg(rgb(pal.border_subtle)))
+                // Theme Switcher Toggle Pill
                 .child(
                     div()
-                        .flex_1()
-                        .min_w(px(0.0))
+                        .id("theme-toggle-cell")
+                        .h(px(30.0))
+                        .px_3()
+                        .rounded_lg()
+                        .bg(if pal.is_light() {
+                            rgb(0xe2e8f0)
+                        } else {
+                            rgb(0x142236)
+                        })
+                        .border_1()
+                        .border_color(rgb(pal.border_subtle))
+                        .cursor_pointer()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.state.theme = match this.state.theme {
+                                AppTheme::Dark => AppTheme::Midnight,
+                                AppTheme::Midnight => AppTheme::Light,
+                                AppTheme::Light => AppTheme::Dark,
+                            };
+                            cx.notify();
+                        }))
                         .flex()
-                        .flex_col()
-                        .justify_center()
-                        .child(
-                            div()
-                                .text_color(rgb(TEXT_PRIMARY))
-                                .text_size(px(11.0))
-                                .font_weight(FontWeight::BOLD)
-                                .whitespace_nowrap()
-                                .child(if app.state.sudo_session_active { "Sudo Active" } else { "Sudo Inactive" }),
-                        )
-                        .child(
-                            div()
-                                .text_color(rgb(TEXT_MUTED))
-                                .text_size(px(8.5))
-                                .whitespace_nowrap()
-                                .child(if app.state.sudo_session_active { "Password cached" } else { "No saved password" }),
-                        ),
-                ),
-        )
-        // Cell 5: Quick Theme Switcher
-        .child(
-            div()
-                .id("theme-toggle-cell")
-                .flex_none()
-                .w(px(100.0))
-                .h(px(38.0))
-                .px_2()
-                .rounded_lg()
-                .bg(rgb(0x0c1626))
-                .cursor_pointer()
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.state.theme = match this.state.theme {
-                        AppTheme::Dark => AppTheme::Midnight,
-                        AppTheme::Midnight => AppTheme::Light,
-                        AppTheme::Light => AppTheme::Dark,
-                    };
-                    cx.notify();
-                }))
-                .flex()
-                .items_center()
-                .gap_2()
-                .child(
-                    div()
-                        .flex_none()
-                        .w(px(26.0))
-                        .h(px(26.0))
-                        .rounded_md()
-                        .bg(rgb(0x152238))
-                        .flex()
+                        .flex_row()
                         .items_center()
-                        .justify_center()
-                        .text_size(px(12.0))
-                        .child(theme_icon),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w(px(0.0))
-                        .flex()
-                        .flex_col()
-                        .justify_center()
+                        .gap_2()
+                        .child(div().text_size(px(12.0)).child(theme_icon))
                         .child(
                             div()
-                                .text_color(rgb(TEXT_PRIMARY))
-                                .text_size(px(11.0))
+                                .text_color(rgb(pal.text_primary))
+                                .text_size(px(11.5))
                                 .font_weight(FontWeight::BOLD)
-                                .whitespace_nowrap()
-                                .child("Theme"),
-                        )
-                        .child(
-                            div()
-                                .text_color(rgb(ACCENT_CYAN))
-                                .text_size(px(8.5))
-                                .whitespace_nowrap()
                                 .child(theme_name),
                         ),
                 ),
@@ -1066,13 +1144,14 @@ fn render_top_bar(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> i
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn render_sidebar(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> impl IntoElement {
+    let pal = get_palette(app.state.theme);
     div()
         .w(px(215.0))
         .flex_none()
         .h_full()
-        .bg(rgb(0x080d16))
+        .bg(rgb(pal.bg_sidebar))
         .border_r_1()
-        .border_color(rgb(0x101926))
+        .border_color(rgb(pal.border_subtle))
         .flex()
         .flex_col()
         .justify_between()
@@ -1115,14 +1194,14 @@ fn render_sidebar(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> i
                                         .gap_1()
                                         .child(
                                             div()
-                                                .text_color(rgb(TEXT_PRIMARY))
+                                                .text_color(rgb(pal.text_primary))
                                                 .text_size(px(18.0))
                                                 .font_weight(FontWeight::BOLD)
                                                 .child("Arch"),
                                         )
                                         .child(
                                             div()
-                                                .text_color(rgb(ACCENT_CYAN))
+                                                .text_color(rgb(pal.accent_cyan))
                                                 .text_size(px(18.0))
                                                 .font_weight(FontWeight::BOLD)
                                                 .child("Bridge"),
@@ -1130,7 +1209,7 @@ fn render_sidebar(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> i
                                 )
                                 .child(
                                     div()
-                                        .text_color(rgb(TEXT_MUTED))
+                                        .text_color(rgb(pal.text_muted))
                                         .text_size(px(8.5))
                                         .font_weight(FontWeight::MEDIUM)
                                         .child("Discover · Build · Bridge · Go Further"),
@@ -1143,12 +1222,48 @@ fn render_sidebar(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> i
                         .flex()
                         .flex_col()
                         .gap_1_5()
-                        .child(sidebar_nav_btn(app, cx, ActiveTab::Discover, "🔍", "Discovery"))
-                        .child(sidebar_nav_btn(app, cx, ActiveTab::Inspect, "📦", "Inspect (.deb / .rpm)"))
-                        .child(sidebar_nav_btn(app, cx, ActiveTab::Build, "🔨", "Build & Install"))
-                        .child(sidebar_nav_btn(app, cx, ActiveTab::Uninstall, "🗑️", "Uninstall Software"))
-                        .child(sidebar_nav_btn(app, cx, ActiveTab::Doctor, "🤍", "Doctor Health"))
-                        .child(sidebar_nav_btn(app, cx, ActiveTab::Settings, "⚙️", "Settings")),
+                        .child(sidebar_nav_btn(
+                            app,
+                            cx,
+                            ActiveTab::Discover,
+                            "🔍",
+                            "Discovery",
+                        ))
+                        .child(sidebar_nav_btn(
+                            app,
+                            cx,
+                            ActiveTab::Inspect,
+                            "📦",
+                            "Inspect (.deb / .rpm)",
+                        ))
+                        .child(sidebar_nav_btn(
+                            app,
+                            cx,
+                            ActiveTab::Build,
+                            "🔨",
+                            "Build & Install",
+                        ))
+                        .child(sidebar_nav_btn(
+                            app,
+                            cx,
+                            ActiveTab::Uninstall,
+                            "🗑",
+                            "Uninstall Software",
+                        ))
+                        .child(sidebar_nav_btn(
+                            app,
+                            cx,
+                            ActiveTab::Doctor,
+                            "🛡",
+                            "Doctor Health",
+                        ))
+                        .child(sidebar_nav_btn(
+                            app,
+                            cx,
+                            ActiveTab::Settings,
+                            "⚙",
+                            "Settings",
+                        )),
                 ),
         )
         // Sidebar Footer Mountain Art & Quote
@@ -1161,21 +1276,21 @@ fn render_sidebar(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> i
                 .gap_2()
                 .child(
                     div()
-                        .text_color(rgb(0x4f6782))
+                        .text_color(rgb(if pal.is_light() { 0x64748b } else { 0x4f6782 }))
                         .text_size(px(11.0))
                         .italic()
                         .child("“ Same software.\n  More possibilities. ”"),
                 )
                 .child(
                     div()
-                        .text_color(rgb(0x204a6e))
+                        .text_color(rgb(if pal.is_light() { 0x0369a1 } else { 0x204a6e }))
                         .text_size(px(14.0))
                         .font_weight(FontWeight::BOLD)
                         .child("▲ Arch Linux"),
                 )
                 .child(
                     div()
-                        .text_color(rgb(0x3a5169))
+                        .text_color(rgb(if pal.is_light() { 0x94a3b8 } else { 0x3a5169 }))
                         .text_size(px(9.0))
                         .child("Powered by You"),
                 ),
@@ -1191,6 +1306,7 @@ fn sidebar_nav_btn(
 ) -> impl IntoElement {
     let is_active = app.state.active_tab == tab;
     let tab_clone = tab.clone();
+    let pal = get_palette(app.state.theme);
 
     div()
         .id(SharedString::from(label))
@@ -1202,9 +1318,25 @@ fn sidebar_nav_btn(
         .px_3()
         .rounded_lg()
         .cursor_pointer()
-        .bg(if is_active { rgb(0x14233c) } else { rgba(0x00000000) })
+        .bg(if is_active {
+            if pal.is_light() {
+                rgb(0xdbeafe)
+            } else {
+                rgb(0x14233c)
+            }
+        } else {
+            rgba(0x00000000)
+        })
         .border_1()
-        .border_color(if is_active { rgb(0x285485) } else { rgba(0x00000000) })
+        .border_color(if is_active {
+            if pal.is_light() {
+                rgb(0x93c5fd)
+            } else {
+                rgb(0x285485)
+            }
+        } else {
+            rgba(0x00000000)
+        })
         .on_click(cx.listener(move |this, _, _, cx| {
             this.state.active_tab = tab_clone.clone();
             this.state.search_focused = false;
@@ -1214,9 +1346,17 @@ fn sidebar_nav_btn(
         .child(div().text_size(px(14.0)).child(icon))
         .child(
             div()
-                .text_color(if is_active { rgb(ACCENT_CYAN) } else { rgb(0x94a3b8) })
+                .text_color(if is_active {
+                    rgb(pal.accent_cyan)
+                } else {
+                    rgb(pal.text_muted)
+                })
                 .text_size(px(13.0))
-                .font_weight(if is_active { FontWeight::BOLD } else { FontWeight::MEDIUM })
+                .font_weight(if is_active {
+                    FontWeight::BOLD
+                } else {
+                    FontWeight::MEDIUM
+                })
                 .child(label),
         )
 }
@@ -1244,6 +1384,7 @@ fn render_active_view(
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn render_discover(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> impl IntoElement {
+    let pal = get_palette(app.state.theme);
     let has_results = !app.state.search_results.is_empty();
 
     div()
@@ -1269,14 +1410,14 @@ fn render_discover(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> 
                         .gap_1()
                         .child(
                             div()
-                                .text_color(rgb(TEXT_PRIMARY))
+                                .text_color(rgb(pal.text_primary))
                                 .text_size(px(22.0))
                                 .font_weight(FontWeight::BOLD)
                                 .child("Discover Software"),
                         )
                         .child(
                             div()
-                                .text_color(rgb(TEXT_MUTED))
+                                .text_color(rgb(pal.text_muted))
                                 .text_size(px(13.0))
                                 .child("Find the best way to get your software on Arch Linux."),
                         ),
@@ -1298,9 +1439,19 @@ fn render_discover(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> 
                                         .track_focus(&app.search_focus)
                                         .flex_1()
                                         .h(px(40.0))
-                                        .bg(if app.state.search_focused { rgb(0x0e2238) } else { rgb(0x0c192b) })
+                                        .bg(if app.state.search_focused {
+                                            if pal.is_light() { rgb(0xffffff) } else { rgb(0x0e2238) }
+                                        } else {
+                                            rgb(pal.bg_input)
+                                        })
                                         .border_1()
-                                        .border_color(if app.state.search_focused { rgb(ACCENT_CYAN) } else if app.state.search_busy { rgb(0x0ea5e9) } else { rgb(0x29415f) })
+                                        .border_color(if app.state.search_focused {
+                                            rgb(pal.accent_cyan)
+                                        } else if app.state.search_busy {
+                                            rgb(0x0ea5e9)
+                                        } else {
+                                            rgb(pal.border)
+                                        })
                                         .rounded_lg()
                                         .px_3()
                                         .flex()
@@ -1348,13 +1499,13 @@ fn render_discover(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> 
                                                                 div()
                                                                     .w(px(2.0))
                                                                     .h(px(16.0))
-                                                                    .bg(rgb(ACCENT_CYAN))
+                                                                    .bg(rgb(pal.accent_cyan))
                                                                     .mr_1(),
                                                             )
                                                         })
                                                         .child(
                                                             div()
-                                                                .text_color(rgb(TEXT_PLACEHOLDER))
+                                                                .text_color(rgb(pal.text_placeholder))
                                                                 .text_size(px(13.0))
                                                                 .child(if app.state.search_focused {
                                                                     "Type package name (e.g. vlc, brave, discord)..."
@@ -1369,7 +1520,7 @@ fn render_discover(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> 
                                                         .items_center()
                                                         .child(
                                                             div()
-                                                                .text_color(rgb(TEXT_PRIMARY))
+                                                                .text_color(rgb(pal.text_primary))
                                                                 .text_size(px(13.0))
                                                                 .child(app.state.search_query.clone()),
                                                         )
@@ -1378,7 +1529,7 @@ fn render_discover(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> 
                                                                 div()
                                                                     .w(px(2.0))
                                                                     .h(px(16.0))
-                                                                    .bg(rgb(ACCENT_CYAN))
+                                                                    .bg(rgb(pal.accent_cyan))
                                                                     .ml(px(2.0)),
                                                             )
                                                         })
@@ -1389,15 +1540,15 @@ fn render_discover(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> 
                                 // Source filter dropdown box
                                 .child(
                                     div()
-                                        .bg(rgb(0x0c192b))
+                                        .bg(rgb(pal.bg_input))
                                         .border_1()
-                                        .border_color(rgb(0x29415f))
+                                        .border_color(rgb(pal.border))
                                         .rounded_lg()
                                         .px_3()
                                         .h(px(40.0))
                                         .flex()
                                         .items_center()
-                                        .text_color(rgb(TEXT_SECONDARY))
+                                        .text_color(rgb(pal.text_secondary))
                                         .text_size(px(12.0))
                                         .child("All Sources ▾"),
                                 )
@@ -1419,7 +1570,7 @@ fn render_discover(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> 
                                 .px_1()
                                 .child(
                                     div()
-                                        .text_color(rgb(TEXT_MUTED))
+                                        .text_color(rgb(pal.text_muted))
                                         .text_size(px(11.0))
                                         .child("Try:"),
                                 )
@@ -1433,7 +1584,7 @@ fn render_discover(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> 
                 )
                 // Status message
                 .when_some(app.state.search_msg.clone(), |this, msg| {
-                    this.child(status_msg_bar(&msg))
+                    this.child(status_msg_bar(&msg, &pal))
                 })
                 // Recommended Path Safe Banner
                 .when_some(app.state.recommended_item.clone(), |this, item| {
@@ -1441,7 +1592,7 @@ fn render_discover(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> 
                         div()
                             .w_full()
                             .p_4()
-                            .bg(rgb(0x072421))
+                            .bg(if pal.is_light() { rgb(0xecfdf5) } else { rgb(0x072421) })
                             .border_1()
                             .border_color(rgb(0x10b981))
                             .rounded_xl()
@@ -1498,7 +1649,7 @@ fn render_discover(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> 
                                             )
                                             .child(
                                                 div()
-                                                    .text_color(rgb(TEXT_SECONDARY))
+                                                    .text_color(rgb(pal.text_secondary))
                                                     .text_size(px(12.0))
                                                     .child(format!(
                                                         "{} is available in the official {} path. Safest choice.",
@@ -1530,7 +1681,7 @@ fn render_discover(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> 
                                 .justify_between()
                                 .child(
                                     div()
-                                        .text_color(rgb(TEXT_PRIMARY))
+                                        .text_color(rgb(pal.text_primary))
                                         .text_size(px(14.0))
                                         .font_weight(FontWeight::BOLD)
                                         .child("Available Sources"),
@@ -1541,8 +1692,8 @@ fn render_discover(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> 
                                         .py_1()
                                         .rounded_lg()
                                         .border_1()
-                                        .border_color(rgb(0x1c304a))
-                                        .text_color(rgb(TEXT_MUTED))
+                                        .border_color(rgb(pal.border_subtle))
+                                        .text_color(rgb(pal.text_muted))
                                         .text_size(px(12.0))
                                         .child("Recommended"),
                                 ),
@@ -1562,7 +1713,7 @@ fn render_discover(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> 
                                             .enumerate()
                                             .map(|(i, result)| {
                                                 let selected = app.state.selected_result == Some(i);
-                                                source_candidate_card(i, result, selected, cx)
+                                                source_candidate_card(i, result, selected, &pal, cx)
                                             })
                                             .collect::<Vec<_>>(),
                                     ),
@@ -1595,23 +1746,36 @@ fn source_candidate_card(
     idx: usize,
     result: &SearchResult,
     selected: bool,
+    pal: &ThemePalette,
     cx: &mut Context<ArchBridgeApp>,
 ) -> impl IntoElement {
     let (border_glow, bg_card) = match result.source.as_str() {
-        "official" => (BORDER_GLOW_OFFICIAL, BG_CARD),
-        "aur" => (BORDER_GLOW_AUR, BG_CARD_ALT),
-        "flatpak" => (BORDER_GLOW_FLATPAK, BG_CARD_ALT),
-        "appimage" => (BORDER_GLOW_APPIMAGE, BG_CARD_ALT),
-        _ => (BORDER_GLOW_UPSTREAM, BG_CARD_ALT),
+        "official" => (BORDER_GLOW_OFFICIAL, pal.bg_card),
+        "aur" => (BORDER_GLOW_AUR, pal.bg_card_alt),
+        "flatpak" => (BORDER_GLOW_FLATPAK, pal.bg_card_alt),
+        "appimage" => (BORDER_GLOW_APPIMAGE, pal.bg_card_alt),
+        _ => (BORDER_GLOW_UPSTREAM, pal.bg_card_alt),
     };
 
     div()
         .id(SharedString::from(format!("card-{}", idx)))
         .w_full()
         .p_3()
-        .bg(if selected { rgb(0x16263b) } else { rgb(bg_card) })
+        .bg(if selected {
+            if pal.is_light() {
+                rgb(0xdbeafe)
+            } else {
+                rgb(0x16263b)
+            }
+        } else {
+            rgb(bg_card)
+        })
         .border_1()
-        .border_color(if selected { rgb(ACCENT_CYAN) } else { rgb(border_glow) })
+        .border_color(if selected {
+            rgb(pal.accent_cyan)
+        } else {
+            rgb(border_glow)
+        })
         .rounded_xl()
         .cursor_pointer()
         .on_click(cx.listener(move |this, _, _, cx| {
@@ -1621,12 +1785,31 @@ fn source_candidate_card(
         .flex()
         .items_center()
         .justify_between()
-        // Left info block
+        // Left info block with app icon
         .child(
             div()
                 .flex()
                 .items_center()
-                .gap_4()
+                .gap_3()
+                .child(
+                    div()
+                        .flex_none()
+                        .w(px(34.0))
+                        .h(px(34.0))
+                        .rounded_lg()
+                        .bg(if pal.is_light() {
+                            rgb(0xe2e8f0)
+                        } else {
+                            rgb(0x13233a)
+                        })
+                        .border_1()
+                        .border_color(rgb(pal.border_subtle))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_size(px(16.0))
+                        .child(app_icon_for_name(&result.name)),
+                )
                 .child(source_badge(&result.source))
                 .child(
                     div()
@@ -1640,21 +1823,21 @@ fn source_candidate_card(
                                 .gap_2()
                                 .child(
                                     div()
-                                        .text_color(rgb(TEXT_PRIMARY))
+                                        .text_color(rgb(pal.text_primary))
                                         .text_size(px(14.0))
                                         .font_weight(FontWeight::BOLD)
                                         .child(result.name.clone()),
                                 )
                                 .child(
                                     div()
-                                        .text_color(rgb(TEXT_MUTED))
+                                        .text_color(rgb(pal.text_muted))
                                         .text_size(px(11.0))
                                         .child(result.version.clone()),
                                 ),
                         )
                         .child(
                             div()
-                                .text_color(rgb(TEXT_SECONDARY))
+                                .text_color(rgb(pal.text_secondary))
                                 .text_size(px(12.0))
                                 .child(result.description.clone()),
                         ),
@@ -1671,7 +1854,13 @@ fn source_candidate_card(
                         .flex()
                         .items_center()
                         .gap_1_5()
-                        .child(div().w(px(8.0)).h(px(8.0)).rounded_full().bg(rgb(ACCENT_GREEN)))
+                        .child(
+                            div()
+                                .w(px(8.0))
+                                .h(px(8.0))
+                                .rounded_full()
+                                .bg(rgb(ACCENT_GREEN)),
+                        )
                         .child(
                             div()
                                 .text_color(rgb(ACCENT_GREEN))
@@ -1682,13 +1871,17 @@ fn source_candidate_card(
                 )
                 .child(
                     div()
-                        .text_color(rgb(TEXT_MUTED))
+                        .text_color(rgb(pal.text_muted))
                         .text_size(px(11.0))
                         .child(result.repo.clone()),
                 )
                 .child(action_button(
                     "plan-btn",
-                    if result.source == "aur" { "Build Plan" } else { "Install Plan" },
+                    if result.source == "aur" {
+                        "Build Plan"
+                    } else {
+                        "Install Plan"
+                    },
                     ACCENT_BLUE,
                     0xffffff,
                     cx.listener(move |this, _, _, cx| {
@@ -1707,6 +1900,7 @@ fn render_right_inspector(
     app: &mut ArchBridgeApp,
     _cx: &mut Context<ArchBridgeApp>,
 ) -> impl IntoElement {
+    let pal = get_palette(app.state.theme);
     let item = app
         .state
         .selected_result
@@ -1717,9 +1911,9 @@ fn render_right_inspector(
         .w(px(340.0))
         .flex_none()
         .h_full()
-        .bg(rgb(0x0a1220))
+        .bg(rgb(pal.bg_card))
         .border_1()
-        .border_color(rgb(0x142236))
+        .border_color(rgb(pal.border_subtle))
         .rounded_2xl()
         .p_5()
         .flex()
@@ -1733,17 +1927,17 @@ fn render_right_inspector(
                 .justify_center()
                 .h_full()
                 .gap_2()
-                .child(div().text_size(px(20.0)).text_color(rgb(ACCENT_CYAN)).child("✦"))
+                .child(div().text_size(px(20.0)).text_color(rgb(pal.accent_cyan)).child("✦"))
                 .child(
                     div()
-                        .text_color(rgb(TEXT_PRIMARY))
+                        .text_color(rgb(pal.text_primary))
                         .text_size(px(14.0))
                         .font_weight(FontWeight::BOLD)
                         .child("No package selected"),
                 )
                 .child(
                     div()
-                        .text_color(rgb(TEXT_MUTED))
+                        .text_color(rgb(pal.text_muted))
                         .text_size(px(11.5))
                         .text_center()
                         .child("Choose a verified result from the source list to\ninspect its details."),
@@ -1754,7 +1948,7 @@ fn render_right_inspector(
                 .flex()
                 .flex_col()
                 .gap_4()
-                // Header
+                // Header with dynamic app icon
                 .child(
                     div()
                         .flex()
@@ -1764,14 +1958,15 @@ fn render_right_inspector(
                             div()
                                 .w(px(42.0))
                                 .h(px(42.0))
-                                .bg(rgb(0x143454))
+                                .bg(if pal.is_light() { rgb(0xdbeafe) } else { rgb(0x143454) })
+                                .border_1()
+                                .border_color(rgb(pal.border_subtle))
                                 .rounded_xl()
                                 .flex()
                                 .items_center()
                                 .justify_center()
-                                .text_color(rgb(ACCENT_CYAN))
-                                .text_size(px(20.0))
-                                .child("📦"),
+                                .text_size(px(22.0))
+                                .child(app_icon_for_name(&item.name)),
                         )
                         .child(
                             div()
@@ -1785,7 +1980,7 @@ fn render_right_inspector(
                                         .gap_2()
                                         .child(
                                             div()
-                                                .text_color(rgb(TEXT_PRIMARY))
+                                                .text_color(rgb(pal.text_primary))
                                                 .text_size(px(18.0))
                                                 .font_weight(FontWeight::BOLD)
                                                 .child(item.name.clone()),
@@ -1794,7 +1989,7 @@ fn render_right_inspector(
                                 )
                                 .child(
                                     div()
-                                        .text_color(rgb(TEXT_MUTED))
+                                        .text_color(rgb(pal.text_muted))
                                         .text_size(px(11.0))
                                         .child(item.description.clone()),
                                 ),
@@ -1803,20 +1998,20 @@ fn render_right_inspector(
                 // Metadata Table
                 .child(
                     div()
-                        .bg(rgb(BG_CARD))
+                        .bg(rgb(pal.bg_card_alt))
                         .border_1()
-                        .border_color(rgb(BORDER_SUBTLE))
+                        .border_color(rgb(pal.border_subtle))
                         .rounded_lg()
                         .p_3()
                         .flex()
                         .flex_col()
                         .gap_1()
-                        .child(detail_row("Version", &item.version))
-                        .child(detail_row("Repository", &item.repo))
-                        .child(detail_row("License", &item.license))
-                        .child(detail_row("Architecture", &item.arch))
-                        .child(detail_row("Size", &item.size))
-                        .child(detail_row("Maintainer", &item.maintainer)),
+                        .child(detail_row("Version", &item.version, &pal))
+                        .child(detail_row("Repository", &item.repo, &pal))
+                        .child(detail_row("License", &item.license, &pal))
+                        .child(detail_row("Architecture", &item.arch, &pal))
+                        .child(detail_row("Size", &item.size, &pal))
+                        .child(detail_row("Maintainer", &item.maintainer, &pal)),
                 )
                 // Tags List
                 .child(
@@ -1824,10 +2019,10 @@ fn render_right_inspector(
                         .flex()
                         .flex_wrap()
                         .gap_1_5()
-                        .child(tag_pill("desktop"))
-                        .child(tag_pill("media"))
-                        .child(tag_pill("open-source"))
-                        .child(tag_pill("verified")),
+                        .child(tag_pill(&pal, "desktop"))
+                        .child(tag_pill(&pal, "media"))
+                        .child(tag_pill(&pal, "open-source"))
+                        .child(tag_pill(&pal, "verified")),
                 )
                 // External Links
                 .child(
@@ -1837,42 +2032,42 @@ fn render_right_inspector(
                         .gap_2()
                         .pt_2()
                         .border_t_1()
-                        .border_color(rgb(BORDER_SUBTLE))
-                        .child(link_row("Website", "https://archlinux.org"))
-                        .child(link_row("Source", "https://github.com/archlinux"))
-                        .child(link_row("Arch Wiki", "https://wiki.archlinux.org")),
+                        .border_color(rgb(pal.border_subtle))
+                        .child(link_row(&pal, "Website", "https://archlinux.org"))
+                        .child(link_row(&pal, "Source", "https://github.com/archlinux"))
+                        .child(link_row(&pal, "Arch Wiki", "https://wiki.archlinux.org")),
                 )
                 .into_any_element(),
         })
 }
 
-fn tag_pill(label: &'static str) -> impl IntoElement {
+fn tag_pill(pal: &ThemePalette, label: &'static str) -> impl IntoElement {
     div()
-        .bg(rgb(BG_CARD))
+        .bg(rgb(pal.bg_card_alt))
         .border_1()
-        .border_color(rgb(BORDER_SUBTLE))
+        .border_color(rgb(pal.border_subtle))
         .rounded_md()
         .px_2()
         .py_0p5()
-        .text_color(rgb(TEXT_SECONDARY))
+        .text_color(rgb(pal.text_secondary))
         .text_size(px(11.0))
         .child(label)
 }
 
-fn link_row(title: &'static str, url: &'static str) -> impl IntoElement {
+fn link_row(pal: &ThemePalette, title: &'static str, url: &'static str) -> impl IntoElement {
     div()
         .flex()
         .items_center()
         .justify_between()
         .child(
             div()
-                .text_color(rgb(TEXT_MUTED))
+                .text_color(rgb(pal.text_muted))
                 .text_size(px(11.0))
                 .child(title),
         )
         .child(
             div()
-                .text_color(rgb(ACCENT_CYAN))
+                .text_color(rgb(pal.accent_cyan))
                 .text_size(px(11.0))
                 .child(url),
         )
@@ -1883,6 +2078,7 @@ fn link_row(title: &'static str, url: &'static str) -> impl IntoElement {
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn render_inspect(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> impl IntoElement {
+    let pal = get_palette(app.state.theme);
     div()
         .flex()
         .flex_col()
@@ -1896,14 +2092,14 @@ fn render_inspect(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> i
                 .gap_1()
                 .child(
                     div()
-                        .text_color(rgb(TEXT_PRIMARY))
+                        .text_color(rgb(pal.text_primary))
                         .text_size(px(22.0))
                         .font_weight(FontWeight::BOLD)
                         .child("Foreign Package Inspector"),
                 )
                 .child(
                     div()
-                        .text_color(rgb(TEXT_MUTED))
+                        .text_color(rgb(pal.text_muted))
                         .text_size(px(13.0))
                         .child("Safely inspect .deb and .rpm packages, metadata, systemd units, and maintainer scripts without execution."),
                 ),
@@ -1919,9 +2115,9 @@ fn render_inspect(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> i
                         .track_focus(&app.inspect_focus)
                         .flex_1()
                         .h(px(40.0))
-                        .bg(rgb(0x0c192b))
+                        .bg(rgb(pal.bg_input))
                         .border_1()
-                        .border_color(rgb(0x29415f))
+                        .border_color(rgb(pal.border))
                         .rounded_lg()
                         .px_3()
                         .flex()
@@ -1951,9 +2147,9 @@ fn render_inspect(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> i
                         .child(
                             div()
                                 .text_color(if app.state.inspect_path.is_empty() {
-                                    rgb(TEXT_PLACEHOLDER)
+                                    rgb(pal.text_placeholder)
                                 } else {
-                                    rgb(TEXT_PRIMARY)
+                                    rgb(pal.text_primary)
                                 })
                                 .child(if app.state.inspect_path.is_empty() {
                                     "Select or enter path to .deb or .rpm file...".to_string()
@@ -1966,8 +2162,8 @@ fn render_inspect(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> i
                 .child(action_button(
                     "inspect-browse-btn",
                     "Browse File...",
-                    0x12233a,
-                    0x94a3b8,
+                    if pal.is_light() { 0xe2e8f0 } else { 0x12233a },
+                    pal.text_secondary,
                     cx.listener(|this, _, _, cx| {
                         this.state.inspect_path = "/var/cache/pacman/pkg/sample.deb".to_string();
                         this.run_inspect(cx);
@@ -1997,9 +2193,9 @@ fn render_inspect(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> i
             div()
                 .w_full()
                 .p_3()
-                .bg(rgb(0x0c1b2c))
+                .bg(if pal.is_light() { rgb(0xe0f2fe) } else { rgb(0x0c1b2c) })
                 .border_1()
-                .border_color(rgb(0x1a334d))
+                .border_color(if pal.is_light() { rgb(0xbae6fd) } else { rgb(0x1a334d) })
                 .rounded_lg()
                 .flex()
                 .items_center()
@@ -2008,18 +2204,18 @@ fn render_inspect(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> i
                     div()
                         .w(px(28.0))
                         .h(px(28.0))
-                        .bg(rgb(0x12253b))
+                        .bg(if pal.is_light() { rgb(0xbae6fd) } else { rgb(0x12253b) })
                         .rounded_md()
                         .flex()
                         .items_center()
                         .justify_center()
-                        .text_color(rgb(ACCENT_CYAN))
+                        .text_color(rgb(pal.accent_cyan))
                         .text_size(px(14.0))
                         .child("🛡️"),
                 )
                 .child(
                     div()
-                        .text_color(rgb(0x38bdf8))
+                        .text_color(rgb(pal.accent_cyan))
                         .text_size(px(12.0))
                         .font_weight(FontWeight::BOLD)
                         .child("Safety Guarantee: Foreign maintainer scripts are analyzed in data-only mode and are NEVER executed."),
@@ -2034,12 +2230,13 @@ fn render_inspect(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> i
                 .flex()
                 .flex_col()
                 .gap_3()
-                .child(render_inspect_body(app, cx)),
+                .child(render_inspect_body(app, &pal, cx)),
         )
 }
 
 fn render_inspect_body(
     app: &mut ArchBridgeApp,
+    pal: &ThemePalette,
     cx: &mut Context<ArchBridgeApp>,
 ) -> impl IntoElement {
     match &app.state.inspect_data {
@@ -2048,13 +2245,13 @@ fn render_inspect_body(
             .flex_1()
             .min_h(px(340.0))
             .border_1()
-            .border_color(rgb(0x13243a))
+            .border_color(rgb(pal.border_subtle))
             .rounded_xl()
-            .bg(rgb(0x060b14))
+            .bg(rgb(pal.bg_card))
             .p_4()
             .child(
                 div()
-                    .text_color(rgb(TEXT_MUTED))
+                    .text_color(rgb(pal.text_muted))
                     .text_size(px(12.0))
                     .font_family("monospace")
                     .child("Inspection report containing metadata, dependencies, desktop files, systemd units, and maintainer scripts will be displayed here..."),
@@ -2070,35 +2267,35 @@ fn render_inspect_body(
                 // Metadata Header Box
                 .child(
                     div()
-                        .bg(rgb(BG_CARD))
+                        .bg(rgb(pal.bg_card))
                         .border_1()
-                        .border_color(rgb(BORDER_SUBTLE))
+                        .border_color(rgb(pal.border_subtle))
                         .rounded_xl()
                         .p_4()
                         .flex()
                         .flex_col()
                         .gap_2()
-                        .child(detail_row("Package Name", data.get("name").and_then(|v| v.as_str()).unwrap_or("sample-package")))
-                        .child(detail_row("Version", data.get("version").and_then(|v| v.as_str()).unwrap_or("1.0.0-1")))
-                        .child(detail_row("Architecture", data.get("architecture").and_then(|v| v.as_str()).unwrap_or("x86_64")))
-                        .child(detail_row("License", data.get("license").and_then(|v| v.as_str()).unwrap_or("GPL-3.0"))),
+                        .child(detail_row("Package Name", data.get("name").and_then(|v| v.as_str()).unwrap_or("sample-package"), pal))
+                        .child(detail_row("Version", data.get("version").and_then(|v| v.as_str()).unwrap_or("1.0.0-1"), pal))
+                        .child(detail_row("Architecture", data.get("architecture").and_then(|v| v.as_str()).unwrap_or("x86_64"), pal))
+                        .child(detail_row("License", data.get("license").and_then(|v| v.as_str()).unwrap_or("GPL-3.0"), pal)),
                 )
                 // Subtabs Selector
                 .child(
                     div()
                         .flex()
                         .gap_2()
-                        .child(inspect_tab_pill(0, "Maintainer Scripts", app, cx))
-                        .child(inspect_tab_pill(1, "Dependencies", app, cx))
-                        .child(inspect_tab_pill(2, "Desktop & Systemd", app, cx))
-                        .child(inspect_tab_pill(3, "Dynamic Libraries (ELF)", app, cx)),
+                        .child(inspect_tab_pill(0, "Maintainer Scripts", app, pal, cx))
+                        .child(inspect_tab_pill(1, "Dependencies", app, pal, cx))
+                        .child(inspect_tab_pill(2, "Desktop & Systemd", app, pal, cx))
+                        .child(inspect_tab_pill(3, "Dynamic Libraries (ELF)", app, pal, cx)),
                 )
                 // Subtab Content
                 .child(
                     div()
-                        .bg(rgb(0x040810))
+                        .bg(if pal.is_light() { rgb(0xf8fafc) } else { rgb(0x040810) })
                         .border_1()
-                        .border_color(rgb(BORDER_SUBTLE))
+                        .border_color(rgb(pal.border_subtle))
                         .rounded_xl()
                         .p_4()
                         .min_h(px(160.0))
@@ -2109,15 +2306,15 @@ fn render_inspect_body(
                                 .font_family("monospace")
                                 .child("# Neutralized Maintainer Script (Data-Only Preview)\n# postinst script analyzed safely without execution\necho 'Configuring package runtime...'\nexit 0"),
                             1 => div()
-                                .text_color(rgb(TEXT_PRIMARY))
+                                .text_color(rgb(pal.text_primary))
                                 .text_size(px(12.0))
                                 .child("• glibc >= 2.33\n• libx11\n• gtk3\n• nss\n• alsa-lib"),
                             2 => div()
-                                .text_color(rgb(TEXT_PRIMARY))
+                                .text_color(rgb(pal.text_primary))
                                 .text_size(px(12.0))
                                 .child("• /usr/share/applications/app.desktop\n• /usr/lib/systemd/user/app.service"),
                             _ => div()
-                                .text_color(rgb(TEXT_PRIMARY))
+                                .text_color(rgb(pal.text_primary))
                                 .text_size(px(12.0))
                                 .child("• libm.so.6\n• libpthread.so.0\n• libc.so.6\n• libdl.so.2"),
                         }),
@@ -2131,6 +2328,7 @@ fn inspect_tab_pill(
     idx: usize,
     title: &'static str,
     app: &mut ArchBridgeApp,
+    pal: &ThemePalette,
     cx: &mut Context<ArchBridgeApp>,
 ) -> impl IntoElement {
     let is_active = app.state.inspect_active_subtab == idx;
@@ -2140,8 +2338,16 @@ fn inspect_tab_pill(
         .py_1_5()
         .rounded_md()
         .cursor_pointer()
-        .bg(if is_active { rgb(ACCENT_BLUE) } else { rgb(BG_CARD) })
-        .text_color(if is_active { rgb(0xffffff) } else { rgb(TEXT_SECONDARY) })
+        .bg(if is_active {
+            rgb(ACCENT_BLUE)
+        } else {
+            rgb(pal.bg_card)
+        })
+        .text_color(if is_active {
+            rgb(0xffffff)
+        } else {
+            rgb(pal.text_secondary)
+        })
         .text_size(px(12.0))
         .font_weight(FontWeight::BOLD)
         .on_click(cx.listener(move |this, _, _, cx| {
@@ -2156,6 +2362,7 @@ fn inspect_tab_pill(
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn render_build(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> impl IntoElement {
+    let pal = get_palette(app.state.theme);
     div()
         .flex()
         .flex_col()
@@ -2169,14 +2376,14 @@ fn render_build(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> imp
                 .gap_1()
                 .child(
                     div()
-                        .text_color(rgb(TEXT_PRIMARY))
+                        .text_color(rgb(pal.text_primary))
                         .text_size(px(22.0))
                         .font_weight(FontWeight::BOLD)
                         .child("Build & Clean Chroot Studio"),
                 )
                 .child(
                     div()
-                        .text_color(rgb(TEXT_MUTED))
+                        .text_color(rgb(pal.text_muted))
                         .text_size(px(13.0))
                         .child("Build packages inside an isolated clean chroot environment with automated runtime smoke testing."),
                 ),
@@ -2192,9 +2399,9 @@ fn render_build(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> imp
                         .track_focus(&app.build_focus)
                         .flex_1()
                         .h(px(40.0))
-                        .bg(rgb(0x0c192b))
+                        .bg(rgb(pal.bg_input))
                         .border_1()
-                        .border_color(rgb(0x29415f))
+                        .border_color(rgb(pal.border))
                         .rounded_lg()
                         .px_3()
                         .flex()
@@ -2224,9 +2431,9 @@ fn render_build(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> imp
                         .child(
                             div()
                                 .text_color(if app.state.build_target_input.is_empty() {
-                                    rgb(TEXT_PLACEHOLDER)
+                                    rgb(pal.text_placeholder)
                                 } else {
-                                    rgb(TEXT_PRIMARY)
+                                    rgb(pal.text_primary)
                                 })
                                 .child(if app.state.build_target_input.is_empty() {
                                     "Target: .deb/.rpm file, GitHub URL, local directory, PKGBUILD, or package name...".to_string()
@@ -2238,8 +2445,8 @@ fn render_build(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> imp
                 .child(action_button(
                     "build-browse-btn",
                     "📁 Browse Package...",
-                    0x12233a,
-                    0x94a3b8,
+                    if pal.is_light() { 0xe2e8f0 } else { 0x12233a },
+                    pal.text_secondary,
                     cx.listener(|this, _, _, cx| {
                         this.state.build_target_input = "vlc".to_string();
                         this.prepare_build_plan(cx);
@@ -2256,32 +2463,32 @@ fn render_build(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> imp
         // Advanced Options Toggle
         .child(
             div()
-                .text_color(rgb(ACCENT_CYAN))
+                .text_color(rgb(pal.accent_cyan))
                 .text_size(px(11.0))
                 .child("▾ Advanced Build Options (optional name, version, entry, dependencies)"),
         )
         .child(
             div()
-                .text_color(rgb(TEXT_MUTED))
+                .text_color(rgb(pal.text_muted))
                 .text_size(px(12.0))
                 .child("Ready — choose a package or build target."),
         )
         .when_some(app.state.build_msg.clone(), |this, msg| {
-            this.child(status_msg_bar(&msg))
+            this.child(status_msg_bar(&msg, &pal))
         })
         // Plan & Review Manifest Area
-        .child(section_header("Prepared Plan & Review Manifest"))
+        .child(section_header("Prepared Plan & Review Manifest", &pal))
         .child(
             div()
-                .bg(rgb(0x040810))
+                .bg(if pal.is_light() { rgb(0xf8fafc) } else { rgb(0x040810) })
                 .border_1()
-                .border_color(rgb(BORDER_SUBTLE))
+                .border_color(rgb(pal.border_subtle))
                 .rounded_xl()
                 .p_3()
                 .min_h(px(110.0))
                 .child(match &app.state.active_plan {
                     None => div()
-                        .text_color(rgb(TEXT_MUTED))
+                        .text_color(rgb(pal.text_muted))
                         .text_size(px(12.0))
                         .font_family("monospace")
                         .child("Prepared dry-run plan, steps, reviewed inputs, and hashes will appear here..."),
@@ -2333,9 +2540,9 @@ fn render_build(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> imp
             div()
                 .flex_1()
                 .min_h(px(120.0))
-                .bg(rgb(0x040810))
+                .bg(if pal.is_light() { rgb(0x0f172a) } else { rgb(0x040810) })
                 .border_1()
-                .border_color(rgb(BORDER_SUBTLE))
+                .border_color(rgb(pal.border_subtle))
                 .rounded_xl()
                 .p_3()
                 .flex()
@@ -2343,7 +2550,7 @@ fn render_build(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> imp
                 .gap_1()
                 .child(
                     div()
-                        .text_color(rgb(TEXT_MUTED))
+                        .text_color(rgb(pal.text_muted))
                         .text_size(px(11.0))
                         .child("── Execution stream and runtime smoke test logs ──"),
                 )
@@ -2369,6 +2576,7 @@ fn render_build(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> imp
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn render_uninstall(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> impl IntoElement {
+    let pal = get_palette(app.state.theme);
     let query = app.state.uninstall_query.to_lowercase();
     let filtered: Vec<(usize, InstalledPackage)> = app
         .state
@@ -2379,7 +2587,12 @@ fn render_uninstall(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) ->
         .map(|(i, p)| (i, p.clone()))
         .collect();
 
-    let count = filtered.len();
+    let total_count = filtered.len();
+    let limit = app.state.uninstall_display_limit;
+    let showing_count = total_count.min(limit);
+    let has_more = total_count > limit;
+    let is_empty = filtered.is_empty();
+    let visible_pkgs: Vec<(usize, InstalledPackage)> = filtered.into_iter().take(limit).collect();
 
     div()
         .flex()
@@ -2399,14 +2612,14 @@ fn render_uninstall(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) ->
                         .gap_1()
                         .child(
                             div()
-                                .text_color(rgb(TEXT_PRIMARY))
+                                .text_color(rgb(pal.text_primary))
                                 .text_size(px(22.0))
                                 .font_weight(FontWeight::BOLD)
                                 .child("Uninstall Installed Software"),
                         )
                         .child(
                             div()
-                                .text_color(rgb(TEXT_MUTED))
+                                .text_color(rgb(pal.text_muted))
                                 .text_size(px(13.0))
                                 .child("Type any software name to automatically find and uninstall packages tracked by pacman."),
                         ),
@@ -2414,8 +2627,8 @@ fn render_uninstall(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) ->
                 .child(action_button(
                     "un-refresh-btn",
                     "🔄 Refresh List",
-                    0x12233a,
-                    0xffffff,
+                    if pal.is_light() { 0xe2e8f0 } else { 0x12233a },
+                    pal.text_primary,
                     cx.listener(|this, _, _, cx| {
                         this.reload_installed();
                         cx.notify();
@@ -2433,9 +2646,9 @@ fn render_uninstall(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) ->
                         .track_focus(&app.uninstall_focus)
                         .flex_1()
                         .h(px(40.0))
-                        .bg(if app.state.uninstall_focused { rgb(0x0e2238) } else { rgb(0x0c192b) })
+                        .bg(rgb(pal.bg_input))
                         .border_1()
-                        .border_color(if app.state.uninstall_focused { rgb(ACCENT_CYAN) } else { rgb(0x29415f) })
+                        .border_color(if app.state.uninstall_focused { rgb(pal.accent_cyan) } else { rgb(pal.border_subtle) })
                         .rounded_lg()
                         .px_3()
                         .flex()
@@ -2477,13 +2690,13 @@ fn render_uninstall(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) ->
                                                 div()
                                                     .w(px(2.0))
                                                     .h(px(16.0))
-                                                    .bg(rgb(ACCENT_CYAN))
+                                                    .bg(rgb(pal.accent_cyan))
                                                     .mr_1(),
                                             )
                                         })
                                         .child(
                                             div()
-                                                .text_color(rgb(TEXT_PLACEHOLDER))
+                                                .text_color(rgb(pal.text_placeholder))
                                                 .text_size(px(13.0))
                                                 .child(if app.state.uninstall_focused {
                                                     "Type software name (e.g. grok-bot, vlc, discord)..."
@@ -2498,7 +2711,7 @@ fn render_uninstall(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) ->
                                         .items_center()
                                         .child(
                                             div()
-                                                .text_color(rgb(TEXT_PRIMARY))
+                                                .text_color(rgb(pal.text_primary))
                                                 .text_size(px(13.0))
                                                 .child(app.state.uninstall_query.clone()),
                                         )
@@ -2507,7 +2720,7 @@ fn render_uninstall(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) ->
                                                 div()
                                                     .w(px(2.0))
                                                     .h(px(16.0))
-                                                    .bg(rgb(ACCENT_CYAN))
+                                                    .bg(rgb(pal.accent_cyan))
                                                     .ml(px(2.0)),
                                             )
                                         })
@@ -2517,15 +2730,15 @@ fn render_uninstall(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) ->
                 )
                 .child(
                     div()
-                        .bg(rgb(0x0c192b))
+                        .bg(rgb(pal.bg_card))
                         .border_1()
-                        .border_color(rgb(0x29415f))
+                        .border_color(rgb(pal.border_subtle))
                         .rounded_lg()
                         .px_3()
                         .h(px(40.0))
                         .flex()
                         .items_center()
-                        .text_color(rgb(TEXT_SECONDARY))
+                        .text_color(rgb(pal.text_secondary))
                         .text_size(px(12.0))
                         .child("Explicitly Installed Apps"),
                 ),
@@ -2533,12 +2746,78 @@ fn render_uninstall(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) ->
         // Subheader count
         .child(
             div()
-                .text_color(rgb(TEXT_MUTED))
+                .text_color(rgb(pal.text_muted))
                 .text_size(px(12.0))
-                .child(format!("Found {} installed packages.", count)),
+                .child(format!("Showing {} of {} installed packages.", showing_count, total_count)),
         )
         .when_some(app.state.uninstall_msg.clone(), |this, msg| {
-            this.child(status_msg_bar(&msg))
+            this.child(status_msg_bar(&msg, &pal))
+        })
+        // Safety Confirmation Prompt Banner
+        .when_some(app.state.uninstall_confirm_idx, |this, idx| {
+            if let Some(pkg) = app.state.installed_packages.get(idx) {
+                let pkg_name = pkg.name.clone();
+                this.child(
+                    div()
+                        .w_full()
+                        .py_2_5()
+                        .px_4()
+                        .rounded_lg()
+                        .bg(if pal.is_light() { rgb(0xfef2f2) } else { rgb(0x2d1214) })
+                        .border_1()
+                        .border_color(if pal.is_light() { rgb(0xfecaca) } else { rgb(0x7f1d1d) })
+                        .flex()
+                        .flex_col()
+                        .gap_3()
+                        .child(
+                            div()
+                                .w_full()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .child(div().text_size(px(15.0)).child("⚠️"))
+                                .child(
+                                    div()
+                                        .text_color(if pal.is_light() { rgb(0x991b1b) } else { rgb(0xfca5a5) })
+                                        .text_size(px(12.5))
+                                        .font_weight(FontWeight::BOLD)
+                                        .child(format!("Are you sure you want to uninstall '{}'? This will remove it from your system.", pkg_name)),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .w_full()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .justify_end()
+                                .gap_3()
+                                .child(small_button(
+                                    "banner-confirm-uninstall-yes",
+                                    "Yes, Uninstall",
+                                    0xdc2626,
+                                    0xffffff,
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.state.uninstall_selected = Some(idx);
+                                        this.state.uninstall_confirm_idx = None;
+                                        this.run_uninstall(cx);
+                                    }),
+                                ))
+                                .child(small_button(
+                                    "banner-confirm-uninstall-cancel",
+                                    "Cancel",
+                                    if pal.is_light() { 0x94a3b8 } else { 0x334155 },
+                                    0xffffff,
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.state.uninstall_confirm_idx = None;
+                                        cx.notify();
+                                    }),
+                                )),
+                        ),
+                )
+            } else {
+                this
+            }
         })
         // Packages Table Container
         .child(
@@ -2546,10 +2825,10 @@ fn render_uninstall(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) ->
                 .flex_1()
                 .min_h(px(0.0))
                 .border_1()
-                .border_color(rgb(0x16243b))
+                .border_color(rgb(pal.border_subtle))
                 .rounded_xl()
                 .overflow_hidden()
-                .bg(rgb(0x080e18))
+                .bg(rgb(pal.bg_card))
                 .flex()
                 .flex_col()
                 // Table Header
@@ -2559,15 +2838,15 @@ fn render_uninstall(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) ->
                         .h(px(38.0))
                         .w_full()
                         .px_4()
-                        .bg(rgb(0x0c1524))
+                        .bg(rgb(pal.bg_topbar))
                         .border_b_1()
-                        .border_color(rgb(0x16243b))
+                        .border_color(rgb(pal.border_subtle))
                         .flex()
                         .items_center()
                         .child(
                             div()
                                 .w(px(200.0))
-                                .text_color(rgb(TEXT_MUTED))
+                                .text_color(rgb(pal.text_muted))
                                 .text_size(px(12.0))
                                 .font_weight(FontWeight::BOLD)
                                 .child("Software Name"),
@@ -2575,7 +2854,7 @@ fn render_uninstall(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) ->
                         .child(
                             div()
                                 .w(px(140.0))
-                                .text_color(rgb(TEXT_MUTED))
+                                .text_color(rgb(pal.text_muted))
                                 .text_size(px(12.0))
                                 .font_weight(FontWeight::BOLD)
                                 .child("Installed Version"),
@@ -2583,15 +2862,15 @@ fn render_uninstall(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) ->
                         .child(
                             div()
                                 .flex_1()
-                                .text_color(rgb(TEXT_MUTED))
+                                .text_color(rgb(pal.text_muted))
                                 .text_size(px(12.0))
                                 .font_weight(FontWeight::BOLD)
                                 .child("Description"),
                         )
                         .child(
                             div()
-                                .w(px(100.0))
-                                .text_color(rgb(TEXT_MUTED))
+                                .w(px(180.0))
+                                .text_color(rgb(pal.text_muted))
                                 .text_size(px(12.0))
                                 .font_weight(FontWeight::BOLD)
                                 .text_right()
@@ -2608,20 +2887,27 @@ fn render_uninstall(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) ->
                         .flex()
                         .flex_col()
                         .children(
-                            filtered
+                            visible_pkgs
                                 .into_iter()
                                 .map(|(real_idx, pkg)| {
                                     let selected = app.state.uninstall_selected == Some(real_idx);
+                                    let is_confirming = app.state.uninstall_confirm_idx == Some(real_idx);
                                     div()
                                         .id(SharedString::from(format!("pkg-row-{}", real_idx)))
                                         .w_full()
-                                        .h(px(46.0))
+                                        .h(px(52.0))
                                         .px_4()
                                         .flex()
                                         .items_center()
-                                        .bg(if selected { rgb(0x14253d) } else { rgba(0x00000000) })
+                                        .bg(if is_confirming {
+                                            if pal.is_light() { rgb(0xfef2f2) } else { rgb(0x231014) }
+                                        } else if selected {
+                                            if pal.is_light() { rgb(0xdbeafe) } else { rgb(0x14253d) }
+                                        } else {
+                                            rgba(0x00000000)
+                                        })
                                         .border_b_1()
-                                        .border_color(rgb(0x101b2a))
+                                        .border_color(rgb(pal.border_subtle))
                                         .cursor_pointer()
                                         .on_click(cx.listener(move |this, _, _, cx| {
                                             this.state.uninstall_selected = Some(real_idx);
@@ -2630,7 +2916,7 @@ fn render_uninstall(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) ->
                                         .child(
                                             div()
                                                 .w(px(200.0))
-                                                .text_color(rgb(TEXT_PRIMARY))
+                                                .text_color(rgb(pal.text_primary))
                                                 .text_size(px(13.0))
                                                 .font_weight(FontWeight::BOLD)
                                                 .child(pkg.name.clone()),
@@ -2638,7 +2924,7 @@ fn render_uninstall(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) ->
                                         .child(
                                             div()
                                                 .w(px(140.0))
-                                                .text_color(rgb(TEXT_MUTED))
+                                                .text_color(rgb(pal.text_muted))
                                                 .text_size(px(12.0))
                                                 .font_family("monospace")
                                                 .child(pkg.version.clone()),
@@ -2646,30 +2932,119 @@ fn render_uninstall(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) ->
                                         .child(
                                             div()
                                                 .flex_1()
-                                                .text_color(rgb(TEXT_SECONDARY))
+                                                .text_color(rgb(pal.text_secondary))
                                                 .text_size(px(12.0))
                                                 .child(pkg.description.clone()),
                                         )
                                         .child(
                                             div()
-                                                .w(px(100.0))
+                                                .w(px(180.0))
                                                 .flex()
                                                 .justify_end()
-                                                .child(action_button(
-                                                    "row-uninstall-btn",
-                                                    "Uninstall",
-                                                    0x261318,
-                                                    0xf87171,
-                                                    cx.listener(move |this, _, _, cx| {
-                                                        this.state.uninstall_selected = Some(real_idx);
-                                                        this.run_uninstall(cx);
-                                                    }),
-                                                )),
+                                                .child(if is_confirming {
+                                                    div()
+                                                        .flex()
+                                                        .flex_row()
+                                                        .items_center()
+                                                        .gap_2()
+                                                        .child(
+                                                            div()
+                                                                .text_color(rgb(pal.accent_red))
+                                                                .text_size(px(11.0))
+                                                                .font_weight(FontWeight::BOLD)
+                                                                .child("Sure?"),
+                                                        )
+                                                        .child(small_button(
+                                                            format!("row-yes-{}", real_idx),
+                                                            "Yes",
+                                                            0xdc2626,
+                                                            0xffffff,
+                                                            cx.listener(move |this, _, _, cx| {
+                                                                this.state.uninstall_selected = Some(real_idx);
+                                                                this.state.uninstall_confirm_idx = None;
+                                                                this.run_uninstall(cx);
+                                                            }),
+                                                        ))
+                                                        .child(small_button(
+                                                            format!("row-cancel-{}", real_idx),
+                                                            "Cancel",
+                                                            if pal.is_light() { 0x94a3b8 } else { 0x334155 },
+                                                            0xffffff,
+                                                            cx.listener(move |this, _, _, cx| {
+                                                                this.state.uninstall_confirm_idx = None;
+                                                                cx.notify();
+                                                            }),
+                                                        ))
+                                                        .into_any_element()
+                                                } else {
+                                                    small_button(
+                                                        format!("row-un-btn-{}", real_idx),
+                                                        "🗑️ Uninstall",
+                                                        if pal.is_light() { 0xfee2e2 } else { 0x261318 },
+                                                        if pal.is_light() { 0xb91c1c } else { 0xf87171 },
+                                                        cx.listener(move |this, _, _, cx| {
+                                                            this.state.uninstall_selected = Some(real_idx);
+                                                            this.state.uninstall_confirm_idx = Some(real_idx);
+                                                            cx.notify();
+                                                        }),
+                                                    )
+                                                    .into_any_element()
+                                                }),
                                         )
                                         .into_any_element()
                                 })
                                 .collect::<Vec<_>>(),
-                        ),
+                        )
+                        .when(is_empty, |this| {
+                            this.child(
+                                div()
+                                    .flex_1()
+                                    .flex()
+                                    .flex_col()
+                                    .items_center()
+                                    .justify_center()
+                                    .gap_2()
+                                    .text_color(rgb(pal.text_muted))
+                                    .text_size(px(13.0))
+                                    .child("No verified installed packages to show.")
+                                    .child(
+                                        div()
+                                            .text_color(rgb(pal.text_placeholder))
+                                            .text_size(px(11.0))
+                                            .child("Use Refresh List after pacman is available."),
+                                    ),
+                            )
+                        })
+                        .when(has_more, |this| {
+                            let remaining = total_count.saturating_sub(limit);
+                            this.child(
+                                div()
+                                    .w_full()
+                                    .py_3()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .child(
+                                        div()
+                                            .id("load-more-pkgs-btn")
+                                            .px_4()
+                                            .py_2()
+                                            .rounded_lg()
+                                            .bg(if pal.is_light() { rgb(0xe2e8f0) } else { rgb(0x16243b) })
+                                            .border_1()
+                                            .border_color(if pal.is_light() { rgb(0xcbd5e1) } else { rgb(0x253b5c) })
+                                            .cursor_pointer()
+                                            .text_color(rgb(pal.accent_cyan))
+                                            .text_size(px(12.0))
+                                            .font_weight(FontWeight::BOLD)
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.state.uninstall_display_limit += 50;
+                                                cx.notify();
+                                            }))
+                                            .child(format!("⬇️ Load More Packages ({} remaining)", remaining)),
+                                    ),
+                            )
+                        }),
                 ),
         )
 }
@@ -2679,6 +3054,7 @@ fn render_uninstall(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) ->
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn render_doctor(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> impl IntoElement {
+    let pal = get_palette(app.state.theme);
     div()
         .flex()
         .flex_col()
@@ -2697,14 +3073,14 @@ fn render_doctor(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> im
                         .gap_1()
                         .child(
                             div()
-                                .text_color(rgb(TEXT_PRIMARY))
+                                .text_color(rgb(pal.text_primary))
                                 .text_size(px(22.0))
                                 .font_weight(FontWeight::BOLD)
                                 .child("System Prerequisites & Health"),
                         )
                         .child(
                             div()
-                                .text_color(rgb(TEXT_MUTED))
+                                .text_color(rgb(pal.text_muted))
                                 .text_size(px(13.0))
                                 .child("Diagnostic verification of packaging tools, kernel namespaces, compilers, and keyrings."),
                         ),
@@ -2718,7 +3094,7 @@ fn render_doctor(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> im
                 )),
         )
         .when_some(app.state.doctor_msg.clone(), |this, msg| {
-            this.child(status_msg_bar(&msg))
+            this.child(status_msg_bar(&msg, &pal))
         })
         // Diagnostics Table Container
         .child(
@@ -2726,10 +3102,10 @@ fn render_doctor(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> im
                 .flex_1()
                 .min_h(px(0.0))
                 .border_1()
-                .border_color(rgb(0x16243b))
+                .border_color(rgb(pal.border_subtle))
                 .rounded_xl()
                 .overflow_hidden()
-                .bg(rgb(0x080e18))
+                .bg(rgb(pal.bg_card))
                 .flex()
                 .flex_col()
                 // Table Header
@@ -2739,15 +3115,15 @@ fn render_doctor(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> im
                         .h(px(38.0))
                         .w_full()
                         .px_4()
-                        .bg(rgb(0x0c1524))
+                        .bg(rgb(pal.bg_card_alt))
                         .border_b_1()
-                        .border_color(rgb(0x16243b))
+                        .border_color(rgb(pal.border_subtle))
                         .flex()
                         .items_center()
                         .child(
                             div()
                                 .w(px(180.0))
-                                .text_color(rgb(TEXT_MUTED))
+                                .text_color(rgb(pal.text_muted))
                                 .text_size(px(12.0))
                                 .font_weight(FontWeight::BOLD)
                                 .child("Check Name"),
@@ -2755,7 +3131,7 @@ fn render_doctor(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> im
                         .child(
                             div()
                                 .w(px(120.0))
-                                .text_color(rgb(TEXT_MUTED))
+                                .text_color(rgb(pal.text_muted))
                                 .text_size(px(12.0))
                                 .font_weight(FontWeight::BOLD)
                                 .child("Status"),
@@ -2763,7 +3139,7 @@ fn render_doctor(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> im
                         .child(
                             div()
                                 .flex_1()
-                                .text_color(rgb(TEXT_MUTED))
+                                .text_color(rgb(pal.text_muted))
                                 .text_size(px(12.0))
                                 .font_weight(FontWeight::BOLD)
                                 .child("Diagnostic Details"),
@@ -2790,11 +3166,11 @@ fn render_doctor(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> im
                                         .flex()
                                         .items_center()
                                         .border_b_1()
-                                        .border_color(rgb(0x101b2a))
+                                        .border_color(rgb(pal.border_subtle))
                                         .child(
                                             div()
                                                 .w(px(180.0))
-                                                .text_color(rgb(TEXT_PRIMARY))
+                                                .text_color(rgb(pal.text_primary))
                                                 .text_size(px(13.0))
                                                 .font_weight(FontWeight::BOLD)
                                                 .child(check.name.clone()),
@@ -2823,7 +3199,7 @@ fn render_doctor(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> im
                                         .child(
                                             div()
                                                 .flex_1()
-                                                .text_color(rgb(TEXT_SECONDARY))
+                                                .text_color(rgb(pal.text_secondary))
                                                 .text_size(px(12.0))
                                                 .child(check.message.clone()),
                                         )
@@ -2840,6 +3216,7 @@ fn render_doctor(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> im
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn render_settings(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> impl IntoElement {
+    let pal = get_palette(app.state.theme);
     div()
         .id("settings-scroll")
         .flex()
@@ -2855,14 +3232,14 @@ fn render_settings(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> 
                 .gap_1()
                 .child(
                     div()
-                        .text_color(rgb(TEXT_PRIMARY))
+                        .text_color(rgb(pal.text_primary))
                         .text_size(px(22.0))
                         .font_weight(FontWeight::BOLD)
                         .child("Preferences & Source Routing"),
                 )
                 .child(
                     div()
-                        .text_color(rgb(TEXT_MUTED))
+                        .text_color(rgb(pal.text_muted))
                         .text_size(px(13.0))
                         .child("Enable or disable package discovery sources according to your workflow."),
                 ),
@@ -2871,9 +3248,9 @@ fn render_settings(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> 
         .child(
             div()
                 .w_full()
-                .bg(rgb(0x0c1829))
+                .bg(rgb(pal.bg_card))
                 .border_1()
-                .border_color(rgb(0x1c304a))
+                .border_color(rgb(pal.border_subtle))
                 .rounded_xl()
                 .p_4()
                 .flex()
@@ -2887,7 +3264,7 @@ fn render_settings(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> 
                         .child(div().text_size(px(14.0)).child("🎨"))
                         .child(
                             div()
-                                .text_color(rgb(TEXT_PRIMARY))
+                                .text_color(rgb(pal.text_primary))
                                 .text_size(px(14.0))
                                 .font_weight(FontWeight::BOLD)
                                 .child("Appearance & Theme Selection"),
@@ -2895,7 +3272,7 @@ fn render_settings(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> 
                 )
                 .child(
                     div()
-                        .text_color(rgb(TEXT_MUTED))
+                        .text_color(rgb(pal.text_muted))
                         .text_size(px(12.0))
                         .child("Customize visual style, surface contrast, and accent highlights."),
                 )
@@ -2906,6 +3283,7 @@ fn render_settings(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> 
                         .gap_3()
                         .pt_1()
                         .child(theme_option_pill(
+                            &pal,
                             "theme-opt-dark",
                             "🌙 Arch Navy (Dark)",
                             app.state.theme == AppTheme::Dark,
@@ -2919,6 +3297,7 @@ fn render_settings(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> 
                             }),
                         ))
                         .child(theme_option_pill(
+                            &pal,
                             "theme-opt-midnight",
                             "🌌 Midnight OLED",
                             app.state.theme == AppTheme::Midnight,
@@ -2932,6 +3311,7 @@ fn render_settings(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> 
                             }),
                         ))
                         .child(theme_option_pill(
+                            &pal,
                             "theme-opt-light",
                             "☀️ Modern Light",
                             app.state.theme == AppTheme::Light,
@@ -2950,9 +3330,9 @@ fn render_settings(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> 
         .child(
             div()
                 .w_full()
-                .bg(rgb(0x0c1829))
+                .bg(rgb(pal.bg_card))
                 .border_1()
-                .border_color(rgb(0x1c304a))
+                .border_color(rgb(pal.border_subtle))
                 .rounded_xl()
                 .p_4()
                 .flex()
@@ -2963,10 +3343,10 @@ fn render_settings(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> 
                         .flex()
                         .items_center()
                         .gap_2()
-                        .child(div().text_color(rgb(ACCENT_CYAN)).text_size(px(14.0)).child("🛡️"))
+                        .child(div().text_color(rgb(pal.accent_cyan)).text_size(px(14.0)).child("🛡️"))
                         .child(
                             div()
-                                .text_color(rgb(TEXT_PRIMARY))
+                                .text_color(rgb(pal.text_primary))
                                 .text_size(px(14.0))
                                 .font_weight(FontWeight::BOLD)
                                 .child("Security & Sudo Authorization"),
@@ -2974,7 +3354,7 @@ fn render_settings(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> 
                 )
                 .child(
                     div()
-                        .text_color(rgb(TEXT_MUTED))
+                        .text_color(rgb(pal.text_muted))
                         .text_size(px(12.0))
                         .child("Manage administrator permissions and cached sudo credentials used for installing or uninstalling software."),
                 )
@@ -2991,7 +3371,7 @@ fn render_settings(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> 
                                 .gap_2()
                                 .child(
                                     div()
-                                        .text_color(rgb(TEXT_PRIMARY))
+                                        .text_color(rgb(pal.text_primary))
                                         .text_size(px(13.0))
                                         .child(if app.state.sudo_session_active {
                                             "⦿ Sudo Session: Active"
@@ -3003,8 +3383,8 @@ fn render_settings(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> 
                         .child(action_button(
                             "invalidate-sudo-btn",
                             "🔒 Invalidate Sudo / Clear Password",
-                            0x3a1414,
-                            0xf87171,
+                            if pal.is_light() { 0xfee2e2 } else { 0x3a1414 },
+                            if pal.is_light() { 0xb91c1c } else { 0xf87171 },
                             cx.listener(|this, _, _, cx| {
                                 this.state.sudo_session_active = false;
                                 this.state.settings_msg = Some(StatusMsg {
@@ -3022,10 +3402,10 @@ fn render_settings(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> 
                         .items_center()
                         .gap_2()
                         .pt_1()
-                        .child(div().text_color(rgb(ACCENT_CYAN)).text_size(px(13.0)).child("☑"))
+                        .child(div().text_color(rgb(pal.accent_cyan)).text_size(px(13.0)).child("☑"))
                         .child(
                             div()
-                                .text_color(rgb(TEXT_SECONDARY))
+                                .text_color(rgb(pal.text_secondary))
                                 .text_size(px(12.0))
                                 .child("Remember sudo password in memory during this app session (never saved to disk)"),
                         ),
@@ -3035,21 +3415,21 @@ fn render_settings(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> 
         .child(
             div()
                 .w_full()
-                .bg(rgb(0x0c1829))
+                .bg(rgb(pal.bg_card))
                 .border_1()
-                .border_color(rgb(0x1c304a))
+                .border_color(rgb(pal.border_subtle))
                 .rounded_xl()
                 .p_4()
                 .flex()
                 .flex_col()
                 .gap_2()
-                .child(settings_checkbox("Official Arch Linux Repositories (pacman)", app.state.opt_official))
-                .child(settings_checkbox("Arch User Repository (AUR RPC)", app.state.opt_aur))
-                .child(settings_checkbox("Flatpak Release Bundles (Flathub)", app.state.opt_flatpak))
-                .child(settings_checkbox("AppImage Standalone Assets", app.state.opt_appimage))
-                .child(settings_checkbox("Upstream Git Release Sources (GitHub/GitLab)", app.state.opt_upstream))
-                .child(settings_checkbox("DEB Package Inspection", app.state.opt_deb))
-                .child(settings_checkbox("RPM Package Inspection", app.state.opt_rpm))
+                .child(settings_checkbox(&pal, "Official Arch Linux Repositories (pacman)", app.state.opt_official))
+                .child(settings_checkbox(&pal, "Arch User Repository (AUR RPC)", app.state.opt_aur))
+                .child(settings_checkbox(&pal, "Flatpak Release Bundles (Flathub)", app.state.opt_flatpak))
+                .child(settings_checkbox(&pal, "AppImage Standalone Assets", app.state.opt_appimage))
+                .child(settings_checkbox(&pal, "Upstream Git Release Sources (GitHub/GitLab)", app.state.opt_upstream))
+                .child(settings_checkbox(&pal, "DEB Package Inspection", app.state.opt_deb))
+                .child(settings_checkbox(&pal, "RPM Package Inspection", app.state.opt_rpm))
                 .child(
                     div()
                         .pt_3()
@@ -3070,11 +3450,11 @@ fn render_settings(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> 
                 ),
         )
         .when_some(app.state.settings_msg.clone(), |this, msg| {
-            this.child(status_msg_bar(&msg))
+            this.child(status_msg_bar(&msg, &pal))
         })
 }
 
-fn settings_checkbox(label: &'static str, checked: bool) -> impl IntoElement {
+fn settings_checkbox(pal: &ThemePalette, label: &'static str, checked: bool) -> impl IntoElement {
     div()
         .flex()
         .flex_row()
@@ -3085,19 +3465,24 @@ fn settings_checkbox(label: &'static str, checked: bool) -> impl IntoElement {
             div()
                 .flex_none()
                 .w(px(18.0))
-                .text_color(if checked { rgb(ACCENT_CYAN) } else { rgb(TEXT_MUTED) })
+                .text_color(if checked {
+                    rgb(pal.accent_cyan)
+                } else {
+                    rgb(pal.text_muted)
+                })
                 .text_size(px(14.0))
                 .child(if checked { "☑" } else { "☐" }),
         )
         .child(
             div()
-                .text_color(rgb(TEXT_PRIMARY))
+                .text_color(rgb(pal.text_primary))
                 .text_size(px(13.0))
                 .child(label),
         )
 }
 
 fn theme_option_pill<F>(
+    pal: &ThemePalette,
     id: &'static str,
     label: &'static str,
     is_active: bool,
@@ -3112,15 +3497,39 @@ where
         .px_4()
         .rounded_lg()
         .cursor_pointer()
-        .bg(if is_active { rgb(0x163456) } else { rgb(0x0c1626) })
+        .bg(if is_active {
+            if pal.is_light() {
+                rgb(0xdbeafe)
+            } else {
+                rgb(0x163456)
+            }
+        } else {
+            if pal.is_light() {
+                rgb(0xf1f5f9)
+            } else {
+                rgb(0x0c1626)
+            }
+        })
         .border_1()
-        .border_color(if is_active { rgb(ACCENT_CYAN) } else { rgb(0x1c304a) })
+        .border_color(if is_active {
+            rgb(pal.accent_cyan)
+        } else {
+            rgb(pal.border_subtle)
+        })
         .flex()
         .items_center()
         .justify_center()
-        .text_color(if is_active { rgb(ACCENT_CYAN) } else { rgb(TEXT_SECONDARY) })
+        .text_color(if is_active {
+            rgb(pal.accent_cyan)
+        } else {
+            rgb(pal.text_secondary)
+        })
         .text_size(px(12.5))
-        .font_weight(if is_active { FontWeight::BOLD } else { FontWeight::MEDIUM })
+        .font_weight(if is_active {
+            FontWeight::BOLD
+        } else {
+            FontWeight::MEDIUM
+        })
         .on_click(on_click)
         .child(label)
 }
@@ -3130,6 +3539,7 @@ where
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn render_bottom_bar(app: &ArchBridgeApp) -> impl IntoElement {
+    let pal = get_palette(app.state.theme);
     div()
         .w_full()
         .h(px(26.0))
@@ -3148,41 +3558,52 @@ fn render_bottom_bar(app: &ArchBridgeApp) -> impl IntoElement {
                         .flex()
                         .items_center()
                         .gap_1_5()
-                        .child(div().w(px(7.0)).h(px(7.0)).rounded_full().bg(rgb(ACCENT_GREEN)))
                         .child(
                             div()
-                                .text_color(rgb(TEXT_SECONDARY))
+                                .w(px(7.0))
+                                .h(px(7.0))
+                                .rounded_full()
+                                .bg(rgb(ACCENT_GREEN)),
+                        )
+                        .child(
+                            div()
+                                .text_color(rgb(pal.text_secondary))
                                 .text_size(px(11.0))
                                 .child("Ready"),
                         ),
                 )
-                .child(div().w_px().h(px(10.0)).bg(rgb(BORDER_SUBTLE)))
+                .child(div().w_px().h(px(10.0)).bg(rgb(pal.border_subtle)))
                 // Active Chroot
                 .child(
                     div()
-                        .text_color(rgb(TEXT_MUTED))
+                        .text_color(rgb(pal.text_muted))
                         .text_size(px(11.0))
                         .child(format!("Active Chroot: {}", app.state.active_chroot)),
                 )
-                .child(div().w_px().h(px(10.0)).bg(rgb(BORDER_SUBTLE)))
+                .child(div().w_px().h(px(10.0)).bg(rgb(pal.border_subtle)))
                 // Disk Space
                 .child(
                     div()
-                        .text_color(rgb(TEXT_MUTED))
+                        .text_color(rgb(pal.text_muted))
                         .text_size(px(11.0))
                         .child(format!("Disk: {}", app.state.free_disk_space)),
                 )
-                .child(div().w_px().h(px(10.0)).bg(rgb(BORDER_SUBTLE)))
+                .child(div().w_px().h(px(10.0)).bg(rgb(pal.border_subtle)))
                 // Keyring Verified
                 .child(
                     div()
                         .flex()
                         .items_center()
                         .gap_1()
-                        .child(div().text_color(rgb(ACCENT_GREEN)).text_size(px(11.0)).child("✓"))
                         .child(
                             div()
-                                .text_color(rgb(TEXT_MUTED))
+                                .text_color(rgb(ACCENT_GREEN))
+                                .text_size(px(11.0))
+                                .child("✓"),
+                        )
+                        .child(
+                            div()
+                                .text_color(rgb(pal.text_muted))
                                 .text_size(px(11.0))
                                 .child(format!("Keyring: {}", app.state.keyring_status)),
                         ),
@@ -3195,14 +3616,14 @@ fn render_bottom_bar(app: &ArchBridgeApp) -> impl IntoElement {
                 .gap_2()
                 .child(
                     div()
-                        .text_color(rgb(TEXT_MUTED))
+                        .text_color(rgb(pal.text_muted))
                         .text_size(px(11.0))
                         .font_family("monospace")
                         .child(format!("v{}", APP_VERSION)),
                 )
                 .child(
                     div()
-                        .text_color(rgb(TEXT_SECONDARY))
+                        .text_color(rgb(pal.text_secondary))
                         .text_size(px(11.0))
                         .font_weight(FontWeight::BOLD)
                         .child("ArchBridge"),
