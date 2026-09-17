@@ -59,7 +59,7 @@ pub fn evaluate_network_probe_result(
                 let is_http_error = if let Some(line) = status_line {
                     let parts: Vec<&str> = line.split_whitespace().collect();
                     if parts.len() >= 2 {
-                        parts[1].parse::<u16>().map_or(false, |code| code >= 400)
+                        parts[1].parse::<u16>().is_ok_and(|code| code >= 400)
                     } else {
                         false
                     }
@@ -213,12 +213,10 @@ pub fn compute_readiness(checks: &[CheckResult]) -> bool {
                     return false;
                 }
             }
-            "network" => {
+            "network" if check.status == "fail" => {
                 // "pass" or "unavailable" are permitted for readiness (offline building is supported).
                 // "fail" (e.g. TLS verification failure) marks system unready as a security safeguard.
-                if check.status == "fail" {
-                    return false;
-                }
+                return false;
             }
             _ => {}
         }
@@ -304,8 +302,8 @@ where
         "Check devtools (makechrootpkg)",
         5,
     );
-    let mk_ok = run_step(&step_mkchroot, None).map_or(false, |o| o.exit_code == 0);
-    let pkg_ok = run_step(&step_makechrootpkg, None).map_or(false, |o| o.exit_code == 0);
+    let mk_ok = run_step(&step_mkchroot, None).is_ok_and(|o| o.exit_code == 0);
+    let pkg_ok = run_step(&step_makechrootpkg, None).is_ok_and(|o| o.exit_code == 0);
     if mk_ok && pkg_ok {
         checks.push(CheckResult {
             name: "devtools".to_string(),
@@ -325,7 +323,7 @@ where
     let ns_file = Path::new("/proc/sys/kernel/unprivileged_userns_clone");
     let user_ns = Path::new("/proc/self/ns/user");
     if user_ns.exists()
-        || (ns_file.exists() && fs::read_to_string(ns_file).map_or(false, |c| c.trim() == "1"))
+        || (ns_file.exists() && fs::read_to_string(ns_file).is_ok_and(|c| c.trim() == "1"))
     {
         checks.push(CheckResult {
             name: "namespaces".to_string(),

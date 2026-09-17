@@ -4,6 +4,7 @@ use std::path::Path;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum BuildSystem {
+    Imported,
     Cmake,
     Make,
     Cargo,
@@ -32,10 +33,8 @@ pub fn detect_build_system(dir: &Path) -> BuildSystem {
             return BuildSystem::Cargo;
         }
     }
-    if go_mod.exists() {
-        if check_go_main(dir) {
-            return BuildSystem::Go;
-        }
+    if go_mod.exists() && check_go_main(dir) {
+        return BuildSystem::Go;
     }
     if meson.exists() {
         return BuildSystem::Meson;
@@ -89,7 +88,7 @@ fn check_go_main(dir: &Path) -> bool {
     if let Ok(entries) = fs::read_dir(dir) {
         for entry in entries.flatten() {
             let p = entry.path();
-            if p.is_file() && p.extension().map_or(false, |ext| ext == "go") {
+            if p.is_file() && p.extension().is_some_and(|ext| ext == "go") {
                 if let Ok(content) = fs::read_to_string(&p) {
                     if content.lines().any(|l| l.trim() == "package main") {
                         return true;
@@ -137,6 +136,38 @@ pub fn generate_pkgbuild(system: &BuildSystem, params: &PkgbuildParams) -> Resul
     };
 
     match system {
+        BuildSystem::Imported => {
+            let extract_cmd = if params.source_tarball.ends_with(".tar.xz")
+                || params.source_tarball.ends_with(".tar.zst")
+                || params.source_tarball.ends_with(".tar")
+            {
+                format!(
+                    "bsdtar -xf \"$srcdir/{}\" -C \"$pkgdir\"",
+                    params.source_tarball
+                )
+            } else {
+                format!(
+                    "tar -xzf \"$srcdir/{}\" -C \"$pkgdir\"",
+                    params.source_tarball
+                )
+            };
+            Ok(format!(
+                "# Maintainer: ArchBridge generated from a foreign package\n\
+pkgname='{pkgname}'\n\
+pkgver='{pkgver}'\n\
+pkgrel=1\n\
+pkgdesc='Imported foreign package payload for {pkgname}'\n\
+arch=('x86_64')\n\
+license=('custom')\n\
+depends={depends_str}\n\
+options=('!strip')\n\
+source=('{source_tar}')\n\
+sha256sums=('{sha256}')\n\n\
+package() {{\n\
+  {extract_cmd}\n\
+}}\n"
+            ))
+        }
         BuildSystem::Cmake => Ok(format!(
             "# Maintainer: ArchBridge generated\n\
 pkgname='{pkgname}'\n\

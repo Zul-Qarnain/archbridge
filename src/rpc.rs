@@ -151,6 +151,7 @@ impl RpcServer {
                             .prepare_build(target, name, version, entry, &deps, &smoke_args)
                     }
                     "install" => self.engine.prepare_install(target),
+                    "uninstall" => self.engine.prepare_uninstall(target),
                     "test" => self.engine.prepare_test(target, entry, &smoke_args),
                     _ => Err(format!("Unknown prepare action '{}'", action)),
                 };

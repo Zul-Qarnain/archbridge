@@ -16,3 +16,6 @@ __pycache__/
 .directory
 .codex/
 .agents/
+.archbridge/
+agent.md
+Bug/

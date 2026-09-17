@@ -1,3 +1,4 @@
+use archbridge::build::snapshot_foreign_package;
 use archbridge::config::Config;
 use archbridge::engine::Engine;
 use archbridge::recipe::{detect_build_system, generate_pkgbuild, BuildSystem, PkgbuildParams};
@@ -12,7 +13,7 @@ fn test_config_defaults_and_toggle() {
 
     assert!(config.set("aur", "false").is_ok());
     assert!(!config.aur);
-    assert_eq!(config.is_enabled("aur"), false);
+    assert!(!config.is_enabled("aur"));
 
     assert!(config
         .set("repo.mytool", "https://github.com/owner/repo")
@@ -63,4 +64,25 @@ fn test_engine_plan_preparation() {
     let plan = engine.prepare_search("bash", None).unwrap();
     assert_eq!(plan.action, "search");
     assert!(plan.decision.is_some());
+}
+
+#[test]
+fn repository_database_is_not_mistaken_for_a_package() {
+    let result = snapshot_foreign_package(std::path::Path::new("community.db"));
+    assert!(matches!(result, Err(error) if error.contains("repository index")));
+}
+
+#[test]
+fn imported_pkgbuild_extracts_payload_without_running_scripts() {
+    let params = PkgbuildParams {
+        name: "imported".to_string(),
+        version: "1.0.0".to_string(),
+        source_tarball: "src.tar.gz".to_string(),
+        sha256_hash: "a".repeat(64),
+        dependencies: vec![],
+        entry_binary: None,
+    };
+    let pkgbuild = generate_pkgbuild(&BuildSystem::Imported, &params).unwrap();
+    assert!(pkgbuild.contains("tar -xzf \"$srcdir/src.tar.gz\""));
+    assert!(!pkgbuild.contains("preinst"));
 }

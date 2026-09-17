@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::io::Write;
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -35,8 +36,19 @@ pub struct ProcessOutput {
 }
 
 pub fn run_step(step: &Step, input: Option<&[u8]>) -> Result<ProcessOutput, String> {
+    run_step_in_dir(step, input, None)
+}
+
+pub fn run_step_in_dir(
+    step: &Step,
+    input: Option<&[u8]>,
+    working_dir: Option<&Path>,
+) -> Result<ProcessOutput, String> {
     let mut cmd = Command::new(&step.program);
     cmd.args(&step.args);
+    if let Some(dir) = working_dir {
+        cmd.current_dir(dir);
+    }
 
     if input.is_some() {
         cmd.stdin(Stdio::piped());

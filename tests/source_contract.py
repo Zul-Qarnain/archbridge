@@ -39,7 +39,7 @@ class SourceContract(unittest.TestCase):
         source = self.read("build.rs")
         self.assertIn("--private-users=pick", source)
         self.assertIn("--private-network", source)
-        self.assertIn('Some("65534")', source)
+        self.assertIn('"65534".to_string()', source)
         self.assertIn("smoke.timeout_seconds = 30", source)
         self.assertNotIn('"--bind="', source)
 

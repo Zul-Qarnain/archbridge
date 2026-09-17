@@ -7,7 +7,7 @@ fn deb_reports_scripts_dependencies_units_and_elf_without_execution() {
     if let Ok(report) = inspect_package(fixture_path) {
         assert_eq!(report.format, "deb");
         for script in &report.maintainer_scripts {
-            assert_eq!(script.executed, false);
+            assert!(!script.executed);
         }
     }
 }
@@ -19,7 +19,7 @@ fn real_rpm_inspection_never_claims_installability() {
     if let Ok(report) = inspect_package(&rpm_env) {
         assert_eq!(report.format, "rpm");
         for script in &report.maintainer_scripts {
-            assert_eq!(script.executed, false);
+            assert!(!script.executed);
         }
     }
 }

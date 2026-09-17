@@ -53,6 +53,7 @@ fn main() {
         "inspect" => handle_inspect(&mut client, &args[2..]),
         "build" => handle_build(&mut client, &args[2..]),
         "install" => handle_install(&mut client, &args[2..]),
+        "uninstall" | "remove" => handle_uninstall(&mut client, &args[2..]),
         "test" => handle_test(&mut client, &args[2..]),
         "config" => handle_config(&mut client, &args[2..]),
         "doctor" => handle_doctor(&mut client),
@@ -84,7 +85,8 @@ archbridge search <name> [--repo <url>]\n  \
 archbridge info <name>\n  \
 archbridge inspect <file.deb|file.rpm>\n  \
 archbridge build <url|directory|PKGBUILD> [--name <name>] [--version <ver>] [--entry <bin>] [--dependency <pkg>...] [--smoke-arg <arg>...] [--dry-run] [--yes]\n  \
-archbridge install <name|file> [--dry-run] [--yes]\n  \
+  archbridge install <name|file> [--dry-run] [--yes]\n  \
+  archbridge uninstall <installed-package-name> [--dry-run] [--yes]\n  \
 archbridge test <package.pkg.tar.zst> [--entry <bin>] [--smoke-arg <arg>...] [--dry-run] [--yes]\n  \
 archbridge config <get|set> <key> [value] [--yes]\n  \
 archbridge doctor\n  \
@@ -273,7 +275,7 @@ fn handle_build(client: &mut DirectRpcClient, args: &[String]) -> Result<i32, St
             "--entry" => { if i + 1 < args.len() { entry = Some(args[i + 1].clone()); i += 1; } }
             "--dependency" => { if i + 1 < args.len() { deps.push(args[i + 1].clone()); i += 1; } }
             "--smoke-arg" => { if i + 1 < args.len() { smoke_args.push(args[i + 1].clone()); i += 1; } }
-            arg if !arg.starts_with("--") => { if target.is_none() { target = Some(arg.to_string()); } }
+            arg if !arg.starts_with("--") && target.is_none() => { target = Some(arg.to_string()); }
             _ => {}
         }
         i += 1;
@@ -363,6 +365,37 @@ fn handle_install(client: &mut DirectRpcClient, args: &[String]) -> Result<i32, 
 }
 
 #[rustfmt::skip]
+fn handle_uninstall(client: &mut DirectRpcClient, args: &[String]) -> Result<i32, String> {
+    let (positional, dry_run, yes, _repo) = parse_flags(args);
+    if positional.is_empty() {
+        return Err("Missing installed package name for uninstall".to_string());
+    }
+    let target = &positional[0];
+    let plan_val = client.call("v1.prepare", json!({
+        "action": "uninstall",
+        "request": { "target": target }
+    }))?;
+    println!("{}", serde_json::to_string_pretty(&plan_val).unwrap());
+    if dry_run { return Ok(0); }
+
+    let plan: Plan = serde_json::from_value(plan_val).map_err(|e| e.to_string())?;
+    if plan.blocked.is_some() { return Ok(3); }
+    if !yes {
+        eprint!("Confirm package removal [y/N]? ");
+        io::stderr().flush().ok();
+        let mut input = String::new();
+        io::stdin().read_line(&mut input).ok();
+        if !input.trim().eq_ignore_ascii_case("y") && !input.trim().eq_ignore_ascii_case("yes") {
+            eprintln!("Operation cancelled.");
+            return Ok(3);
+        }
+    }
+    let result = client.call("v1.execute", json!({ "plan_id": plan.plan_id, "confirmed": true }))?;
+    println!("{}", serde_json::to_string_pretty(&result).unwrap());
+    Ok(0)
+}
+
+#[rustfmt::skip]
 fn handle_test(client: &mut DirectRpcClient, args: &[String]) -> Result<i32, String> {
     let mut pkg_path = None;
     let mut entry = None;
@@ -377,7 +410,7 @@ fn handle_test(client: &mut DirectRpcClient, args: &[String]) -> Result<i32, Str
             "--yes" | "-y" => yes = true,
             "--entry" => { if i + 1 < args.len() { entry = Some(args[i + 1].clone()); i += 1; } }
             "--smoke-arg" => { if i + 1 < args.len() { smoke_args.push(args[i + 1].clone()); i += 1; } }
-            arg if !arg.starts_with("--") => { if pkg_path.is_none() { pkg_path = Some(arg.to_string()); } }
+            arg if !arg.starts_with("--") && pkg_path.is_none() => { pkg_path = Some(arg.to_string()); }
             _ => {}
         }
         i += 1;

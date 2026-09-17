@@ -15,7 +15,7 @@ import urllib.request
 import webbrowser
 from pathlib import Path
 
-from PyQt6.QtCore import QByteArray, QPoint, QProcess, QRect, QRectF, QSize, Qt, QThread, pyqtSignal
+from PyQt6.QtCore import QByteArray, QPoint, QProcess, QRect, QRectF, QSize, Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import (
     QBrush,
     QColor,
@@ -42,6 +42,7 @@ from PyQt6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
+    QDialogButtonBox,
     QLabel,
     QLineEdit,
     QListWidget,
@@ -347,6 +348,35 @@ class NavButton(QPushButton):
         self.setText(f"{self.icon_str}   {clean_text}")
 
 
+class HeaderIcon(QLabel):
+    """Stable inline SVG icon for the compact status header."""
+
+    def __init__(self, kind, parent=None):
+        super().__init__(parent)
+        self.kind = kind
+        self.setFixedSize(30, 30)
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.set_state("#38bdf8")
+
+    def set_state(self, color):
+        paths = {
+            "engine": '<path d="M7 15h6m2 0h6M8 12.5a2.5 2.5 0 1 0 0 5 2.5 2.5 0 0 0 0-5Zm14 0a2.5 2.5 0 1 0 0 5 2.5 2.5 0 0 0 0-5Z"/>',
+            "history": '<path d="M7 9v4h4M8 13a7 7 0 1 0 2-5m5 2v5l4 2"/>',
+            "system": '<path d="m8.5 10 6.5-3 6.5 3-1 7c-.8 3-3.2 5.2-5.5 6.5-2.3-1.3-4.7-3.5-5.5-6.5l-1-7Zm3 5.5 2.5 2.5 4.5-5"/>'
+        }
+        svg = f'''<svg width="30" height="30" viewBox="0 0 30 30" xmlns="http://www.w3.org/2000/svg">
+          <rect x="0.5" y="0.5" width="29" height="29" rx="8" fill="#0b1b2e" stroke="#23405e"/>
+          <g fill="none" stroke="{color}" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">{paths[self.kind]}</g>
+        </svg>'''
+        renderer = QSvgRenderer(QByteArray(svg.encode("utf-8")))
+        pixmap = QPixmap(30, 30)
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        renderer.render(painter)
+        painter.end()
+        self.setPixmap(pixmap)
+
+
 class ArchBridgeWindow(QMainWindow):
     def __init__(self, binary_path):
         super().__init__()
@@ -357,6 +387,9 @@ class ArchBridgeWindow(QMainWindow):
         self.current_query = ""
         self.last_search_result = None
         self.icon_threads = []
+        self.privilege_retry_used = False
+        self.clear_sudo_after_job = False
+        self.sudo_process = None
 
         self.setWindowTitle("ArchBridge — Software Discovery & Packaging Assistant")
         self.resize(1280, 840)
@@ -591,66 +624,108 @@ class ArchBridgeWindow(QMainWindow):
     # --- 2. TOP BAR ---
     def setup_top_bar(self, main_layout):
         top_bar = QHBoxLayout()
-        top_bar.setSpacing(12)
+        top_bar.setContentsMargins(0, 0, 0, 0)
 
-        # Pill 1: IPC Status
-        self.ipc_pill = QFrame()
-        self.ipc_pill.setStyleSheet("QFrame { background-color: #09121d; border: 1px solid #132032; border-radius: 8px; padding: 4px 12px; }")
-        ipc_layout = QHBoxLayout(self.ipc_pill)
-        ipc_layout.setContentsMargins(6, 4, 8, 4)
-        ipc_layout.setSpacing(8)
-
-        self.ipc_dot = QLabel("●")
-        self.ipc_dot.setStyleSheet("color: #10b981; font-size: 12px;")
-        ipc_text_col = QVBoxLayout()
-        ipc_text_col.setSpacing(0)
-        self.ipc_title = QLabel("IPC Connected (v1.0)")
-        self.ipc_title.setStyleSheet("font-size: 11px; font-weight: bold; color: #f1f5f9;")
-        self.ipc_sub = QLabel("archbridge serve")
-        self.ipc_sub.setStyleSheet("font-size: 9px; color: #64748b;")
-        ipc_text_col.addWidget(self.ipc_title)
-        ipc_text_col.addWidget(self.ipc_sub)
-
-        ipc_layout.addWidget(self.ipc_dot)
-        ipc_layout.addLayout(ipc_text_col)
-        top_bar.addWidget(self.ipc_pill)
-
-        # Pill 2: Search History
-        self.btn_history = QPushButton("🕒  Search history ▾")
-        self.btn_history.setStyleSheet("""
-            QPushButton {
-                background-color: #09121d;
-                border: 1px solid #132032;
-                border-radius: 8px;
-                padding: 8px 14px;
-                color: #cbd5e1;
-                font-size: 12px;
+        header_surface = QFrame()
+        header_surface.setObjectName("headerSurface")
+        header_surface.setMinimumWidth(520)
+        header_surface.setMaximumWidth(720)
+        header_surface.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        header_surface.setStyleSheet("""
+            QFrame#headerSurface {
+                background-color: rgba(12, 24, 41, 225);
+                border: 1px solid #1c304a;
+                border-radius: 14px;
             }
-            QPushButton:hover {
-                background-color: #0f1c2d;
+            QFrame#headerCell {
+                background-color: transparent;
+                border: 1px solid transparent;
+                border-radius: 10px;
             }
+            QFrame#headerCell:hover {
+                background-color: #102039;
+                border-color: #29415f;
+            }
+            QLabel#headerTitle {
+                color: #e2e8f0;
+                font-size: 11px;
+                font-weight: 700;
+            }
+            QLabel#headerSubtitle {
+                color: #64748b;
+                font-size: 9px;
+            }
+            QPushButton#historyButton {
+                background: transparent;
+                border: none;
+                color: #e2e8f0;
+                font-size: 11px;
+                font-weight: 700;
+                text-align: left;
+                padding: 0;
+            }
+            QPushButton#historyButton:disabled { color: #64748b; }
         """)
+        header_layout = QHBoxLayout(header_surface)
+        header_layout.setContentsMargins(6, 6, 6, 6)
+        header_layout.setSpacing(4)
+
+        def make_cell(icon_kind, title, subtitle):
+            cell = QFrame()
+            cell.setObjectName("headerCell")
+            cell.setMinimumHeight(50)
+            cell.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            cell_layout = QHBoxLayout(cell)
+            cell_layout.setContentsMargins(8, 5, 10, 5)
+            cell_layout.setSpacing(8)
+            icon_label = HeaderIcon(icon_kind)
+            text_col = QVBoxLayout()
+            text_col.setSpacing(1)
+            title_label = QLabel(title)
+            title_label.setObjectName("headerTitle")
+            subtitle_label = QLabel(subtitle)
+            subtitle_label.setObjectName("headerSubtitle")
+            text_col.addWidget(title_label)
+            text_col.addWidget(subtitle_label)
+            cell_layout.addWidget(icon_label)
+            cell_layout.addLayout(text_col, 1)
+            return cell, title_label, subtitle_label
+
+        self.ipc_pill, self.ipc_title, self.ipc_sub = make_cell("engine", "Engine ready", "Local service")
+        self.ipc_dot = self.ipc_pill.findChild(HeaderIcon)
+        header_layout.addWidget(self.ipc_pill)
+
+        history_cell = QFrame()
+        history_cell.setObjectName("headerCell")
+        history_cell.setMinimumHeight(50)
+        history_cell.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        history_layout = QHBoxLayout(history_cell)
+        history_layout.setContentsMargins(8, 5, 10, 5)
+        history_layout.setSpacing(8)
+        history_icon = HeaderIcon("history")
+        history_text = QVBoxLayout()
+        history_text.setSpacing(1)
+        self.btn_history = QPushButton("History")
+        self.btn_history.setObjectName("historyButton")
+        self.btn_history.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.history_sub = QLabel("No recent searches")
+        self.history_sub.setObjectName("headerSubtitle")
+        history_text.addWidget(self.btn_history)
+        history_text.addWidget(self.history_sub)
+        history_layout.addWidget(history_icon)
+        history_layout.addLayout(history_text, 1)
+        header_layout.addWidget(history_cell)
+
         self.history_menu = QMenu(self)
         self.history_menu.setStyleSheet("background-color: #0a1322; color: #cbd5e1; border: 1px solid #16263b; padding: 4px;")
         self.btn_history.setMenu(self.history_menu)
-        top_bar.addWidget(self.btn_history)
+        self.btn_history.setEnabled(False)
 
-        # Pill 3: Doctor Status
-        self.doc_pill = QFrame()
-        self.doc_pill.setStyleSheet("QFrame { background-color: #09121d; border: 1px solid #132032; border-radius: 8px; padding: 6px 12px; }")
-        doc_layout = QHBoxLayout(self.doc_pill)
-        doc_layout.setContentsMargins(6, 4, 8, 4)
-        doc_layout.setSpacing(6)
+        self.doc_pill, self.doc_status_lbl, self.doc_sub = make_cell("system", "System ready", "Health checks passing")
+        self.doc_dot = self.doc_pill.findChild(HeaderIcon)
+        header_layout.addWidget(self.doc_pill)
 
-        self.doc_dot = QLabel("●")
-        self.doc_dot.setStyleSheet("color: #10b981; font-size: 12px;")
-        self.doc_status_lbl = QLabel("Doctor: Healthy")
-        self.doc_status_lbl.setStyleSheet("font-size: 11px; font-weight: 600; color: #f1f5f9;")
-
-        doc_layout.addWidget(self.doc_dot)
-        doc_layout.addWidget(self.doc_status_lbl)
-        top_bar.addWidget(self.doc_pill)
-
+        top_bar.addWidget(header_surface)
         top_bar.addStretch()
 
         main_layout.addLayout(top_bar)
@@ -836,10 +911,12 @@ class ArchBridgeWindow(QMainWindow):
         sec_header.addWidget(sec_title)
         sec_header.addStretch()
 
-        sort_combo = QComboBox()
-        sort_combo.addItems(["Sort by: Recommended", "Sort by: Source", "Sort by: Name"])
-        sort_combo.setFixedWidth(160)
-        sec_header.addWidget(sort_combo)
+        self.sort_combo = QComboBox()
+        self.sort_combo.addItems(["Recommended", "Source", "Name"])
+        self.sort_combo.setToolTip("Choose how verified sources are ordered")
+        self.sort_combo.setMinimumWidth(190)
+        self.sort_combo.currentIndexChanged.connect(self.refresh_search_results)
+        sec_header.addWidget(self.sort_combo)
         left_layout.addLayout(sec_header)
 
         # Scrollable Cards Area
@@ -898,6 +975,7 @@ class ArchBridgeWindow(QMainWindow):
         self.detail_name.setStyleSheet("font-size: 20px; font-weight: 800; color: #f8fafc;")
         self.detail_source_pill = QLabel("—")
         self.detail_source_pill.setStyleSheet("background-color: #064e3b; color: #34d399; font-size: 9px; font-weight: bold; padding: 2px 6px; border-radius: 4px;")
+        self.detail_source_pill.hide()
         top_name_row.addWidget(self.detail_name)
         top_name_row.addWidget(self.detail_source_pill)
         top_name_row.addStretch()
@@ -939,6 +1017,21 @@ class ArchBridgeWindow(QMainWindow):
 
         layout.addLayout(self.meta_grid)
 
+        self.detail_meta_widgets = []
+        for row_idx in range(self.meta_grid.rowCount()):
+            for col_idx in range(2):
+                item = self.meta_grid.itemAtPosition(row_idx, col_idx)
+                if item and item.widget():
+                    self.detail_meta_widgets.append(item.widget())
+
+        self.detail_empty_state = QLabel(
+            "✦\n\nNo package selected\n\nChoose a verified result from the source list to inspect its details."
+        )
+        self.detail_empty_state.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.detail_empty_state.setWordWrap(True)
+        self.detail_empty_state.setStyleSheet("color: #64748b; font-size: 12px; padding: 24px;")
+        layout.insertWidget(2, self.detail_empty_state, 1)
+
         layout.addSpacing(6)
 
         # Tag Chips
@@ -969,10 +1062,13 @@ class ArchBridgeWindow(QMainWindow):
             l.setStyleSheet("font-size: 11px; color: #cbd5e1;")
             links_box.addWidget(l)
 
+        self.detail_link_widgets = [self.link_web, self.link_src, self.link_wiki]
+
         layout.addLayout(links_box)
         layout.addStretch()
 
         main_h_layout.addWidget(self.detail_card, 35)
+        self.clear_inspector_panel()
 
     def update_tag_chips(self, tags):
         # Clear previous chips
@@ -1029,6 +1125,9 @@ class ArchBridgeWindow(QMainWindow):
             for h in self.search_history[:8]:
                 act = self.history_menu.addAction(h)
                 act.triggered.connect(lambda checked, item=h: self.do_search_query(item))
+            self.btn_history.setText(f"History · {len(self.search_history)}")
+            self.history_sub.setText("Recent searches")
+            self.btn_history.setEnabled(True)
 
         self.rec_desc.setText(f"Searching available paths for '{query}'...")
         self.rec_sub.setText("Querying sync database, AUR RPC API, and release repositories...")
@@ -1122,10 +1221,16 @@ class ArchBridgeWindow(QMainWindow):
 
     def clear_inspector_panel(self):
         self.app_icon_label.clear()
-        self.detail_name.setText("No package selected")
+        self.detail_name.setText("Ready to inspect")
         self.detail_source_pill.setText("—")
+        self.detail_source_pill.hide()
         self.detail_short_desc.setText("Select a verified result to inspect package details.")
         self.detail_long_desc.setText("")
+        self.detail_empty_state.show()
+        for widget in self.detail_meta_widgets + self.detail_link_widgets:
+            widget.hide()
+        self.chips_container.hide()
+        self.detail_long_desc.hide()
         for label in self.meta_val_labels.values():
             label.setText("—")
         self.update_tag_chips([])
@@ -1134,6 +1239,12 @@ class ArchBridgeWindow(QMainWindow):
         self.link_wiki.setText("📄  Arch Wiki: —")
 
     def update_inspector_panel(self, meta):
+        self.detail_empty_state.hide()
+        self.detail_source_pill.show()
+        for widget in self.detail_meta_widgets + self.detail_link_widgets:
+            widget.show()
+        self.chips_container.show()
+        self.detail_long_desc.show()
         self.detail_name.setText(meta.get("name", self.current_query))
         self.detail_short_desc.setText(meta.get("description", ""))
         self.detail_long_desc.setText(meta.get("description", ""))
@@ -1189,7 +1300,16 @@ class ArchBridgeWindow(QMainWindow):
             self.rec_desc.setText(f"No verified source found for '{target}'.")
             self.rec_sub.setText("No matching packages found in Official repos, AUR, Flatpak, or AppImage.")
 
-        table = result.get("decision_table", [])
+        table = list(result.get("decision_table", []))
+        if self.sort_combo.currentIndex() == 0:
+            table.sort(key=lambda row: (not row.get("recommended", False), row.get("source", "")))
+        elif self.sort_combo.currentIndex() == 1:
+            table.sort(key=lambda row: row.get("source", ""))
+        else:
+            table.sort(key=lambda row: (
+                row.get("candidates", [{}])[0].get("name", target)
+                if row.get("candidates") else target
+            ).lower())
         selected_source = self.combo_source_filter.currentText().lower()
         cards_added = 0
         first_candidate_name = None
@@ -1426,9 +1546,15 @@ class ArchBridgeWindow(QMainWindow):
         btn_inspect.setStyleSheet("background-color: #0084d1; color: #ffffff; font-weight: bold;")
         btn_inspect.clicked.connect(self.do_inspect)
 
+        btn_import = QPushButton("Import & Build")
+        btn_import.setStyleSheet("background-color: #059669; color: #ffffff; font-weight: bold;")
+        btn_import.setToolTip("Convert the package payload into an Arch package, then offer installation")
+        btn_import.clicked.connect(self.do_import_build)
+
         file_bar.addWidget(self.inspect_file_input, 1)
         file_bar.addWidget(btn_browse)
         file_bar.addWidget(btn_inspect)
+        file_bar.addWidget(btn_import)
         layout.addLayout(file_bar)
 
         safety_banner = QFrame()
@@ -1451,6 +1577,19 @@ class ArchBridgeWindow(QMainWindow):
         file_path, _ = QFileDialog.getOpenFileName(self, "Select Package File", "", "Package Files (*.deb *.rpm);;All Files (*)")
         if file_path:
             self.inspect_file_input.setText(file_path)
+            self.do_inspect()
+
+    def do_import_build(self):
+        path = self.inspect_file_input.text().strip()
+        if not path:
+            QMessageBox.warning(self, "Package Required", "Choose a .deb or .rpm file first.")
+            return
+        if not path.lower().endswith((".deb", ".rpm")):
+            QMessageBox.warning(self, "Unsupported File", "Import currently supports .deb and .rpm files.")
+            return
+        self.switch_tab(2)
+        self.build_target_input.setText(path)
+        self.do_prepare_build()
 
     def do_inspect(self):
         path = self.inspect_file_input.text().strip()
@@ -1482,14 +1621,19 @@ class ArchBridgeWindow(QMainWindow):
 
         t_row = QHBoxLayout()
         self.build_target_input = QLineEdit()
-        self.build_target_input.setPlaceholderText("Target: GitHub/GitLab URL, local directory, PKGBUILD, or package name...")
-        self.build_target_input.setText("brave")
+        self.build_target_input.setPlaceholderText("Target: .deb/.rpm file, GitHub URL, local directory, PKGBUILD, or package name...")
+        self.build_target_input.clear()
+
+        btn_browse_build = QPushButton("Browse Package...")
+        btn_browse_build.setToolTip("Choose a local .deb or .rpm package")
+        btn_browse_build.clicked.connect(self.browse_build_package)
 
         btn_prep = QPushButton("Prepare Build Plan (Dry-Run)")
         btn_prep.setStyleSheet("background-color: #0084d1; color: #ffffff; font-weight: bold;")
         btn_prep.clicked.connect(self.do_prepare_build)
 
         t_row.addWidget(self.build_target_input, 1)
+        t_row.addWidget(btn_browse_build)
         t_row.addWidget(btn_prep)
         top_layout.addLayout(t_row)
 
@@ -1505,7 +1649,39 @@ class ArchBridgeWindow(QMainWindow):
         opts_row.addWidget(self.opt_deps)
         top_layout.addLayout(opts_row)
 
+        remove_row = QHBoxLayout()
+        remove_label = QLabel("Remove installed package")
+        remove_label.setStyleSheet("color: #cbd5e1; font-weight: 700;")
+        self.uninstall_name_input = QLineEdit()
+        self.uninstall_name_input.setPlaceholderText("Package name, e.g. grok-bot")
+        self.btn_prepare_uninstall = QPushButton("Prepare Uninstall Plan")
+        self.btn_prepare_uninstall.setEnabled(False)
+        self.btn_prepare_uninstall.setToolTip("Review a pacman removal plan before anything is changed")
+        self.btn_prepare_uninstall.clicked.connect(self.do_prepare_uninstall)
+        self.uninstall_name_input.textChanged.connect(
+            lambda text: self.btn_prepare_uninstall.setEnabled(bool(text.strip()))
+        )
+        remove_row.addWidget(remove_label)
+        remove_row.addWidget(self.uninstall_name_input, 1)
+        remove_row.addWidget(self.btn_prepare_uninstall)
+        top_layout.addLayout(remove_row)
+
         layout.addWidget(top_box)
+
+        self.build_stage_label = QLabel("Ready — choose a package or build target.")
+        self.build_stage_label.setStyleSheet("color: #94a3b8; font-size: 12px; font-weight: 600;")
+        layout.addWidget(self.build_stage_label)
+
+        self.build_progress = QProgressBar()
+        self.build_progress.setRange(0, 0)
+        self.build_progress.setTextVisible(False)
+        self.build_progress.setFixedHeight(5)
+        self.build_progress.setStyleSheet("""
+            QProgressBar { background-color: #101c2d; border: none; border-radius: 3px; }
+            QProgressBar::chunk { background-color: #0ea5e9; border-radius: 3px; }
+        """)
+        self.build_progress.hide()
+        layout.addWidget(self.build_progress)
 
         splitter = QSplitter(Qt.Orientation.Vertical)
 
@@ -1565,6 +1741,8 @@ class ArchBridgeWindow(QMainWindow):
         if not target:
             return
 
+        self.set_build_busy(True, "Preparing a verified build plan…")
+
         opts = {}
         if self.opt_name.text().strip(): opts["name"] = self.opt_name.text().strip()
         if self.opt_ver.text().strip(): opts["version"] = self.opt_ver.text().strip()
@@ -1580,45 +1758,209 @@ class ArchBridgeWindow(QMainWindow):
         }
         self.call_rpc("v1.prepare", params, self.on_build_prepare_response)
 
+    def browse_build_package(self):
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Package to Import",
+            "",
+            "Package Files (*.deb *.rpm);;All Files (*)",
+        )
+        if file_path:
+            self.build_target_input.setText(file_path)
+            self.do_prepare_build()
+
+    def set_build_busy(self, busy, message=None):
+        if not hasattr(self, "build_progress"):
+            return
+        if message:
+            self.build_stage_label.setText(message)
+        self.build_progress.setVisible(busy)
+        self.btn_exec_plan.setEnabled(not busy and bool(self.active_plan))
+
     def do_prepare_install(self):
         target = self.build_target_input.text().strip()
         if not target:
             return
+        self.set_build_busy(True, "Preparing the installation plan…")
         self.call_rpc(
             "v1.prepare",
             {"action": "install", "request": {"target": target}},
             self.on_build_prepare_response,
         )
 
+    def do_prepare_uninstall(self):
+        target = self.uninstall_name_input.text().strip()
+        if not target:
+            return
+        self.set_build_busy(True, "Preparing a safe removal plan…")
+        self.call_rpc(
+            "v1.prepare",
+            {"action": "uninstall", "request": {"target": target}},
+            self.on_build_prepare_response,
+        )
+
     def on_build_prepare_response(self, result):
+        self.set_build_busy(False, "Plan ready — review the manifest before continuing.")
         if not result:
             return
         self.active_plan = result
         self.build_plan_view.setText(json.dumps(result, indent=2))
         if result.get("blocked"):
             self.btn_exec_plan.setEnabled(False)
+            self.build_stage_label.setText("Blocked — resolve the issue shown in the plan.")
             QMessageBox.warning(self, "Plan Blocked", f"Plan is blocked: {result['blocked']}")
         else:
             self.btn_exec_plan.setEnabled(True)
+            if result.get("action") == "uninstall":
+                self.btn_exec_plan.setText("Confirm & Remove Package")
+            else:
+                self.btn_exec_plan.setText("Confirm & Execute Plan")
 
     def do_execute_plan(self):
         if not self.active_plan:
             return
         plan_id = self.active_plan.get("plan_id")
-        self.build_log_console.setText("Executing clean chroot build and runtime smoke test...")
+        self.privilege_retry_used = False
+        self.set_build_busy(True, "Working… clean chroot setup and package build may take several minutes.")
+        self.btn_exec_plan.setEnabled(False)
+        if self.active_plan.get("action") == "uninstall":
+            self.build_log_console.setText(
+                "ArchBridge is working.\n\n"
+                "Preparing pacman to remove the selected package…\n\n"
+                "Do not close the window while this is running."
+            )
+        else:
+            self.build_log_console.setText(
+                "ArchBridge is working.\n\n"
+                "1/2  Preparing the isolated clean chroot…\n"
+                "2/2  Building and validating the package…\n\n"
+                "Do not close the window while this is running."
+            )
         self.call_rpc("v1.execute", {"plan_id": plan_id, "confirmed": True}, self.on_execute_response)
+
+    def request_sudo_authorization(self, error_message):
+        """Obtain temporary sudo authorization without retaining the password."""
+        if self.privilege_retry_used:
+            return False
+        if "password is required" not in error_message.lower():
+            return False
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("ArchBridge administrator permission")
+        dialog.setModal(True)
+        dialog.setMinimumWidth(430)
+        dialog.setStyleSheet("""
+            QDialog { background: #0b1220; color: #e2e8f0; }
+            QLabel { color: #cbd5e1; }
+            QLineEdit { background: #101c2d; color: #f8fafc; border: 1px solid #29415f;
+                        border-radius: 8px; padding: 9px; }
+            QLineEdit:focus { border: 1px solid #38bdf8; }
+            QCheckBox { color: #cbd5e1; spacing: 8px; }
+            QDialogButtonBox QPushButton { background: #0ea5e9; color: white; border: none;
+                                           border-radius: 7px; padding: 8px 18px; }
+            QDialogButtonBox QPushButton:hover { background: #38bdf8; }
+        """)
+        dialog_layout = QVBoxLayout(dialog)
+        title = QLabel("Administrator permission required")
+        title.setStyleSheet("font-size: 16px; font-weight: 800; color: #f8fafc;")
+        detail = QLabel(
+            "ArchBridge needs sudo for the isolated clean chroot. "
+            "The password is used once and is never saved or sent to the engine."
+        )
+        detail.setWordWrap(True)
+        password_input = QLineEdit()
+        password_input.setPlaceholderText("Sudo password")
+        password_input.setEchoMode(QLineEdit.EchoMode.Password)
+        show_password = QCheckBox("Show password")
+        show_password.toggled.connect(
+            lambda visible: password_input.setEchoMode(
+                QLineEdit.EchoMode.Normal if visible else QLineEdit.EchoMode.Password
+            )
+        )
+        keep_session = QCheckBox("Keep sudo authorization active for this session")
+        keep_session.setChecked(True)
+        keep_session.setToolTip("Uncheck to revoke sudo authorization after the job finishes.")
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        dialog_layout.addWidget(title)
+        dialog_layout.addWidget(detail)
+        dialog_layout.addSpacing(8)
+        dialog_layout.addWidget(password_input)
+        dialog_layout.addWidget(show_password)
+        dialog_layout.addWidget(keep_session)
+        dialog_layout.addWidget(buttons)
+        password_input.setFocus()
+        accepted = dialog.exec() == QDialog.DialogCode.Accepted
+        password = password_input.text() if accepted else ""
+        keep = keep_session.isChecked()
+        if not accepted or not password:
+            self.set_build_busy(False, "Authorization cancelled.")
+            return True
+
+        self.clear_sudo_after_job = not keep
+        self.build_stage_label.setText("Checking authorization… the window remains responsive.")
+        self.sudo_process = QProcess(self)
+        self.sudo_process.setProcessChannelMode(QProcess.ProcessChannelMode.SeparateChannels)
+        self.sudo_process.finished.connect(self.on_sudo_authorization_finished)
+        self.sudo_process.start("sudo", ["-S", "-v"])
+        if not self.sudo_process.waitForStarted(1000):
+            self.sudo_process = None
+            self.set_build_busy(False, "Could not start sudo.")
+            QMessageBox.critical(self, "Authorization failed", "ArchBridge could not start sudo.")
+            return True
+        self.sudo_process.write((password + "\n").encode())
+        password = ""
+        self.sudo_process.closeWriteChannel()
+        return True
+
+    def on_sudo_authorization_finished(self, exit_code, _exit_status):
+        process = self.sudo_process
+        self.sudo_process = None
+        if not process or exit_code != 0:
+            self.set_build_busy(False, "Authorization failed. Check your sudo password.")
+            QMessageBox.critical(self, "Authorization failed", "Sudo rejected the password. No build was started.")
+            return
+
+        self.privilege_retry_used = True
+        self.build_stage_label.setText("Authorization accepted — refreshing the reviewed plan…")
+        if self.active_plan and self.active_plan.get("action") in ["install", "uninstall"]:
+            QTimer.singleShot(0, self.do_execute_plan)
+        else:
+            QTimer.singleShot(0, self.do_prepare_build)
 
     def on_execute_response(self, result):
         if not result:
+            self.set_build_busy(False, "No response received from the packaging engine.")
             return
+        self.set_build_busy(False)
         self.build_log_console.setText(json.dumps(result, indent=2))
         if result.get("ok"):
-            QMessageBox.information(self, "Execution Success", result.get("message", "Success"))
             if result.get("next_plan"):
                 self.active_plan = result["next_plan"]
                 self.build_plan_view.setText(json.dumps(self.active_plan, indent=2))
                 self.btn_exec_plan.setText("Confirm & Install Built Package")
+                self.btn_exec_plan.setEnabled(True)
+                self.build_stage_label.setText("Build complete — the Arch package is ready to install.")
+                QMessageBox.information(self, "Package Ready", result.get("message", "Package is ready to install."))
+            else:
+                action = self.active_plan.get("action") if self.active_plan else "install"
+                self.build_stage_label.setText(
+                    "Package removal complete." if action == "uninstall" else "Installation complete."
+                )
+                self.btn_exec_plan.setEnabled(False)
+                if self.clear_sudo_after_job:
+                    subprocess.run(["sudo", "-k"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+                    self.clear_sudo_after_job = False
+                QMessageBox.information(
+                    self,
+                    "Package Removed" if action == "uninstall" else "Installation Complete",
+                    result.get("message", "Success"),
+                )
         else:
+            self.build_stage_label.setText("Build failed — see the execution log for details.")
             QMessageBox.critical(self, "Execution Failed", result.get("message", "Failed"))
 
     # --- 6. VIEW 4: DOCTOR ---
@@ -1694,14 +2036,17 @@ class ArchBridgeWindow(QMainWindow):
         if result.get("ready"):
             has_unavailable = any(c.get("status") == "unavailable" for c in checks)
             if has_unavailable:
-                self.doc_status_lbl.setText("Doctor: Ready (Offline)")
-                self.doc_dot.setStyleSheet("color: #f59e0b; font-size: 12px;")
+                self.doc_status_lbl.setText("System ready")
+                self.doc_sub.setText("Offline checks available")
+                self.doc_dot.set_state("#f59e0b")
             else:
-                self.doc_status_lbl.setText("Doctor: Healthy")
-                self.doc_dot.setStyleSheet("color: #10b981; font-size: 12px;")
+                self.doc_status_lbl.setText("System healthy")
+                self.doc_sub.setText("Health checks passing")
+                self.doc_dot.set_state("#10b981")
         else:
-            self.doc_status_lbl.setText("Doctor: Issues Detected")
-            self.doc_dot.setStyleSheet("color: #ef4444; font-size: 12px;")
+            self.doc_status_lbl.setText("System attention")
+            self.doc_sub.setText("Open Health for details")
+            self.doc_dot.set_state("#ef4444")
 
     # --- 7. VIEW 5: SETTINGS ---
     def setup_settings_view(self):
@@ -1839,19 +2184,26 @@ class ArchBridgeWindow(QMainWindow):
         if req_id in self.pending_callbacks:
             cb = self.pending_callbacks.pop(req_id)
             if "error" in data and data["error"]:
-                QMessageBox.critical(self, "RPC Error", f"Error: {data['error'].get('message')}")
+                error_message = data["error"].get("message", "")
+                if self.request_sudo_authorization(error_message):
+                    return
+                self.set_build_busy(False, "The packaging engine reported an error.")
+                QMessageBox.critical(self, "RPC Error", f"Error: {error_message}")
             else:
                 cb(data.get("result"))
 
     def on_rpc_error(self, err_msg):
+        self.set_build_busy(False, "The packaging engine is unavailable.")
         if hasattr(self, 'ipc_title'):
-            self.ipc_title.setText("IPC Engine Error")
-            self.ipc_dot.setStyleSheet("color: #ef4444; font-size: 12px;")
+            self.ipc_title.setText("Engine unavailable")
+            self.ipc_sub.setText("Restart ArchBridge to retry")
+            self.ipc_dot.set_state("#ef4444")
 
     def on_capabilities_response(self, result):
         if result and hasattr(self, 'ipc_title'):
-            self.ipc_title.setText("IPC Connected (v1.0)")
-            self.ipc_dot.setStyleSheet("color: #10b981; font-size: 12px;")
+            self.ipc_title.setText("Engine ready")
+            self.ipc_sub.setText("Local service connected")
+            self.ipc_dot.set_state("#10b981")
 
     def closeEvent(self, event):
         for thread in list(getattr(self, "icon_threads", [])):

@@ -1,5 +1,7 @@
 use crate::archive::{snapshot_directory, snapshot_tarball_bytes, FileReview};
-use crate::build::{execute_chroot_build, run_runtime_smoke_test, SmokeTestReport};
+use crate::build::{
+    execute_chroot_build, run_runtime_smoke_test, snapshot_foreign_package, SmokeTestReport,
+};
 use crate::config::Config;
 use crate::discovery::{search, DecisionReport};
 use crate::inspect::inspect_package;
@@ -50,6 +52,7 @@ pub struct StagedBuild {
     pub source_tarball: Vec<u8>,
     pub entry: String,
     pub smoke_args: Vec<String>,
+    pub run_smoke_test: bool,
     pub artifact_path: Option<PathBuf>,
 }
 
@@ -181,20 +184,78 @@ impl Engine {
         deps: &[String],
         smoke_args: &[String],
     ) -> Result<Plan, String> {
-        let name = name_opt.unwrap_or_else(|| {
+        let inferred_name = name_opt.map(str::to_string).unwrap_or_else(|| {
             if let Some(pos) = target.rfind('/') {
-                &target[pos + 1..]
+                target[pos + 1..].to_string()
             } else {
-                target
+                target.to_string()
             }
         });
+        let name = inferred_name
+            .strip_suffix(".deb")
+            .or_else(|| inferred_name.strip_suffix(".rpm"))
+            .unwrap_or(&inferred_name);
         let entry = entry_opt.unwrap_or(name);
         let version = ver_opt.unwrap_or("1.0.0");
 
         let job_id = format!("job-{}", generate_plan_id("build", target));
         let job_dir = PathBuf::from(".archbridge").join("jobs").join(&job_id);
 
-        let (snapshot, build_sys, pkgbuild) = if target.ends_with("PKGBUILD") {
+        let (snapshot, build_sys, pkgbuild) = if target.ends_with(".deb")
+            || target.ends_with(".rpm")
+        {
+            let snap = snapshot_foreign_package(Path::new(target))?;
+            let source_tar = if snap
+                .tarball_bytes
+                .starts_with(&[0xFD, b'7', b'z', b'X', b'Z', 0x00])
+            {
+                "src.tar.xz".to_string()
+            } else if snap.tarball_bytes.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]) {
+                "src.tar.zst".to_string()
+            } else {
+                "src.tar.gz".to_string()
+            };
+
+            let inspected = inspect_package(target).ok();
+            let effective_name = if let Some(ref rep) = inspected {
+                if rep.package_name != "unknown" && !rep.package_name.is_empty() {
+                    rep.package_name.clone()
+                } else {
+                    name.to_string()
+                }
+            } else {
+                name.to_string()
+            };
+            let effective_ver = if let Some(ref rep) = inspected {
+                if rep.version != "unknown" && !rep.version.is_empty() {
+                    rep.version.clone()
+                } else {
+                    version.to_string()
+                }
+            } else {
+                version.to_string()
+            };
+
+            let final_name = name_opt.unwrap_or(&effective_name);
+            let sanitized_name = final_name.to_lowercase().replace('_', "-");
+            let final_ver = ver_opt.unwrap_or(&effective_ver);
+            let sanitized_ver = final_ver.replace('-', "_");
+
+            let params = PkgbuildParams {
+                name: sanitized_name,
+                version: sanitized_ver,
+                source_tarball: source_tar,
+                sha256_hash: snap.sha256_hash.clone(),
+                dependencies: deps.to_vec(),
+                entry_binary: Some(entry.to_string()),
+            };
+            let pkgb = generate_pkgbuild(&BuildSystem::Imported, &params)?;
+            (snap, BuildSystem::Imported, pkgb)
+        } else if target.ends_with(".db") {
+            return Err(
+                "An Arch .db file is a repository index and contains no package payload to build. Download the corresponding .pkg.tar.* package instead.".to_string(),
+            );
+        } else if target.ends_with("PKGBUILD") {
             let pkgbuild_content = fs::read_to_string(target)
                 .map_err(|e| format!("Failed to read PKGBUILD at '{}': {}", target, e))?;
             let parent_dir = Path::new(target).parent().unwrap_or_else(|| Path::new("."));
@@ -264,7 +325,7 @@ impl Engine {
 
             let bytes = out.stdout.as_bytes();
             let snap = snapshot_tarball_bytes(bytes)?;
-            let bsys = BuildSystem::Cargo; // Default fallback for remote demo
+            let bsys = BuildSystem::Cargo;
             let params = PkgbuildParams {
                 name: name.to_string(),
                 version: version.to_string(),
@@ -284,7 +345,7 @@ impl Engine {
 
         let plan_id = generate_plan_id("build", target);
 
-        let steps = vec![
+        let mut steps = vec![
             Step::new(
                 "sudo",
                 vec![
@@ -317,7 +378,11 @@ impl Engine {
                 "Build package inside clean chroot",
                 600,
             ),
-            Step::new(
+        ];
+
+        let run_smoke_test = !matches!(&build_sys, BuildSystem::Imported) || entry_opt.is_some();
+        if run_smoke_test {
+            steps.push(Step::new(
                 "systemd-nspawn",
                 vec![
                     "--private-users=pick",
@@ -330,8 +395,8 @@ impl Engine {
                 ],
                 "Runtime smoke test inside isolated container",
                 30,
-            ),
-        ];
+            ));
+        }
 
         let filesystem_changes = vec![FilesystemChange {
             path: job_dir.to_string_lossy().to_string(),
@@ -350,14 +415,22 @@ impl Engine {
             steps,
             filesystem_changes,
             reviews: snapshot.reviews,
-            warnings: vec![
-                "Build will execute inside an isolated clean chroot container".to_string(),
-            ],
+            warnings: if run_smoke_test {
+                vec!["Build will execute inside an isolated clean chroot container".to_string()]
+            } else {
+                vec![
+                    "Foreign payload will be repackaged; runtime smoke test requires an explicit entry binary"
+                        .to_string(),
+                ]
+            },
             decision: None,
-            downstream: Some(
+            downstream: Some(if run_smoke_test {
                 "Upon passing runtime smoke test, package will be available for installation"
-                    .to_string(),
-            ),
+                    .to_string()
+            } else {
+                "After payload repackaging, the generated Arch package will be available for installation"
+                    .to_string()
+            }),
             blocked: None,
         };
 
@@ -368,6 +441,7 @@ impl Engine {
             source_tarball: snapshot.tarball_bytes,
             entry: entry.to_string(),
             smoke_args: smoke_args.to_vec(),
+            run_smoke_test,
             artifact_path: None,
         };
 
@@ -378,12 +452,15 @@ impl Engine {
 
     pub fn prepare_install(&mut self, target: &str) -> Result<Plan, String> {
         if target.ends_with(".deb") || target.ends_with(".rpm") {
-            let mut plan = self.prepare_inspect(target)?;
-            plan.blocked = Some("Foreign packages (.deb/.rpm) cannot be installed natively in Phase 1. Use inspect or upstream build.".to_string());
-            return Ok(plan);
+            return self.prepare_build(target, None, None, None, &[], &[]);
+        }
+        if target.ends_with(".db") {
+            return Err(
+                "An Arch .db file is a repository index, not an installable package. Download the matching .pkg.tar.* file.".to_string(),
+            );
         }
 
-        if target.ends_with(".pkg.tar.zst") {
+        if target.contains(".pkg.tar.") {
             let plan_id = generate_plan_id("install", target);
             let steps = vec![Step::new(
                 "sudo",
@@ -444,6 +521,53 @@ impl Engine {
             }
             _ => self.prepare_build(target, None, None, None, &[], &[]),
         }
+    }
+
+    pub fn prepare_uninstall(&mut self, target: &str) -> Result<Plan, String> {
+        let package = target.trim();
+        if package.is_empty()
+            || package == "."
+            || package == ".."
+            || package.len() > 128
+            || !package
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || b"@._+-".contains(&c))
+        {
+            return Err(
+                "Uninstall requires an installed Arch package name, not a path or file."
+                    .to_string(),
+            );
+        }
+
+        let plan_id = generate_plan_id("uninstall", package);
+        let plan = Plan {
+            protocol_version: "v1.0".to_string(),
+            plan_id: plan_id.clone(),
+            action: "uninstall".to_string(),
+            summary: format!("Remove installed package '{}' with pacman", package),
+            steps: vec![Step::new(
+                "sudo",
+                vec!["pacman", "-Rns", "--noconfirm", package],
+                "Remove selected package and unused dependencies",
+                120,
+            )],
+            filesystem_changes: vec![FilesystemChange {
+                path: "/".to_string(),
+                action: "modify".to_string(),
+                description: format!("Remove package '{}' from the live system", package),
+            }],
+            reviews: vec![],
+            warnings: vec![
+                "This changes the live system and may remove dependencies no longer needed."
+                    .to_string(),
+            ],
+            decision: None,
+            downstream: None,
+            blocked: None,
+        };
+        self.pending_plans
+            .insert(plan_id, (plan.clone(), Instant::now(), None));
+        Ok(plan)
     }
 
     pub fn prepare_test(
@@ -559,57 +683,68 @@ impl Engine {
                     let art_path =
                         execute_chroot_build(&job_dir, &staged.pkgbuild, &staged.source_tarball)?;
 
-                    // Run runtime smoke test
-                    let smoke_res: SmokeTestReport =
-                        run_runtime_smoke_test(&art_path, &staged.entry, &staged.smoke_args)?;
-                    if !smoke_res.passed {
-                        return Ok(ExecutionResult {
-                            ok: false,
-                            plan_id: plan_id.to_string(),
-                            message: format!(
-                                "Runtime smoke test failed for entry '{}': {}",
-                                staged.entry, smoke_res.stderr
-                            ),
-                            output: Some(format!(
-                                "Exit code: {}\nStdout: {}\nStderr: {}",
-                                smoke_res.exit_code, smoke_res.stdout, smoke_res.stderr
-                            )),
-                            next_plan: None,
-                        });
+                    if staged.run_smoke_test {
+                        let smoke_res: SmokeTestReport =
+                            run_runtime_smoke_test(&art_path, &staged.entry, &staged.smoke_args)?;
+                        if !smoke_res.passed {
+                            return Ok(ExecutionResult {
+                                ok: false,
+                                plan_id: plan_id.to_string(),
+                                message: format!(
+                                    "Runtime smoke test failed for entry '{}': {}",
+                                    staged.entry, smoke_res.stderr
+                                ),
+                                output: Some(format!(
+                                    "Exit code: {}\nStdout: {}\nStderr: {}",
+                                    smoke_res.exit_code, smoke_res.stdout, smoke_res.stderr
+                                )),
+                                next_plan: None,
+                            });
+                        }
                     }
 
                     // Create next_plan for install
                     let install_plan_id = generate_plan_id("install", &staged.target);
                     let next_plan = Plan {
                         protocol_version: "v1.0".to_string(),
-                        plan_id: install_plan_id,
+                        plan_id: install_plan_id.clone(),
                         action: "install".to_string(),
-                        summary: format!("Install built and tested package '{:?}'", art_path),
+                        summary: format!("Install built package '{:?}'", art_path),
                         steps: vec![Step::new(
                             "sudo",
-                            vec!["pacman", "-U", "--needed", art_path.to_str().unwrap()],
-                            "Install tested package to host",
-                            60,
+                            vec![
+                                "pacman".to_string(),
+                                "-U".to_string(),
+                                "--needed".to_string(),
+                                "--noconfirm".to_string(),
+                                art_path.to_str().unwrap().to_string(),
+                            ],
+                            "Install package to host",
+                            120,
                         )],
                         filesystem_changes: vec![FilesystemChange {
                             path: "/".to_string(),
                             action: "modify".to_string(),
-                            description: format!(
-                                "Install tested package '{:?}' to host system",
-                                art_path
-                            ),
+                            description: format!("Install package '{:?}' to host system", art_path),
                         }],
                         reviews: vec![],
-                        warnings: vec![],
+                        warnings: vec!["Modifies system packages on host".to_string()],
                         decision: None,
                         downstream: None,
                         blocked: None,
                     };
 
+                    self.pending_plans
+                        .insert(install_plan_id, (next_plan.clone(), Instant::now(), None));
+
                     Ok(ExecutionResult {
                         ok: true,
                         plan_id: plan_id.to_string(),
-                        message: format!("Build and smoke test passed for '{:?}'", art_path),
+                        message: if staged.run_smoke_test {
+                            format!("Build and smoke test passed for '{:?}'", art_path)
+                        } else {
+                            format!("Package repackaged successfully at '{:?}'", art_path)
+                        },
                         output: Some(format!("Artifact produced at '{:?}'", art_path)),
                         next_plan: Some(next_plan),
                     })
@@ -617,7 +752,7 @@ impl Engine {
                     Err("Staged build data missing".to_string())
                 }
             }
-            "install" => {
+            "install" | "uninstall" => {
                 let mut last_out = String::new();
                 for step in &plan.steps {
                     let out = run_step(step, None)?;
@@ -638,7 +773,11 @@ impl Engine {
                 Ok(ExecutionResult {
                     ok: true,
                     plan_id: plan_id.to_string(),
-                    message: "Installation completed successfully".to_string(),
+                    message: if plan.action == "uninstall" {
+                        "Package removal completed successfully".to_string()
+                    } else {
+                        "Installation completed successfully".to_string()
+                    },
                     output: Some(last_out),
                     next_plan: None,
                 })
