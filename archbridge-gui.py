@@ -362,7 +362,8 @@ class HeaderIcon(QLabel):
         paths = {
             "engine": '<path d="M7 15h6m2 0h6M8 12.5a2.5 2.5 0 1 0 0 5 2.5 2.5 0 0 0 0-5Zm14 0a2.5 2.5 0 1 0 0 5 2.5 2.5 0 0 0 0-5Z"/>',
             "history": '<path d="M7 9v4h4M8 13a7 7 0 1 0 2-5m5 2v5l4 2"/>',
-            "system": '<path d="m8.5 10 6.5-3 6.5 3-1 7c-.8 3-3.2 5.2-5.5 6.5-2.3-1.3-4.7-3.5-5.5-6.5l-1-7Zm3 5.5 2.5 2.5 4.5-5"/>'
+            "system": '<path d="m8.5 10 6.5-3 6.5 3-1 7c-.8 3-3.2 5.2-5.5 6.5-2.3-1.3-4.7-3.5-5.5-6.5l-1-7Zm3 5.5 2.5 2.5 4.5-5"/>',
+            "sudo": '<path d="M12 4s6-2 8 0v7c0 5-4 8.5-8 10-4-1.5-8-5-8-10V4c2-2 8 0 8 0z"/><circle cx="12" cy="11" r="2"/><path d="M12 13v3"/>',
         }
         svg = f'''<svg width="30" height="30" viewBox="0 0 30 30" xmlns="http://www.w3.org/2000/svg">
           <rect x="0.5" y="0.5" width="29" height="29" rx="8" fill="#0b1b2e" stroke="#23405e"/>
@@ -375,6 +376,72 @@ class HeaderIcon(QLabel):
         renderer.render(painter)
         painter.end()
         self.setPixmap(pixmap)
+
+
+class InstalledPackageWorker(QThread):
+    """Asynchronous background query for installed pacman packages without freezing the UI."""
+    packages_loaded = pyqtSignal(list)
+
+    def __init__(self, query="", filter_mode="explicit", parent=None):
+        super().__init__(parent)
+        self.query = query.strip()
+        self.filter_mode = filter_mode
+
+    def run(self):
+        results = []
+        try:
+            if self.query:
+                # pacman -Qs <query>
+                p = subprocess.run(["pacman", "-Qs", self.query], capture_output=True, text=True, check=False)
+                lines = p.stdout.splitlines()
+                i = 0
+                while i < len(lines):
+                    line = lines[i].strip()
+                    if line.startswith("local/"):
+                        parts = line.split()
+                        full_name = parts[0].replace("local/", "")
+                        version = parts[1] if len(parts) > 1 else ""
+                        desc = ""
+                        if i + 1 < len(lines) and lines[i + 1].startswith("    "):
+                            desc = lines[i + 1].strip()
+                            i += 1
+                        results.append({"name": full_name, "version": version, "desc": desc})
+                    i += 1
+            else:
+                if self.filter_mode == "foreign":
+                    cmd = ["pacman", "-Qm"]
+                    p = subprocess.run(cmd, capture_output=True, text=True, check=False)
+                    for line in p.stdout.splitlines()[:200]:
+                        parts = line.strip().split()
+                        if parts:
+                            results.append({"name": parts[0], "version": parts[1] if len(parts) > 1 else "", "desc": "Local / AUR foreign package"})
+                elif self.filter_mode == "all":
+                    cmd = ["pacman", "-Q"]
+                    p = subprocess.run(cmd, capture_output=True, text=True, check=False)
+                    for line in p.stdout.splitlines()[:200]:
+                        parts = line.strip().split()
+                        if parts:
+                            results.append({"name": parts[0], "version": parts[1] if len(parts) > 1 else "", "desc": ""})
+                else:  # explicit apps
+                    p = subprocess.run(["pacman", "-Qei"], capture_output=True, text=True, check=False)
+                    current = {}
+                    for line in p.stdout.splitlines():
+                        if ":" in line:
+                            k, v = line.split(":", 1)
+                            k, v = k.strip(), v.strip()
+                            if k == "Name":
+                                if current.get("name"):
+                                    results.append(current)
+                                current = {"name": v, "version": "", "desc": ""}
+                            elif k == "Version":
+                                current["version"] = v
+                            elif k == "Description":
+                                current["desc"] = v
+                    if current.get("name"):
+                        results.append(current)
+        except Exception:
+            pass
+        self.packages_loaded.emit(results)
 
 
 class ArchBridgeWindow(QMainWindow):
@@ -390,6 +457,11 @@ class ArchBridgeWindow(QMainWindow):
         self.privilege_retry_used = False
         self.clear_sudo_after_job = False
         self.sudo_process = None
+        self.cached_sudo_password = None
+        self.has_saved_sudo = False
+        self.remember_sudo_in_session = True
+        self.uninstaller_worker = None
+        self.current_built_package = None
 
         self.setWindowTitle("ArchBridge — Software Discovery & Packaging Assistant")
         self.resize(1280, 840)
@@ -536,18 +608,21 @@ class ArchBridgeWindow(QMainWindow):
         self.view_discover = QWidget()
         self.view_inspect = QWidget()
         self.view_build = QWidget()
+        self.view_uninstall = QWidget()
         self.view_doctor = QWidget()
         self.view_settings = QWidget()
 
         self.stack.addWidget(self.view_discover)
         self.stack.addWidget(self.view_inspect)
         self.stack.addWidget(self.view_build)
+        self.stack.addWidget(self.view_uninstall)
         self.stack.addWidget(self.view_doctor)
         self.stack.addWidget(self.view_settings)
 
         self.setup_discover_view()
         self.setup_inspect_view()
         self.setup_build_view()
+        self.setup_uninstall_view()
         self.setup_doctor_view()
         self.setup_settings_view()
 
@@ -589,6 +664,7 @@ class ArchBridgeWindow(QMainWindow):
         self.btn_nav_discover = NavButton("🔍", "Discovery")
         self.btn_nav_inspect = NavButton("📦", "Inspect (.deb / .rpm)")
         self.btn_nav_build = NavButton("🔨", "Build & Install")
+        self.btn_nav_uninstall = NavButton("🗑️", "Uninstall Software")
         self.btn_nav_doctor = NavButton("🤍", "Doctor Health")
         self.btn_nav_settings = NavButton("⚙️", "Settings")
 
@@ -596,6 +672,7 @@ class ArchBridgeWindow(QMainWindow):
             self.btn_nav_discover,
             self.btn_nav_inspect,
             self.btn_nav_build,
+            self.btn_nav_uninstall,
             self.btn_nav_doctor,
             self.btn_nav_settings,
         ]
@@ -620,6 +697,8 @@ class ArchBridgeWindow(QMainWindow):
         self.stack.setCurrentIndex(index)
         for i, btn in enumerate(self.nav_btns):
             btn.set_active(i == index)
+        if index == 3 and hasattr(self, "reload_uninstall_packages"):
+            self.reload_uninstall_packages()
 
     # --- 2. TOP BAR ---
     def setup_top_bar(self, main_layout):
@@ -628,9 +707,7 @@ class ArchBridgeWindow(QMainWindow):
 
         header_surface = QFrame()
         header_surface.setObjectName("headerSurface")
-        header_surface.setMinimumWidth(520)
-        header_surface.setMaximumWidth(720)
-        header_surface.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        header_surface.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
         header_surface.setStyleSheet("""
             QFrame#headerSurface {
                 background-color: rgba(12, 24, 41, 225);
@@ -724,6 +801,14 @@ class ArchBridgeWindow(QMainWindow):
         self.doc_pill, self.doc_status_lbl, self.doc_sub = make_cell("system", "System ready", "Health checks passing")
         self.doc_dot = self.doc_pill.findChild(HeaderIcon)
         header_layout.addWidget(self.doc_pill)
+
+        self.sudo_pill, self.sudo_title, self.sudo_sub = make_cell("sudo", "Sudo Session", "Inactive")
+        self.sudo_dot = self.sudo_pill.findChild(HeaderIcon)
+        self.sudo_dot.set_state("#64748b")
+        self.sudo_pill.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.sudo_pill.mousePressEvent = lambda event: self.prompt_clear_sudo()
+        self.sudo_pill.setToolTip("Click to clear saved sudo password / revoke authorization")
+        header_layout.addWidget(self.sudo_pill)
 
         top_bar.addWidget(header_surface)
         top_bar.addStretch()
@@ -961,7 +1046,9 @@ class ArchBridgeWindow(QMainWindow):
         layout.setSpacing(12)
 
         # App Header (Icon + Name + Badges)
-        app_head = QHBoxLayout()
+        self.app_head_container = QWidget()
+        app_head = QHBoxLayout(self.app_head_container)
+        app_head.setContentsMargins(0, 0, 0, 0)
         self.app_icon_label = QLabel()
         self.app_icon_label.setFixedSize(54, 54)
         self.app_icon_label.setStyleSheet("border-radius: 10px; background-color: #1e293b;")
@@ -987,12 +1074,22 @@ class ArchBridgeWindow(QMainWindow):
         app_name_col.addWidget(self.detail_short_desc)
         app_head.addLayout(app_name_col)
         app_head.addStretch()
-        layout.addLayout(app_head)
+        layout.addWidget(self.app_head_container)
+
+        self.detail_empty_state = QLabel(
+            "✦\n\nNo package selected\n\nChoose a verified result from the source list to inspect its details."
+        )
+        self.detail_empty_state.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.detail_empty_state.setWordWrap(True)
+        self.detail_empty_state.setStyleSheet("color: #64748b; font-size: 13px; padding: 40px 16px;")
+        layout.addWidget(self.detail_empty_state, 1)
 
         layout.addSpacing(4)
 
         # Metadata Table
-        self.meta_grid = QGridLayout()
+        self.meta_grid_container = QWidget()
+        self.meta_grid = QGridLayout(self.meta_grid_container)
+        self.meta_grid.setContentsMargins(0, 0, 0, 0)
         self.meta_grid.setVerticalSpacing(6)
         self.meta_grid.setHorizontalSpacing(10)
 
@@ -1015,7 +1112,7 @@ class ArchBridgeWindow(QMainWindow):
             self.meta_grid.addWidget(v_lbl, row_idx, 1)
             self.meta_val_labels[k] = v_lbl
 
-        layout.addLayout(self.meta_grid)
+        layout.addWidget(self.meta_grid_container)
 
         self.detail_meta_widgets = []
         for row_idx in range(self.meta_grid.rowCount()):
@@ -1023,14 +1120,6 @@ class ArchBridgeWindow(QMainWindow):
                 item = self.meta_grid.itemAtPosition(row_idx, col_idx)
                 if item and item.widget():
                     self.detail_meta_widgets.append(item.widget())
-
-        self.detail_empty_state = QLabel(
-            "✦\n\nNo package selected\n\nChoose a verified result from the source list to inspect its details."
-        )
-        self.detail_empty_state.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.detail_empty_state.setWordWrap(True)
-        self.detail_empty_state.setStyleSheet("color: #64748b; font-size: 12px; padding: 24px;")
-        layout.insertWidget(2, self.detail_empty_state, 1)
 
         layout.addSpacing(6)
 
@@ -1050,7 +1139,9 @@ class ArchBridgeWindow(QMainWindow):
         layout.addSpacing(6)
 
         # Quick Links
-        links_box = QVBoxLayout()
+        self.links_box_container = QWidget()
+        links_box = QVBoxLayout(self.links_box_container)
+        links_box.setContentsMargins(0, 0, 0, 0)
         links_box.setSpacing(6)
 
         self.link_web = QLabel("🌐  Website: —")
@@ -1063,8 +1154,8 @@ class ArchBridgeWindow(QMainWindow):
             links_box.addWidget(l)
 
         self.detail_link_widgets = [self.link_web, self.link_src, self.link_wiki]
+        layout.addWidget(self.links_box_container)
 
-        layout.addLayout(links_box)
         layout.addStretch()
 
         main_h_layout.addWidget(self.detail_card, 35)
@@ -1220,17 +1311,12 @@ class ArchBridgeWindow(QMainWindow):
             return None
 
     def clear_inspector_panel(self):
-        self.app_icon_label.clear()
-        self.detail_name.setText("Ready to inspect")
-        self.detail_source_pill.setText("—")
-        self.detail_source_pill.hide()
-        self.detail_short_desc.setText("Select a verified result to inspect package details.")
-        self.detail_long_desc.setText("")
-        self.detail_empty_state.show()
-        for widget in self.detail_meta_widgets + self.detail_link_widgets:
-            widget.hide()
+        self.app_head_container.hide()
+        self.meta_grid_container.hide()
         self.chips_container.hide()
         self.detail_long_desc.hide()
+        self.links_box_container.hide()
+        self.detail_empty_state.show()
         for label in self.meta_val_labels.values():
             label.setText("—")
         self.update_tag_chips([])
@@ -1240,11 +1326,12 @@ class ArchBridgeWindow(QMainWindow):
 
     def update_inspector_panel(self, meta):
         self.detail_empty_state.hide()
-        self.detail_source_pill.show()
-        for widget in self.detail_meta_widgets + self.detail_link_widgets:
-            widget.show()
+        self.app_head_container.show()
+        self.meta_grid_container.show()
         self.chips_container.show()
         self.detail_long_desc.show()
+        self.links_box_container.show()
+        self.detail_source_pill.show()
         self.detail_name.setText(meta.get("name", self.current_query))
         self.detail_short_desc.setText(meta.get("description", ""))
         self.detail_long_desc.setText(meta.get("description", ""))
@@ -1616,20 +1703,23 @@ class ArchBridgeWindow(QMainWindow):
         layout.addWidget(h1_sub)
 
         top_box = QFrame()
-        top_box.setStyleSheet("background-color: #09121f; border: 1px solid #152438; border-radius: 10px; padding: 12px;")
+        top_box.setObjectName("buildTopBox")
+        top_box.setStyleSheet("QFrame#buildTopBox { background-color: #09121f; border: 1px solid #152438; border-radius: 10px; }")
         top_layout = QVBoxLayout(top_box)
+        top_layout.setContentsMargins(14, 14, 14, 14)
+        top_layout.setSpacing(10)
 
         t_row = QHBoxLayout()
         self.build_target_input = QLineEdit()
         self.build_target_input.setPlaceholderText("Target: .deb/.rpm file, GitHub URL, local directory, PKGBUILD, or package name...")
         self.build_target_input.clear()
 
-        btn_browse_build = QPushButton("Browse Package...")
+        btn_browse_build = QPushButton("📂 Browse Package...")
         btn_browse_build.setToolTip("Choose a local .deb or .rpm package")
         btn_browse_build.clicked.connect(self.browse_build_package)
 
         btn_prep = QPushButton("Prepare Build Plan (Dry-Run)")
-        btn_prep.setStyleSheet("background-color: #0084d1; color: #ffffff; font-weight: bold;")
+        btn_prep.setStyleSheet("background-color: #0084d1; color: #ffffff; font-weight: bold; padding: 10px 18px;")
         btn_prep.clicked.connect(self.do_prepare_build)
 
         t_row.addWidget(self.build_target_input, 1)
@@ -1637,36 +1727,112 @@ class ArchBridgeWindow(QMainWindow):
         t_row.addWidget(btn_prep)
         top_layout.addLayout(t_row)
 
-        opts_row = QHBoxLayout()
-        self.opt_name = QLineEdit(); self.opt_name.setPlaceholderText("--name (optional)")
-        self.opt_ver = QLineEdit(); self.opt_ver.setPlaceholderText("--version (optional)")
-        self.opt_entry = QLineEdit(); self.opt_entry.setPlaceholderText("--entry binary (optional)")
-        self.opt_deps = QLineEdit(); self.opt_deps.setPlaceholderText("--dependency (comma-separated)")
+        self.btn_toggle_adv = QPushButton("▾ Advanced Build Options (optional name, version, entry, dependencies)")
+        self.btn_toggle_adv.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.btn_toggle_adv.setStyleSheet("QPushButton { border: none; background: transparent; color: #0284c7; text-align: left; font-size: 11px; font-weight: 600; padding: 2px 0; } QPushButton:hover { color: #38bdf8; }")
+        self.btn_toggle_adv.clicked.connect(self.toggle_advanced_options)
+        top_layout.addWidget(self.btn_toggle_adv)
 
-        opts_row.addWidget(self.opt_name)
-        opts_row.addWidget(self.opt_ver)
-        opts_row.addWidget(self.opt_entry)
-        opts_row.addWidget(self.opt_deps)
-        top_layout.addLayout(opts_row)
+        self.adv_box = QWidget()
+        adv_layout = QGridLayout(self.adv_box)
+        adv_layout.setContentsMargins(0, 4, 0, 0)
+        adv_layout.setHorizontalSpacing(10)
+        adv_layout.setVerticalSpacing(8)
 
-        remove_row = QHBoxLayout()
-        remove_label = QLabel("Remove installed package")
-        remove_label.setStyleSheet("color: #cbd5e1; font-weight: 700;")
-        self.uninstall_name_input = QLineEdit()
-        self.uninstall_name_input.setPlaceholderText("Package name, e.g. grok-bot")
-        self.btn_prepare_uninstall = QPushButton("Prepare Uninstall Plan")
-        self.btn_prepare_uninstall.setEnabled(False)
-        self.btn_prepare_uninstall.setToolTip("Review a pacman removal plan before anything is changed")
-        self.btn_prepare_uninstall.clicked.connect(self.do_prepare_uninstall)
-        self.uninstall_name_input.textChanged.connect(
-            lambda text: self.btn_prepare_uninstall.setEnabled(bool(text.strip()))
-        )
-        remove_row.addWidget(remove_label)
-        remove_row.addWidget(self.uninstall_name_input, 1)
-        remove_row.addWidget(self.btn_prepare_uninstall)
-        top_layout.addLayout(remove_row)
+        self.opt_name = QLineEdit(); self.opt_name.setPlaceholderText("Package Name override (optional)")
+        self.opt_ver = QLineEdit(); self.opt_ver.setPlaceholderText("Package Version override (optional)")
+        self.opt_entry = QLineEdit(); self.opt_entry.setPlaceholderText("Entry binary name (optional)")
+        self.opt_deps = QLineEdit(); self.opt_deps.setPlaceholderText("Extra dependencies (comma-separated)")
+
+        adv_layout.addWidget(QLabel("Package Name:"), 0, 0)
+        adv_layout.addWidget(self.opt_name, 0, 1)
+        adv_layout.addWidget(QLabel("Version:"), 0, 2)
+        adv_layout.addWidget(self.opt_ver, 0, 3)
+        adv_layout.addWidget(QLabel("Entry Binary:"), 1, 0)
+        adv_layout.addWidget(self.opt_entry, 1, 1)
+        adv_layout.addWidget(QLabel("Dependencies:"), 1, 2)
+        adv_layout.addWidget(self.opt_deps, 1, 3)
+        self.adv_box.hide()
+        top_layout.addWidget(self.adv_box)
 
         layout.addWidget(top_box)
+
+        # Prominent banner: The package has been built. Now install the package.
+        self.build_install_prompt_card = QFrame()
+        self.build_install_prompt_card.setObjectName("buildSuccessCard")
+        self.build_install_prompt_card.setStyleSheet("""
+            QFrame#buildSuccessCard {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #064e3b, stop:1 #022c22);
+                border: 2px solid #10b981;
+                border-radius: 12px;
+                padding: 14px;
+            }
+            QLabel { background: transparent; border: none; }
+        """)
+        b_layout = QVBoxLayout(self.build_install_prompt_card)
+        b_layout.setSpacing(8)
+
+        b_top_row = QHBoxLayout()
+        b_icon = QLabel("🎉")
+        b_icon.setStyleSheet("font-size: 24px;")
+        b_top_row.addWidget(b_icon)
+
+        b_title_col = QVBoxLayout()
+        b_title = QLabel("The package has been built. Now install the package.")
+        b_title.setStyleSheet("font-size: 15px; font-weight: 800; color: #ffffff;")
+        self.build_artifact_label = QLabel("The native Arch package (.pkg.tar.zst) is ready on disk.")
+        self.build_artifact_label.setStyleSheet("font-size: 12px; color: #a7f3d0;")
+        b_title_col.addWidget(b_title)
+        b_title_col.addWidget(self.build_artifact_label)
+        b_top_row.addLayout(b_title_col, 1)
+
+        b_btn_dismiss = QPushButton("✕")
+        b_btn_dismiss.setFixedSize(24, 24)
+        b_btn_dismiss.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        b_btn_dismiss.setStyleSheet("border: none; background: transparent; color: #6ee7b7; font-size: 14px;")
+        b_btn_dismiss.clicked.connect(lambda: self.build_install_prompt_card.hide())
+        b_top_row.addWidget(b_btn_dismiss)
+        b_layout.addLayout(b_top_row)
+
+        b_action_row = QHBoxLayout()
+        self.btn_prompt_install = QPushButton("🚀 Install Package Now (pacman -U)")
+        self.btn_prompt_install.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.btn_prompt_install.setStyleSheet("""
+            QPushButton {
+                background-color: #10b981;
+                border: 1px solid #34d399;
+                color: #ffffff;
+                font-weight: 800;
+                font-size: 13px;
+                border-radius: 8px;
+                padding: 10px 22px;
+            }
+            QPushButton:hover { background-color: #059669; }
+        """)
+        self.btn_prompt_install.clicked.connect(self.do_execute_plan)
+        b_action_row.addWidget(self.btn_prompt_install)
+
+        self.btn_prompt_folder = QPushButton("📁 Open Containing Folder")
+        self.btn_prompt_folder.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.btn_prompt_folder.setStyleSheet("""
+            QPushButton {
+                background-color: #111e30;
+                border: 1px solid #23354d;
+                color: #cbd5e1;
+                font-weight: 600;
+                font-size: 12px;
+                border-radius: 8px;
+                padding: 10px 16px;
+            }
+            QPushButton:hover { background-color: #1a2c42; color: #ffffff; }
+        """)
+        self.btn_prompt_folder.clicked.connect(self.open_artifact_folder)
+        b_action_row.addWidget(self.btn_prompt_folder)
+        b_action_row.addStretch()
+        b_layout.addLayout(b_action_row)
+
+        layout.addWidget(self.build_install_prompt_card)
+        self.build_install_prompt_card.hide()
 
         self.build_stage_label = QLabel("Ready — choose a package or build target.")
         self.build_stage_label.setStyleSheet("color: #94a3b8; font-size: 12px; font-weight: 600;")
@@ -1686,6 +1852,7 @@ class ArchBridgeWindow(QMainWindow):
         splitter = QSplitter(Qt.Orientation.Vertical)
 
         plan_container = QWidget()
+        plan_container.setMinimumHeight(140)
         plan_layout = QVBoxLayout(plan_container)
         plan_layout.setContentsMargins(0, 0, 0, 0)
         plan_lbl = QLabel("Prepared Plan & Review Manifest")
@@ -1699,6 +1866,7 @@ class ArchBridgeWindow(QMainWindow):
         splitter.addWidget(plan_container)
 
         exec_container = QWidget()
+        exec_container.setMinimumHeight(140)
         exec_layout = QVBoxLayout(exec_container)
         exec_layout.setContentsMargins(0, 8, 0, 0)
 
@@ -1707,19 +1875,21 @@ class ArchBridgeWindow(QMainWindow):
         self.btn_exec_plan.setEnabled(False)
         self.btn_exec_plan.setStyleSheet("""
             QPushButton {
-                background-color: #059669;
+                background-color: #0084d1;
                 color: #ffffff;
                 font-weight: 700;
-                border: none;
+                border: 1px solid #38bdf8;
                 border-radius: 8px;
-                padding: 10px 20px;
+                padding: 10px 22px;
+                font-size: 13px;
             }
             QPushButton:hover {
-                background-color: #10b981;
+                background-color: #0284c7;
             }
             QPushButton:disabled {
-                background-color: #13241e;
-                color: #3b5247;
+                background-color: #111d2e;
+                color: #4b627f;
+                border: 1px solid #1c2e44;
             }
         """)
         self.btn_exec_plan.clicked.connect(self.do_execute_plan)
@@ -1838,81 +2008,164 @@ class ArchBridgeWindow(QMainWindow):
             )
         self.call_rpc("v1.execute", {"plan_id": plan_id, "confirmed": True}, self.on_execute_response)
 
+    def toggle_advanced_options(self):
+        visible = not self.adv_box.isVisible()
+        self.adv_box.setVisible(visible)
+        self.btn_toggle_adv.setText(
+            "▴ Hide Advanced Build Options" if visible else "▾ Advanced Build Options (optional name, version, entry, dependencies)"
+        )
+
+    def open_artifact_folder(self):
+        pkg = getattr(self, "current_built_package", None)
+        if pkg and os.path.exists(pkg):
+            folder = os.path.dirname(os.path.abspath(pkg))
+            subprocess.Popen(["xdg-open", folder])
+        elif os.path.exists(os.path.expanduser("~/Downloads")):
+            subprocess.Popen(["xdg-open", os.path.expanduser("~/Downloads")])
+
+    def clear_saved_sudo_credentials(self):
+        subprocess.run(["sudo", "-k"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+        self.cached_sudo_password = None
+        self.has_saved_sudo = False
+        self.update_sudo_ui_status()
+        QMessageBox.information(
+            self,
+            "Password & Sudo Cleared",
+            "Saved password in memory has been erased and kernel sudo timestamps have been revoked (sudo -k).\n\nYou will be prompted for your password on the next administrative operation.",
+        )
+
+    def prompt_clear_sudo(self):
+        if self.has_saved_sudo or self.cached_sudo_password:
+            reply = QMessageBox.question(
+                self,
+                "Clear Saved Sudo Authorization",
+                "Sudo authorization is currently active.\n\nWould you like to clear the saved password and revoke sudo timestamps?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                self.clear_saved_sudo_credentials()
+        else:
+            QMessageBox.information(
+                self,
+                "Sudo Session Inactive",
+                "No active sudo authorization or saved password. You will be prompted when root privileges are required.",
+            )
+
+    def update_sudo_ui_status(self):
+        is_active = self.has_saved_sudo or (self.cached_sudo_password is not None)
+        if is_active:
+            self.sudo_title.setText("Sudo Active")
+            self.sudo_sub.setText("Click to revoke")
+            self.sudo_dot.set_state("#10b981")
+            if hasattr(self, "sudo_status_label"):
+                self.sudo_status_label.setText("● Sudo Session: Active (cached in memory)")
+                self.sudo_status_label.setStyleSheet("color: #10b981; font-weight: bold; font-size: 12px;")
+        else:
+            self.sudo_title.setText("Sudo Inactive")
+            self.sudo_sub.setText("No saved password")
+            self.sudo_dot.set_state("#64748b")
+            if hasattr(self, "sudo_status_label"):
+                self.sudo_status_label.setText("○ Sudo Session: Inactive / Revoked")
+                self.sudo_status_label.setStyleSheet("color: #64748b; font-weight: bold; font-size: 12px;")
+
     def request_sudo_authorization(self, error_message):
-        """Obtain temporary sudo authorization without retaining the password."""
+        """Obtain temporary sudo authorization or use memory-cached credentials."""
         if self.privilege_retry_used:
             return False
-        if "password is required" not in error_message.lower():
-            return False
+
+        # If user has a cached password in memory, try it directly
+        if self.cached_sudo_password:
+            p = subprocess.Popen(["sudo", "-S", "-v"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            _, _ = p.communicate((self.cached_sudo_password + "\n").encode())
+            if p.returncode == 0:
+                self.has_saved_sudo = True
+                self.update_sudo_ui_status()
+                self.privilege_retry_used = True
+                if self.active_plan and self.active_plan.get("action") in ["install", "uninstall"]:
+                    QTimer.singleShot(0, self.do_execute_plan)
+                else:
+                    QTimer.singleShot(0, self.do_prepare_build)
+                return True
+            else:
+                self.cached_sudo_password = None
+                self.has_saved_sudo = False
+                self.update_sudo_ui_status()
 
         dialog = QDialog(self)
-        dialog.setWindowTitle("ArchBridge administrator permission")
+        dialog.setWindowTitle("ArchBridge Administrator Permission")
         dialog.setModal(True)
-        dialog.setMinimumWidth(430)
+        dialog.setMinimumWidth(440)
         dialog.setStyleSheet("""
             QDialog { background: #0b1220; color: #e2e8f0; }
             QLabel { color: #cbd5e1; }
             QLineEdit { background: #101c2d; color: #f8fafc; border: 1px solid #29415f;
-                        border-radius: 8px; padding: 9px; }
+                        border-radius: 8px; padding: 10px; font-size: 13px; }
             QLineEdit:focus { border: 1px solid #38bdf8; }
-            QCheckBox { color: #cbd5e1; spacing: 8px; }
+            QCheckBox { color: #cbd5e1; spacing: 8px; font-size: 12px; }
             QDialogButtonBox QPushButton { background: #0ea5e9; color: white; border: none;
-                                           border-radius: 7px; padding: 8px 18px; }
+                                           border-radius: 7px; padding: 8px 20px; font-weight: bold; }
             QDialogButtonBox QPushButton:hover { background: #38bdf8; }
         """)
         dialog_layout = QVBoxLayout(dialog)
-        title = QLabel("Administrator permission required")
+        title = QLabel("Administrator Permission Required")
         title.setStyleSheet("font-size: 16px; font-weight: 800; color: #f8fafc;")
         detail = QLabel(
-            "ArchBridge needs sudo for the isolated clean chroot. "
-            "The password is used once and is never saved or sent to the engine."
+            "ArchBridge requires administrator privileges to execute this system operation.\n\n"
+            "You can clear saved credentials anytime in Settings or via the top header bar."
         )
         detail.setWordWrap(True)
         password_input = QLineEdit()
-        password_input.setPlaceholderText("Sudo password")
+        password_input.setPlaceholderText("Enter your sudo password...")
         password_input.setEchoMode(QLineEdit.EchoMode.Password)
+
         show_password = QCheckBox("Show password")
         show_password.toggled.connect(
             lambda visible: password_input.setEchoMode(
                 QLineEdit.EchoMode.Normal if visible else QLineEdit.EchoMode.Password
             )
         )
-        keep_session = QCheckBox("Keep sudo authorization active for this session")
-        keep_session.setChecked(True)
-        keep_session.setToolTip("Uncheck to revoke sudo authorization after the job finishes.")
+        keep_session = QCheckBox("Remember password in memory for this session (never written to disk)")
+        keep_session.setChecked(self.remember_sudo_in_session)
+
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
         buttons.accepted.connect(dialog.accept)
         buttons.rejected.connect(dialog.reject)
+
         dialog_layout.addWidget(title)
         dialog_layout.addWidget(detail)
-        dialog_layout.addSpacing(8)
+        dialog_layout.addSpacing(6)
         dialog_layout.addWidget(password_input)
         dialog_layout.addWidget(show_password)
         dialog_layout.addWidget(keep_session)
+        dialog_layout.addSpacing(6)
         dialog_layout.addWidget(buttons)
+
         password_input.setFocus()
         accepted = dialog.exec() == QDialog.DialogCode.Accepted
         password = password_input.text() if accepted else ""
-        keep = keep_session.isChecked()
+
         if not accepted or not password:
             self.set_build_busy(False, "Authorization cancelled.")
             return True
 
-        self.clear_sudo_after_job = not keep
-        self.build_stage_label.setText("Checking authorization… the window remains responsive.")
+        if keep_session.isChecked():
+            self.cached_sudo_password = password
+            self.remember_sudo_in_session = True
+
+        self.build_stage_label.setText("Checking authorization…")
         self.sudo_process = QProcess(self)
         self.sudo_process.setProcessChannelMode(QProcess.ProcessChannelMode.SeparateChannels)
         self.sudo_process.finished.connect(self.on_sudo_authorization_finished)
         self.sudo_process.start("sudo", ["-S", "-v"])
-        if not self.sudo_process.waitForStarted(1000):
+        if not self.sudo_process.waitForStarted(1500):
             self.sudo_process = None
             self.set_build_busy(False, "Could not start sudo.")
             QMessageBox.critical(self, "Authorization failed", "ArchBridge could not start sudo.")
             return True
         self.sudo_process.write((password + "\n").encode())
-        password = ""
         self.sudo_process.closeWriteChannel()
         return True
 
@@ -1920,12 +2173,17 @@ class ArchBridgeWindow(QMainWindow):
         process = self.sudo_process
         self.sudo_process = None
         if not process or exit_code != 0:
+            self.cached_sudo_password = None
+            self.has_saved_sudo = False
+            self.update_sudo_ui_status()
             self.set_build_busy(False, "Authorization failed. Check your sudo password.")
-            QMessageBox.critical(self, "Authorization failed", "Sudo rejected the password. No build was started.")
+            QMessageBox.critical(self, "Authorization failed", "Sudo rejected the password. Please re-enter your password.")
             return
 
+        self.has_saved_sudo = True
+        self.update_sudo_ui_status()
         self.privilege_retry_used = True
-        self.build_stage_label.setText("Authorization accepted — refreshing the reviewed plan…")
+        self.build_stage_label.setText("Authorization accepted — continuing operation…")
         if self.active_plan and self.active_plan.get("action") in ["install", "uninstall"]:
             QTimer.singleShot(0, self.do_execute_plan)
         else:
@@ -1941,27 +2199,281 @@ class ArchBridgeWindow(QMainWindow):
             if result.get("next_plan"):
                 self.active_plan = result["next_plan"]
                 self.build_plan_view.setText(json.dumps(self.active_plan, indent=2))
-                self.btn_exec_plan.setText("Confirm & Install Built Package")
+                self.btn_exec_plan.setText("🚀 Confirm & Install Built Package")
+                self.btn_exec_plan.setStyleSheet("""
+                    QPushButton {
+                        background-color: #10b981;
+                        color: #ffffff;
+                        font-weight: 800;
+                        border: 1px solid #34d399;
+                        border-radius: 8px;
+                        padding: 10px 22px;
+                        font-size: 13px;
+                    }
+                    QPushButton:hover { background-color: #059669; }
+                """)
                 self.btn_exec_plan.setEnabled(True)
                 self.build_stage_label.setText("Build complete — the Arch package is ready to install.")
-                QMessageBox.information(self, "Package Ready", result.get("message", "Package is ready to install."))
+
+                # Extract package file from steps or output
+                pkg_path = ""
+                for step in self.active_plan.get("steps", []):
+                    args = step.get("command", [])
+                    for a in args:
+                        if ".pkg.tar" in a:
+                            pkg_path = a
+                            break
+                if not pkg_path and result.get("output"):
+                    m = re.search(r"(/[\S]+\.pkg\.tar\.\S+)", result["output"])
+                    if m:
+                        pkg_path = m.group(1).rstrip("'\"")
+
+                self.current_built_package = pkg_path
+                pkg_size_str = ""
+                if pkg_path and os.path.exists(pkg_path):
+                    sz = os.path.getsize(pkg_path) / (1024 * 1024)
+                    pkg_size_str = f" ({sz:.1f} MiB)"
+
+                self.build_artifact_label.setText(
+                    f"Package ready: {os.path.basename(pkg_path)}{pkg_size_str} at {pkg_path}"
+                    if pkg_path else "The native Arch package (.pkg.tar.zst) is ready on disk."
+                )
+                self.build_install_prompt_card.show()
+
+                # Interactive confirmation prompt
+                box = QMessageBox(self)
+                box.setWindowTitle("Package Ready for Installation")
+                box.setText(
+                    f"<h3 style='color:#10b981; margin:0;'>The package has been built. Now install the package.</h3><br>"
+                    f"Artifact generated: <code>{os.path.basename(pkg_path) if pkg_path else 'Package'}</code>{pkg_size_str}<br><br>"
+                    f"Would you like to install the package onto your system now using <code>pacman -U</code>?"
+                )
+                btn_install_now = box.addButton("Install Package Now", QMessageBox.ButtonRole.AcceptRole)
+                btn_later = box.addButton("Install Later / Keep File", QMessageBox.ButtonRole.RejectRole)
+                box.setDefaultButton(btn_install_now)
+                box.exec()
+
+                if box.clickedButton() == btn_install_now:
+                    self.do_execute_plan()
             else:
                 action = self.active_plan.get("action") if self.active_plan else "install"
                 self.build_stage_label.setText(
                     "Package removal complete." if action == "uninstall" else "Installation complete."
                 )
                 self.btn_exec_plan.setEnabled(False)
+                self.build_install_prompt_card.hide()
                 if self.clear_sudo_after_job:
                     subprocess.run(["sudo", "-k"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
                     self.clear_sudo_after_job = False
+                    self.cached_sudo_password = None
+                    self.has_saved_sudo = False
+                    self.update_sudo_ui_status()
                 QMessageBox.information(
                     self,
                     "Package Removed" if action == "uninstall" else "Installation Complete",
                     result.get("message", "Success"),
                 )
+                if hasattr(self, "reload_uninstall_packages"):
+                    self.reload_uninstall_packages()
         else:
             self.build_stage_label.setText("Build failed — see the execution log for details.")
             QMessageBox.critical(self, "Execution Failed", result.get("message", "Failed"))
+
+    # --- 6. VIEW 4: UNINSTALL SOFTWARE ---
+    def setup_uninstall_view(self):
+        layout = QVBoxLayout(self.view_uninstall)
+        layout.setContentsMargins(0, 8, 0, 0)
+        layout.setSpacing(14)
+
+        top = QHBoxLayout()
+        title_col = QVBoxLayout()
+        h1 = QLabel("Uninstall Installed Software")
+        h1.setStyleSheet("font-size: 22px; font-weight: 800; color: #f8fafc;")
+        h1_sub = QLabel("Type any software name to automatically find and uninstall packages tracked by pacman.")
+        h1_sub.setStyleSheet("font-size: 12px; color: #64748b;")
+        title_col.addWidget(h1)
+        title_col.addWidget(h1_sub)
+        top.addLayout(title_col)
+        top.addStretch()
+
+        btn_refresh = QPushButton("🔄 Refresh List")
+        btn_refresh.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        btn_refresh.setStyleSheet("background-color: #102039; border: 1px solid #29415f; color: #cbd5e1; border-radius: 8px; padding: 8px 16px; font-weight: 600;")
+        btn_refresh.clicked.connect(self.reload_uninstall_packages)
+        top.addWidget(btn_refresh)
+        layout.addLayout(top)
+
+        # Search Bar Box
+        search_box = QFrame()
+        search_box.setStyleSheet("background-color: #09121f; border: 1px solid #152438; border-radius: 10px; padding: 10px 14px;")
+        s_layout = QHBoxLayout(search_box)
+        s_layout.setSpacing(10)
+
+        s_icon = QLabel("🔍")
+        s_icon.setStyleSheet("font-size: 14px; color: #64748b; background: transparent;")
+        s_layout.addWidget(s_icon)
+
+        self.uninstall_search_input = QLineEdit()
+        self.uninstall_search_input.setPlaceholderText("Type software name to find and uninstall (e.g. grok-bot, vlc, discord, steam)...")
+        self.uninstall_search_input.setStyleSheet("border: none; background: transparent; padding: 6px 0px; font-size: 13px; color: #ffffff;")
+        self.uninstall_search_input.textChanged.connect(self.on_uninstall_search_text_changed)
+        s_layout.addWidget(self.uninstall_search_input, 1)
+
+        btn_clear = QPushButton("✕")
+        btn_clear.setFixedSize(22, 22)
+        btn_clear.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        btn_clear.setStyleSheet("border: none; background: transparent; color: #64748b; font-size: 12px;")
+        btn_clear.clicked.connect(lambda: self.uninstall_search_input.clear())
+        s_layout.addWidget(btn_clear)
+
+        self.uninstall_filter_combo = QComboBox()
+        self.uninstall_filter_combo.addItems(["Explicitly Installed Apps", "All Installed Packages", "Foreign / AUR Packages"])
+        self.uninstall_filter_combo.setFixedWidth(200)
+        self.uninstall_filter_combo.currentIndexChanged.connect(self.reload_uninstall_packages)
+        s_layout.addWidget(self.uninstall_filter_combo)
+
+        layout.addWidget(search_box)
+
+        # Status Label
+        self.uninstall_status_lbl = QLabel("Showing installed software...")
+        self.uninstall_status_lbl.setStyleSheet("color: #94a3b8; font-size: 12px;")
+        layout.addWidget(self.uninstall_status_lbl)
+
+        # Packages Table
+        self.uninstall_table = QTableWidget()
+        self.uninstall_table.setColumnCount(4)
+        self.uninstall_table.setHorizontalHeaderLabels(["Software Name", "Installed Version", "Description", "Action"])
+        self.uninstall_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        self.uninstall_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self.uninstall_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.uninstall_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
+        self.uninstall_table.setColumnWidth(3, 140)
+        self.uninstall_table.verticalHeader().setVisible(False)
+        self.uninstall_table.setStyleSheet("""
+            QTableWidget {
+                background-color: #080f19;
+                border: 1px solid #132032;
+                border-radius: 8px;
+                gridline-color: #0f1a2a;
+            }
+            QTableWidget::item {
+                padding: 6px 10px;
+                border-bottom: 1px solid #0e1826;
+            }
+            QHeaderView::section {
+                background-color: #0c1524;
+                color: #94a3b8;
+                padding: 10px;
+                border: none;
+                font-weight: 700;
+                font-size: 11px;
+            }
+        """)
+        layout.addWidget(self.uninstall_table, 1)
+
+        # Live search debounce timer
+        self.uninstall_search_timer = QTimer(self)
+        self.uninstall_search_timer.setSingleShot(True)
+        self.uninstall_search_timer.setInterval(200)
+        self.uninstall_search_timer.timeout.connect(self.reload_uninstall_packages)
+
+    def on_uninstall_search_text_changed(self, text):
+        self.uninstall_search_timer.start()
+
+    def reload_uninstall_packages(self):
+        query = self.uninstall_search_input.text().strip() if hasattr(self, "uninstall_search_input") else ""
+        mode_idx = self.uninstall_filter_combo.currentIndex() if hasattr(self, "uninstall_filter_combo") else 0
+        mode = "explicit" if mode_idx == 0 else ("all" if mode_idx == 1 else "foreign")
+
+        if hasattr(self, "uninstall_status_lbl"):
+            self.uninstall_status_lbl.setText("Searching installed packages…" if query else "Loading installed packages…")
+
+        if self.uninstaller_worker and self.uninstaller_worker.isRunning():
+            self.uninstaller_worker.terminate()
+            self.uninstaller_worker.wait(500)
+
+        self.uninstaller_worker = InstalledPackageWorker(query, mode, self)
+        self.uninstaller_worker.packages_loaded.connect(self.on_uninstall_packages_loaded)
+        self.uninstaller_worker.start()
+
+    def on_uninstall_packages_loaded(self, results):
+        self.uninstall_table.setRowCount(len(results))
+        count = len(results)
+        self.uninstall_status_lbl.setText(f"Found {count} installed package{'s' if count != 1 else ''}.")
+
+        for row, item in enumerate(results):
+            name = item.get("name", "")
+            ver = item.get("version", "")
+            desc = item.get("desc", "")
+
+            name_item = QTableWidgetItem(name)
+            name_item.setFont(QFont("Inter", 11, QFont.Weight.Bold))
+            name_item.setForeground(QColor("#f8fafc"))
+
+            ver_item = QTableWidgetItem(ver)
+            ver_item.setForeground(QColor("#94a3b8"))
+
+            desc_item = QTableWidgetItem(desc)
+            desc_item.setForeground(QColor("#cbd5e1"))
+
+            btn_uninstall = QPushButton("🗑️ Uninstall")
+            btn_uninstall.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+            btn_uninstall.setStyleSheet("""
+                QPushButton {
+                    background-color: #271418;
+                    border: 1px solid #7f1d1d;
+                    color: #f87171;
+                    font-weight: 700;
+                    border-radius: 6px;
+                    padding: 4px 10px;
+                }
+                QPushButton:hover {
+                    background-color: #dc2626;
+                    color: #ffffff;
+                }
+            """)
+            btn_uninstall.clicked.connect(lambda _, n=name, v=ver: self.confirm_and_uninstall_package(n, v))
+
+            cell_widget = QWidget()
+            cell_layout = QHBoxLayout(cell_widget)
+            cell_layout.setContentsMargins(4, 2, 4, 2)
+            cell_layout.addWidget(btn_uninstall)
+
+            self.uninstall_table.setItem(row, 0, name_item)
+            self.uninstall_table.setItem(row, 1, ver_item)
+            self.uninstall_table.setItem(row, 2, desc_item)
+            self.uninstall_table.setCellWidget(row, 3, cell_widget)
+
+    def confirm_and_uninstall_package(self, pkg_name, version):
+        reply = QMessageBox.question(
+            self,
+            "Confirm Package Uninstallation",
+            f"<h3 style='color:#f87171; margin:0;'>Uninstall Software: {pkg_name}</h3><br>"
+            f"Are you sure you want to remove <b>{pkg_name}</b> (version <code>{version}</code>)?<br><br>"
+            f"ArchBridge will safely prepare and execute the uninstallation via <code>pacman -R</code>.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            self.execute_package_uninstallation(pkg_name)
+
+    def execute_package_uninstallation(self, pkg_name):
+        self.uninstall_status_lbl.setText(f"Preparing removal plan for '{pkg_name}'…")
+        self.call_rpc(
+            "v1.prepare",
+            {"action": "uninstall", "request": {"target": pkg_name}},
+            self.on_uninstall_prepare_response,
+        )
+
+    def on_uninstall_prepare_response(self, result):
+        if not result or result.get("blocked"):
+            msg = result.get("blocked", "Plan is blocked") if result else "Failed to prepare plan."
+            QMessageBox.warning(self, "Removal Blocked", msg)
+            self.uninstall_status_lbl.setText(f"Removal blocked: {msg}")
+            return
+        self.active_plan = result
+        self.uninstall_status_lbl.setText(f"Uninstalling '{result.get('target', '')}'…")
+        self.do_execute_plan()
 
     # --- 6. VIEW 4: DOCTOR ---
     def setup_doctor_view(self):
@@ -2061,9 +2573,85 @@ class ArchBridgeWindow(QMainWindow):
         layout.addWidget(h1)
         layout.addWidget(h1_sub)
 
+        # Security & Sudo Authorization Card
+        sec_card = QFrame()
+        sec_card.setObjectName("secCard")
+        sec_card.setStyleSheet("QFrame#secCard { background-color: #080f19; border: 1px solid #132032; border-radius: 10px; }")
+        sec_layout = QVBoxLayout(sec_card)
+        sec_layout.setContentsMargins(16, 16, 16, 16)
+        sec_layout.setSpacing(12)
+
+        sec_title = QLabel("🛡️ Security & Sudo Authorization")
+        sec_title.setStyleSheet("font-size: 15px; font-weight: 700; color: #f8fafc; background: transparent; border: none;")
+        sec_sub = QLabel("Manage administrator permissions and cached sudo credentials used for installing or uninstalling software.")
+        sec_sub.setStyleSheet("font-size: 11px; color: #64748b; background: transparent; border: none;")
+        sec_layout.addWidget(sec_title)
+        sec_layout.addWidget(sec_sub)
+
+        sec_row = QHBoxLayout()
+        self.sudo_status_label = QLabel("○ Sudo Session: Inactive / Revoked")
+        self.sudo_status_label.setStyleSheet("color: #64748b; font-weight: bold; font-size: 12px; background: transparent; border: none;")
+        sec_row.addWidget(self.sudo_status_label)
+        sec_row.addStretch()
+
+        self.btn_clear_sudo = QPushButton("🗑️ Clear Saved Password / Invalidate Sudo")
+        self.btn_clear_sudo.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.btn_clear_sudo.setStyleSheet("""
+            QPushButton {
+                background-color: #1a1523;
+                border: 1px solid #dc2626;
+                color: #f87171;
+                font-weight: 700;
+                padding: 8px 16px;
+                border-radius: 8px;
+            }
+            QPushButton:hover {
+                background-color: #dc2626;
+                color: #ffffff;
+            }
+        """)
+        self.btn_clear_sudo.clicked.connect(self.clear_saved_sudo_credentials)
+        sec_row.addWidget(self.btn_clear_sudo)
+        sec_layout.addLayout(sec_row)
+
+        cb_style = """
+            QCheckBox {
+                font-size: 13px;
+                color: #e2e8f0;
+                spacing: 10px;
+                background: transparent;
+                border: none;
+                padding: 4px 0px;
+            }
+            QCheckBox::indicator {
+                width: 18px;
+                height: 18px;
+                border-radius: 4px;
+                border: 1px solid #29415f;
+                background-color: #0c1829;
+            }
+            QCheckBox::indicator:hover {
+                border-color: #0084d1;
+            }
+            QCheckBox::indicator:checked {
+                background-color: #0084d1;
+                border: 1px solid #38bdf8;
+            }
+        """
+
+        self.cb_save_sudo = QCheckBox("Remember sudo password in memory during this app session (never saved to disk)")
+        self.cb_save_sudo.setChecked(self.remember_sudo_in_session)
+        self.cb_save_sudo.setStyleSheet(cb_style)
+        self.cb_save_sudo.toggled.connect(lambda val: setattr(self, "remember_sudo_in_session", val))
+        sec_layout.addWidget(self.cb_save_sudo)
+
+        layout.addWidget(sec_card)
+
         group = QFrame()
-        group.setStyleSheet("background-color: #080f19; border: 1px solid #132032; border-radius: 10px; padding: 16px;")
+        group.setObjectName("sourcesGroup")
+        group.setStyleSheet("QFrame#sourcesGroup { background-color: #080f19; border: 1px solid #132032; border-radius: 10px; }")
         g_layout = QVBoxLayout(group)
+        g_layout.setContentsMargins(16, 16, 16, 16)
         g_layout.setSpacing(12)
 
         self.cfg_checks = {}
@@ -2080,7 +2668,7 @@ class ArchBridgeWindow(QMainWindow):
         for s_key, s_label in sources:
             cb = QCheckBox(s_label)
             cb.setChecked(True)
-            cb.setStyleSheet("QCheckBox { font-size: 13px; color: #e2e8f0; } QCheckBox::indicator { width: 18px; height: 18px; }")
+            cb.setStyleSheet(cb_style)
             self.cfg_checks[s_key] = cb
             g_layout.addWidget(cb)
 
@@ -2092,6 +2680,7 @@ class ArchBridgeWindow(QMainWindow):
         layout.addWidget(group)
         layout.addStretch()
 
+        self.update_sudo_ui_status()
         self.load_config()
 
     def load_config(self):
