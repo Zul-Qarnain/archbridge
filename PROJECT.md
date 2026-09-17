@@ -32,18 +32,20 @@ Rust library: discovery / config / inspection / recipe / planner / execution
 ```
 
 The CLI starts the same executable in `serve` mode and keeps it alive for the
-session. The PyQt6 GUI uses the same transport, not a second packaging engine.
+session. The native GPUI desktop application (`archbridge gui`) interacts directly with
+the engine, eliminating Python/PyQt6 runtime requirements.
 The library is available as the `archbridge` crate.
 
 ### Stack choices
 
 - Rust 2021 with a small synchronous core; minimum supported toolchain remains unverified.
+- GPUI (Zed Editor's framework) provides GPU-accelerated, native rendering for the desktop GUI.
 - Serde/serde_json for configuration, reports and IPC.
 - SHA-256 hashes bind source/review/artifact bytes to prepared plans.
 - `tar`, `flate2`, `toml`, and `tempfile` for bounded parsing/staging.
 - Explicit argument vectors for child processes; no user-built host shell command.
 - System `curl` handles HTTPS, timeouts, redirects and certificate verification.
-- Python is presentation-only. The Rust library remains the packaging engine;
+- The Rust engine and GPUI frontend form a self-contained native binary.
   Python source-contract checks and the Bash acceptance harness are development
   tooling, not alternate packaging engines.
 

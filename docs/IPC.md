@@ -50,7 +50,7 @@ The response's `result` is a plan containing:
 - `reviews`: path, SHA-256, byte count, executable flag, UTF-8 text if available;
 - `warnings`, optional discovery `decision`, `downstream`, and optional `blocked`.
 
-Display the entire plan/reviews. A dry-run stops here. The PyQt6 GUI and CLI both
+Display the entire plan/reviews. A dry-run stops here. The GPUI desktop GUI and CLI both
 use this same contract. After explicit approval:
 
 ```json
@@ -82,5 +82,5 @@ in the initial plan. `sudo`, `curl`, package managers and nspawn never inherit t
 RPC stdin. They cannot consume the next request as an interactive answer.
 
 The CLI always prints plans, including with `--yes`. An integrating GUI must do
-the equivalent. There is no D-Bus interface. The graphical frontend is PyQt6 and
-remains a client of this JSON-RPC boundary.
+the equivalent. There is no D-Bus interface. The graphical frontend is native GPUI and
+interacts with this verified core.

@@ -3,8 +3,8 @@
 ## Repository layout
 
 ```text
-src/                 Rust library, CLI, RPC, discovery, planning, and safety code
-archbridge-gui.py    PyQt6 desktop frontend
+src/                 Rust library, CLI, GPUI frontend, RPC, discovery, planning, and safety code
+src/gui/             Native GPUI desktop application (Zed's GPU-rendered engine)
 tests/               Rust integration tests, Python contracts, acceptance harness
 docs/                Public architecture, security, IPC, validation, and release docs
 .github/             CI and contribution templates
@@ -17,7 +17,7 @@ docs/                Public architecture, security, IPC, validation, and release
 - `src/inspect.rs`: data-only DEB/RPM inspection.
 - `src/build.rs`: clean-chroot build and isolated runtime testing.
 - `src/rpc.rs`: versioned frontend boundary.
-- `archbridge-gui.py`: presentation and user interaction only.
+- `src/gui/`: native GPUI presentation, interactive panels, GPU rendering, and reactive view state.
 
 Do not duplicate packaging logic in the UI.
 
