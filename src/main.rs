@@ -12,7 +12,7 @@ fn main() {
     }
 
     let command = args[1].as_str();
-    if command == "gui" || command == "--gui" {
+    if command == "gui" || command == "--gui" || command == "ui" || command == "--ui" {
         let script = std::path::Path::new("archbridge-gui.py");
         let script_path = if script.exists() {
             script.to_path_buf()

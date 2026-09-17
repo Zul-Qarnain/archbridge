@@ -464,7 +464,7 @@ impl Engine {
             let plan_id = generate_plan_id("install", target);
             let steps = vec![Step::new(
                 "sudo",
-                vec!["pacman", "-U", "--needed", target],
+                vec!["-n", "pacman", "-U", "--noconfirm", target],
                 "Install prebuilt native package",
                 60,
             )];
@@ -498,7 +498,7 @@ impl Engine {
                 let plan_id = generate_plan_id("install", target);
                 let steps = vec![Step::new(
                     "sudo",
-                    vec!["pacman", "-S", "--needed", "--noconfirm", target],
+                    vec!["-n", "pacman", "-S", "--needed", "--noconfirm", target],
                     "Install official Arch package",
                     60,
                 )];
@@ -547,7 +547,7 @@ impl Engine {
             summary: format!("Remove installed package '{}' with pacman", package),
             steps: vec![Step::new(
                 "sudo",
-                vec!["pacman", "-Rns", "--noconfirm", package],
+                vec!["-n", "pacman", "-Rns", "--noconfirm", package],
                 "Remove selected package and unused dependencies",
                 120,
             )],
@@ -713,9 +713,9 @@ impl Engine {
                         steps: vec![Step::new(
                             "sudo",
                             vec![
+                                "-n".to_string(),
                                 "pacman".to_string(),
                                 "-U".to_string(),
-                                "--needed".to_string(),
                                 "--noconfirm".to_string(),
                                 art_path.to_str().unwrap().to_string(),
                             ],

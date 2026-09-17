@@ -166,7 +166,22 @@ sha256sums=('{sha256}')\n\n\
 package() {{\n\
   {extract_cmd}\n\
   mkdir -p \"$pkgdir/usr/bin\"\n\
-  if [ ! -f \"$pkgdir/usr/bin/{pkgname}\" ] && [ ! -L \"$pkgdir/usr/bin/{pkgname}\" ]; then\n\
+  if [ -d \"$pkgdir/usr/share/applications\" ]; then\n\
+    for df in \"$pkgdir\"/usr/share/applications/*.desktop; do\n\
+      [ -f \"$df\" ] || continue\n\
+      exec_bin=$(grep -E \"^Exec=\" \"$df\" | head -n1 | cut -d= -f2- | awk '{{print $1}}')\n\
+      exec_bin=$(basename \"$exec_bin\")\n\
+      if [ -n \"$exec_bin\" ] && [ ! -e \"$pkgdir/usr/bin/$exec_bin\" ]; then\n\
+        for cand in \"$pkgdir/opt\"/*\"$exec_bin\" \"$pkgdir/opt\"/*/*\"$exec_bin\"; do\n\
+          if [ -f \"$cand\" ] && [ -x \"$cand\" ]; then\n\
+            ln -s \"${{cand#$pkgdir}}\" \"$pkgdir/usr/bin/$exec_bin\"\n\
+            break\n\
+          fi\n\
+        done\n\
+      fi\n\
+    done\n\
+  fi\n\
+  if [ ! -e \"$pkgdir/usr/bin/{pkgname}\" ]; then\n\
     for candidate in \"$pkgdir\"/opt/*/{pkgname} \"$pkgdir\"/opt/*/*; do\n\
       if [ -f \"$candidate\" ] && [ -x \"$candidate\" ]; then\n\
         target_rel=\"${{candidate#$pkgdir}}\"\n\

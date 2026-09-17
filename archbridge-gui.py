@@ -1996,6 +1996,33 @@ class ArchBridgeWindow(QMainWindow):
         if not self.active_plan:
             return
         plan_id = self.active_plan.get("plan_id")
+        action = self.active_plan.get("action")
+
+        if action in ["install", "uninstall"]:
+            is_authed = False
+            if self.cached_sudo_password:
+                p = subprocess.Popen(["sudo", "-S", "-v"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                _, _ = p.communicate((self.cached_sudo_password + "\n").encode())
+                if p.returncode == 0:
+                    is_authed = True
+                    self.has_saved_sudo = True
+                    self.update_sudo_ui_status()
+                else:
+                    self.cached_sudo_password = None
+                    self.has_saved_sudo = False
+                    self.update_sudo_ui_status()
+
+            if not is_authed:
+                chk = subprocess.run(["sudo", "-n", "true"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                if chk.returncode == 0:
+                    is_authed = True
+                    self.has_saved_sudo = True
+                    self.update_sudo_ui_status()
+
+            if not is_authed:
+                self.request_sudo_authorization(f"Administrator permission required to {action} package.")
+                return
+
         self.privilege_retry_used = False
         self.set_build_busy(True, "Working… clean chroot setup and package build may take several minutes.")
         self.btn_exec_plan.setEnabled(False)
@@ -2101,7 +2128,7 @@ class ArchBridgeWindow(QMainWindow):
         dialog = QDialog(self)
         dialog.setWindowTitle("ArchBridge Administrator Permission")
         dialog.setModal(True)
-        dialog.setMinimumWidth(440)
+        dialog.setMinimumWidth(460)
         dialog.setStyleSheet("""
             QDialog { background: #0b1220; color: #e2e8f0; }
             QLabel { color: #cbd5e1; }
@@ -2118,9 +2145,59 @@ class ArchBridgeWindow(QMainWindow):
         title.setStyleSheet("font-size: 16px; font-weight: 800; color: #f8fafc;")
         detail = QLabel(
             "ArchBridge requires administrator privileges to execute this system operation.\n\n"
-            "You can clear saved credentials anytime in Settings or via the top header bar."
+            "You can authenticate via your fingerprint reader or enter your sudo password below."
         )
         detail.setWordWrap(True)
+        dialog_layout.addWidget(title)
+        dialog_layout.addWidget(detail)
+        dialog_layout.addSpacing(6)
+
+        # Check for fingerprint module
+        has_fprint = False
+        try:
+            if os.path.exists("/etc/pam.d/sudo"):
+                with open("/etc/pam.d/sudo", "r") as f:
+                    if "pam_fprintd" in f.read():
+                        has_fprint = True
+        except Exception:
+            pass
+
+        fprint_proc = None
+        fprint_box = None
+        if has_fprint:
+            fprint_box = QFrame()
+            fprint_box.setStyleSheet("background: #0d1929; border: 1px solid #1e3a5f; border-radius: 8px; padding: 10px;")
+            fprint_layout = QHBoxLayout(fprint_box)
+            fprint_label = QLabel("🖐 Fingerprint Reader: Listening... Place finger on sensor now")
+            fprint_label.setStyleSheet("color: #38bdf8; font-weight: 600; font-size: 12px; background: transparent;")
+            fprint_layout.addWidget(fprint_label)
+            fprint_layout.addStretch()
+
+            dialog_layout.addWidget(fprint_box)
+            dialog_layout.addSpacing(6)
+
+            fprint_proc = QProcess(dialog)
+            fprint_proc.setProcessChannelMode(QProcess.ProcessChannelMode.SeparateChannels)
+
+            def on_fprint_finished(exit_code, _):
+                if exit_code == 0:
+                    fprint_label.setText("✓ Fingerprint verified successfully!")
+                    fprint_label.setStyleSheet("color: #10b981; font-weight: bold; font-size: 12px; background: transparent;")
+                    self.has_saved_sudo = True
+                    self.update_sudo_ui_status()
+                    self.privilege_retry_used = True
+                    dialog.accept()
+                    if self.active_plan and self.active_plan.get("action") in ["install", "uninstall"]:
+                        QTimer.singleShot(0, self.do_execute_plan)
+                    else:
+                        QTimer.singleShot(0, self.do_prepare_build)
+                else:
+                    fprint_label.setText("Fingerprint scan inactive. Please enter password below.")
+                    fprint_label.setStyleSheet("color: #94a3b8; font-size: 11px; background: transparent;")
+
+            fprint_proc.finished.connect(on_fprint_finished)
+            fprint_proc.start("sudo", ["-v"])
+
         password_input = QLineEdit()
         password_input.setPlaceholderText("Enter your sudo password...")
         password_input.setEchoMode(QLineEdit.EchoMode.Password)
@@ -2140,9 +2217,6 @@ class ArchBridgeWindow(QMainWindow):
         buttons.accepted.connect(dialog.accept)
         buttons.rejected.connect(dialog.reject)
 
-        dialog_layout.addWidget(title)
-        dialog_layout.addWidget(detail)
-        dialog_layout.addSpacing(6)
         dialog_layout.addWidget(password_input)
         dialog_layout.addWidget(show_password)
         dialog_layout.addWidget(keep_session)
@@ -2151,6 +2225,15 @@ class ArchBridgeWindow(QMainWindow):
 
         password_input.setFocus()
         accepted = dialog.exec() == QDialog.DialogCode.Accepted
+
+        if fprint_proc and fprint_proc.state() == QProcess.ProcessState.Running:
+            fprint_proc.kill()
+            fprint_proc.waitForFinished(500)
+
+        # If already validated via fingerprint during dialog.exec()
+        if self.has_saved_sudo and not password_input.text():
+            return True
+
         password = password_input.text() if accepted else ""
 
         if not accepted or not password:
@@ -2282,8 +2365,13 @@ class ArchBridgeWindow(QMainWindow):
                 if hasattr(self, "reload_uninstall_packages"):
                     self.reload_uninstall_packages()
         else:
-            self.build_stage_label.setText("Build failed — see the execution log for details.")
-            QMessageBox.critical(self, "Execution Failed", result.get("message", "Failed"))
+            msg = result.get("message", "Failed")
+            out = result.get("output", "")
+            if ("sudo" in msg.lower() or "password" in (out or "").lower() or "code 1" in msg) and not self.privilege_retry_used:
+                if self.request_sudo_authorization(msg):
+                    return
+            self.build_stage_label.setText("Execution failed — see the log for details.")
+            QMessageBox.critical(self, "Execution Failed", msg)
 
     # --- 6. VIEW 4: UNINSTALL SOFTWARE ---
     def setup_uninstall_view(self):
