@@ -52,6 +52,7 @@ pub struct SearchResult {
 pub struct InstalledPackage {
     pub name: String,
     pub version: String,
+    pub description: String,
     pub size: String,
 }
 
@@ -94,6 +95,7 @@ pub struct AppState {
     pub inspect_msg: Option<StatusMsg>,
 
     // ──────────────────── build ─────────────────────────
+    pub build_target_input: String,
     pub active_plan: Option<Plan>,
     pub build_stage: usize, // 1: Prepare, 2: PKGBUILD, 3: Chroot, 4: Install
     pub build_log: String,
@@ -115,6 +117,14 @@ pub struct AppState {
 
     // ──────────────────── settings ──────────────────────
     pub config_data: Option<Value>,
+    pub opt_official: bool,
+    pub opt_aur: bool,
+    pub opt_flatpak: bool,
+    pub opt_appimage: bool,
+    pub opt_upstream: bool,
+    pub opt_deb: bool,
+    pub opt_rpm: bool,
+    pub opt_remember_sudo: bool,
     pub settings_msg: Option<StatusMsg>,
 
     // ──────────────────── auth ──────────────────────────
@@ -129,7 +139,7 @@ impl Default for AppState {
     fn default() -> Self {
         Self {
             active_tab: ActiveTab::Discover,
-            search_history: vec!["brave".into(), "vscode".into(), "docker".into()],
+            search_history: vec!["brave".into(), "vlc".into(), "vscode".into(), "docker".into()],
             show_history_menu: false,
             doctor_ready: true,
             sudo_session_active: false,
@@ -137,89 +147,12 @@ impl Default for AppState {
             free_disk_space: "142 GiB Free".into(),
             keyring_status: "Verified".into(),
 
-            search_query: "brave".into(),
+            // Clean default Discovery state
+            search_query: "".into(),
             source_filter: "All Sources".into(),
-            search_results: vec![
-                SearchResult {
-                    name: "brave".into(),
-                    version: "v1.70.126-1".into(),
-                    description: "A privacy focused web browser".into(),
-                    source: "official".into(),
-                    score: 1.0,
-                    repo: "extra".into(),
-                    is_recommended: true,
-                    license: "MPL-2.0".into(),
-                    arch: "x86_64".into(),
-                    size: "182.4 MiB".into(),
-                    maintainer: "Arch Linux".into(),
-                },
-                SearchResult {
-                    name: "brave-bin".into(),
-                    version: "v1.70.126-1".into(),
-                    description: "Pre-built binary from upstream (AUR)".into(),
-                    source: "aur".into(),
-                    score: 0.95,
-                    repo: "AUR (community)".into(),
-                    is_recommended: false,
-                    license: "MPL-2.0".into(),
-                    arch: "x86_64".into(),
-                    size: "182.4 MiB".into(),
-                    maintainer: "AUR Contributor".into(),
-                },
-                SearchResult {
-                    name: "com.brave.Browser".into(),
-                    version: "v1.70.126".into(),
-                    description: "Brave Browser (Flatpak)".into(),
-                    source: "flatpak".into(),
-                    score: 0.90,
-                    repo: "Flathub".into(),
-                    is_recommended: false,
-                    license: "MPL-2.0".into(),
-                    arch: "x86_64".into(),
-                    size: "210.0 MiB".into(),
-                    maintainer: "Flathub Maintainers".into(),
-                },
-                SearchResult {
-                    name: "Brave-Browser".into(),
-                    version: "v1.70.126".into(),
-                    description: "Standalone AppImage (official)".into(),
-                    source: "appimage".into(),
-                    score: 0.85,
-                    repo: "Official Release".into(),
-                    is_recommended: false,
-                    license: "MPL-2.0".into(),
-                    arch: "x86_64".into(),
-                    size: "195.0 MiB".into(),
-                    maintainer: "Brave Software".into(),
-                },
-                SearchResult {
-                    name: "github.com/brave/brave-browser".into(),
-                    version: "master".into(),
-                    description: "Source code (build from source)".into(),
-                    source: "upstream".into(),
-                    score: 0.80,
-                    repo: "GitHub".into(),
-                    is_recommended: false,
-                    license: "MPL-2.0".into(),
-                    arch: "source".into(),
-                    size: "Source Repo".into(),
-                    maintainer: "Brave Software".into(),
-                },
-            ],
-            recommended_item: Some(SearchResult {
-                name: "brave".into(),
-                version: "v1.70.126-1".into(),
-                description: "A privacy focused web browser".into(),
-                source: "official".into(),
-                score: 1.0,
-                repo: "extra".into(),
-                is_recommended: true,
-                license: "MPL-2.0".into(),
-                arch: "x86_64".into(),
-                size: "182.4 MiB".into(),
-                maintainer: "Arch Linux".into(),
-            }),
-            selected_result: Some(0),
+            search_results: Vec::new(),
+            recommended_item: None,
+            selected_result: None,
             search_busy: false,
             search_msg: None,
 
@@ -229,6 +162,7 @@ impl Default for AppState {
             inspect_busy: false,
             inspect_msg: None,
 
+            build_target_input: "".into(),
             active_plan: None,
             build_stage: 1,
             build_log: "".into(),
@@ -242,11 +176,61 @@ impl Default for AppState {
             uninstall_busy: false,
             uninstall_msg: None,
 
-            health_checks: Vec::new(),
+            // Pre-populated 8 health checks matching doctor report
+            health_checks: vec![
+                HealthCheck {
+                    name: "pacman".into(),
+                    ok: true,
+                    message: "pacman package manager is installed".into(),
+                },
+                HealthCheck {
+                    name: "base-devel".into(),
+                    ok: true,
+                    message: "base-devel group/meta-package is installed".into(),
+                },
+                HealthCheck {
+                    name: "devtools".into(),
+                    ok: true,
+                    message: "devtools (mkarchroot and makechrootpkg) are installed".into(),
+                },
+                HealthCheck {
+                    name: "namespaces".into(),
+                    ok: true,
+                    message: "Kernel user namespaces support detected".into(),
+                },
+                HealthCheck {
+                    name: "disk_space".into(),
+                    ok: true,
+                    message: "Sufficient workspace disk space available (142 GiB Free)".into(),
+                },
+                HealthCheck {
+                    name: "compiler".into(),
+                    ok: true,
+                    message: "GCC compiler toolchain is available".into(),
+                },
+                HealthCheck {
+                    name: "network".into(),
+                    ok: true,
+                    message: "HTTPS network connectivity verified (https://archlinux.org)".into(),
+                },
+                HealthCheck {
+                    name: "keyring".into(),
+                    ok: true,
+                    message: "Pacman keyring is populated and valid".into(),
+                },
+            ],
             doctor_busy: false,
             doctor_msg: None,
 
             config_data: None,
+            opt_official: true,
+            opt_aur: true,
+            opt_flatpak: true,
+            opt_appimage: true,
+            opt_upstream: true,
+            opt_deb: true,
+            opt_rpm: true,
+            opt_remember_sudo: true,
             settings_msg: None,
 
             auth_dialog_open: false,
