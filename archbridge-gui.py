@@ -31,6 +31,7 @@ from PyQt6.QtGui import (
 )
 from PyQt6.QtSvg import QSvgRenderer
 from PyQt6.QtWidgets import (
+    QAbstractItemView,
     QApplication,
     QCheckBox,
     QComboBox,
@@ -300,6 +301,15 @@ class MountainArtwork(QWidget):
         painter.drawText(QRect(0, h - 18, w, 18), Qt.AlignmentFlag.AlignRight, "Arch Linux · Powered by You")
 
 
+def get_check_icon_path():
+    p = Path("/tmp/archbridge_check.svg")
+    if not p.exists():
+        p.write_text(
+            '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#ffffff" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>'
+        )
+    return str(p)
+
+
 class NavButton(QPushButton):
     def __init__(self, icon_str, text, parent=None):
         super().__init__(parent)
@@ -322,7 +332,7 @@ class NavButton(QPushButton):
                     color: #38bdf8;
                     border: 1px solid #1b3252;
                     border-radius: 8px;
-                    padding-left: 16px;
+                    padding-left: 14px;
                     text-align: left;
                     font-size: 13px;
                     font-weight: 700;
@@ -335,6 +345,8 @@ class NavButton(QPushButton):
                     color: #8492a6;
                     border: 1px solid transparent;
                     border-radius: 8px;
+                    padding-left: 14px;
+                    text-align: left;
                     font-size: 13px;
                     font-weight: 500;
                 }
@@ -1130,12 +1142,6 @@ class ArchBridgeWindow(QMainWindow):
         self.chips_layout.setSpacing(6)
         layout.addWidget(self.chips_container)
 
-        # Detailed Description
-        self.detail_long_desc = QLabel("")
-        self.detail_long_desc.setWordWrap(True)
-        self.detail_long_desc.setStyleSheet("color: #94a3b8; font-size: 11px; line-height: 1.4; padding-top: 4px;")
-        layout.addWidget(self.detail_long_desc)
-
         layout.addSpacing(6)
 
         # Quick Links
@@ -1314,7 +1320,6 @@ class ArchBridgeWindow(QMainWindow):
         self.app_head_container.hide()
         self.meta_grid_container.hide()
         self.chips_container.hide()
-        self.detail_long_desc.hide()
         self.links_box_container.hide()
         self.detail_empty_state.show()
         for label in self.meta_val_labels.values():
@@ -1329,12 +1334,10 @@ class ArchBridgeWindow(QMainWindow):
         self.app_head_container.show()
         self.meta_grid_container.show()
         self.chips_container.show()
-        self.detail_long_desc.show()
         self.links_box_container.show()
         self.detail_source_pill.show()
         self.detail_name.setText(meta.get("name", self.current_query))
         self.detail_short_desc.setText(meta.get("description", ""))
-        self.detail_long_desc.setText(meta.get("description", ""))
 
         self.meta_val_labels["Version"].setText(meta.get("version", ""))
         self.meta_val_labels["Repository"].setText(meta.get("repository", ""))
@@ -1575,11 +1578,6 @@ class ArchBridgeWindow(QMainWindow):
         )
         layout.addWidget(btn_action)
 
-        btn_more = QPushButton("···")
-        btn_more.setFixedWidth(24)
-        btn_more.setStyleSheet("QPushButton { background-color: transparent; border: none; color: #475569; font-size: 16px; font-weight: bold; } QPushButton:hover { color: #f8fafc; }")
-        layout.addWidget(btn_more)
-
         card.mousePressEvent = lambda ev, c_name=cand_name, r_name=row["source"], u=project_url: self.on_card_selected(c_name, r_name, u)
         return card
 
@@ -1633,7 +1631,7 @@ class ArchBridgeWindow(QMainWindow):
         btn_inspect.setStyleSheet("background-color: #0084d1; color: #ffffff; font-weight: bold;")
         btn_inspect.clicked.connect(self.do_inspect)
 
-        btn_import = QPushButton("Import & Build")
+        btn_import = QPushButton("Import and Build")
         btn_import.setStyleSheet("background-color: #059669; color: #ffffff; font-weight: bold;")
         btn_import.setToolTip("Convert the package payload into an Arch package, then offer installation")
         btn_import.clicked.connect(self.do_import_build)
@@ -1697,7 +1695,7 @@ class ArchBridgeWindow(QMainWindow):
 
         h1 = QLabel("Build & Clean Chroot Studio")
         h1.setStyleSheet("font-size: 22px; font-weight: 800; color: #f8fafc;")
-        h1_sub = QLabel("Build packages inside an isolated clean chroot container with automated runtime smoke testing.")
+        h1_sub = QLabel("Build packages inside an isolated clean chroot environment with automated runtime smoke testing.")
         h1_sub.setStyleSheet("font-size: 12px; color: #64748b;")
         layout.addWidget(h1)
         layout.addWidget(h1_sub)
@@ -1850,6 +1848,14 @@ class ArchBridgeWindow(QMainWindow):
         layout.addWidget(self.build_progress)
 
         splitter = QSplitter(Qt.Orientation.Vertical)
+        splitter.setStyleSheet("""
+            QSplitter::handle:vertical {
+                height: 4px;
+                background-color: #0c1524;
+                border-top: 1px solid #142236;
+                border-bottom: 1px solid #142236;
+            }
+        """)
 
         plan_container = QWidget()
         plan_container.setMinimumHeight(140)
@@ -1871,7 +1877,7 @@ class ArchBridgeWindow(QMainWindow):
         exec_layout.setContentsMargins(0, 8, 0, 0)
 
         ctrl_bar = QHBoxLayout()
-        self.btn_exec_plan = QPushButton("Confirm & Execute Plan (Clean Chroot)")
+        self.btn_exec_plan = QPushButton("Confirm and Execute Plan (Clean Chroot)")
         self.btn_exec_plan.setEnabled(False)
         self.btn_exec_plan.setStyleSheet("""
             QPushButton {
@@ -2347,23 +2353,26 @@ class ArchBridgeWindow(QMainWindow):
         self.uninstall_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         self.uninstall_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
         self.uninstall_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
-        self.uninstall_table.setColumnWidth(3, 140)
+        self.uninstall_table.setColumnWidth(3, 120)
         self.uninstall_table.verticalHeader().setVisible(False)
+        self.uninstall_table.verticalHeader().setDefaultSectionSize(48)
+        self.uninstall_table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self.uninstall_table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.uninstall_table.setShowGrid(False)
         self.uninstall_table.setStyleSheet("""
             QTableWidget {
                 background-color: #080f19;
                 border: 1px solid #132032;
                 border-radius: 8px;
-                gridline-color: #0f1a2a;
             }
             QTableWidget::item {
-                padding: 6px 10px;
+                padding: 4px 12px;
                 border-bottom: 1px solid #0e1826;
             }
             QHeaderView::section {
                 background-color: #0c1524;
                 color: #94a3b8;
-                padding: 10px;
+                padding: 10px 12px;
                 border: none;
                 font-weight: 700;
                 font-size: 11px;
@@ -2402,6 +2411,7 @@ class ArchBridgeWindow(QMainWindow):
         self.uninstall_status_lbl.setText(f"Found {count} installed package{'s' if count != 1 else ''}.")
 
         for row, item in enumerate(results):
+            self.uninstall_table.setRowHeight(row, 48)
             name = item.get("name", "")
             ver = item.get("version", "")
             desc = item.get("desc", "")
@@ -2409,34 +2419,45 @@ class ArchBridgeWindow(QMainWindow):
             name_item = QTableWidgetItem(name)
             name_item.setFont(QFont("Inter", 11, QFont.Weight.Bold))
             name_item.setForeground(QColor("#f8fafc"))
+            name_item.setTextAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
 
             ver_item = QTableWidgetItem(ver)
             ver_item.setForeground(QColor("#94a3b8"))
+            ver_item.setTextAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
 
             desc_item = QTableWidgetItem(desc)
             desc_item.setForeground(QColor("#cbd5e1"))
+            desc_item.setTextAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
 
-            btn_uninstall = QPushButton("🗑️ Uninstall")
+            btn_uninstall = QPushButton("Uninstall")
             btn_uninstall.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+            btn_uninstall.setFixedSize(96, 30)
             btn_uninstall.setStyleSheet("""
                 QPushButton {
-                    background-color: #271418;
-                    border: 1px solid #7f1d1d;
+                    background-color: #2b1115;
+                    border: 1px solid #991b1b;
                     color: #f87171;
                     font-weight: 700;
+                    font-size: 11px;
                     border-radius: 6px;
-                    padding: 4px 10px;
+                    padding: 0px;
                 }
                 QPushButton:hover {
                     background-color: #dc2626;
+                    border-color: #ef4444;
                     color: #ffffff;
+                }
+                QPushButton:pressed {
+                    background-color: #7f1d1d;
                 }
             """)
             btn_uninstall.clicked.connect(lambda _, n=name, v=ver: self.confirm_and_uninstall_package(n, v))
 
             cell_widget = QWidget()
+            cell_widget.setStyleSheet("background: transparent; border: none;")
             cell_layout = QHBoxLayout(cell_widget)
-            cell_layout.setContentsMargins(4, 2, 4, 2)
+            cell_layout.setContentsMargins(0, 0, 0, 0)
+            cell_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
             cell_layout.addWidget(btn_uninstall)
 
             self.uninstall_table.setItem(row, 0, name_item)
@@ -2502,19 +2523,31 @@ class ArchBridgeWindow(QMainWindow):
         self.doc_table = QTableWidget()
         self.doc_table.setColumnCount(3)
         self.doc_table.setHorizontalHeaderLabels(["Check Name", "Status", "Diagnostic Details"])
+        self.doc_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        self.doc_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         self.doc_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.doc_table.verticalHeader().setVisible(False)
+        self.doc_table.verticalHeader().setDefaultSectionSize(40)
+        self.doc_table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self.doc_table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.doc_table.setShowGrid(False)
         self.doc_table.setStyleSheet("""
             QTableWidget {
                 background-color: #080f19;
                 border: 1px solid #132032;
                 border-radius: 8px;
             }
+            QTableWidget::item {
+                padding: 6px 12px;
+                border-bottom: 1px solid #0e1826;
+            }
             QHeaderView::section {
                 background-color: #0c1524;
                 color: #94a3b8;
-                padding: 8px;
+                padding: 10px 12px;
                 border: none;
                 font-weight: 700;
+                font-size: 11px;
             }
         """)
         layout.addWidget(self.doc_table, 1)
@@ -2529,9 +2562,16 @@ class ArchBridgeWindow(QMainWindow):
         self.doc_table.setRowCount(len(checks))
 
         for row, c in enumerate(checks):
+            self.doc_table.setRowHeight(row, 40)
             name_item = QTableWidgetItem(c.get("name", ""))
+            name_item.setFont(QFont("Inter", 11, QFont.Weight.Bold))
+            name_item.setForeground(QColor("#f8fafc"))
+            name_item.setTextAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
+
             status = c.get("status", "")
             status_item = QTableWidgetItem("● " + status.upper())
+            status_item.setFont(QFont("Inter", 10, QFont.Weight.Bold))
+            status_item.setTextAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
             if status == "pass":
                 status_item.setForeground(QColor("#10b981"))
             elif status == "unavailable":
@@ -2540,6 +2580,8 @@ class ArchBridgeWindow(QMainWindow):
                 status_item.setForeground(QColor("#ef4444"))
 
             msg_item = QTableWidgetItem(c.get("message", ""))
+            msg_item.setForeground(QColor("#cbd5e1"))
+            msg_item.setTextAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
 
             self.doc_table.setItem(row, 0, name_item)
             self.doc_table.setItem(row, 1, status_item)
@@ -2594,7 +2636,7 @@ class ArchBridgeWindow(QMainWindow):
         sec_row.addWidget(self.sudo_status_label)
         sec_row.addStretch()
 
-        self.btn_clear_sudo = QPushButton("🗑️ Clear Saved Password / Invalidate Sudo")
+        self.btn_clear_sudo = QPushButton("🔒 Invalidate Sudo / Clear Password")
         self.btn_clear_sudo.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
         self.btn_clear_sudo.setStyleSheet("""
             QPushButton {
@@ -2614,29 +2656,31 @@ class ArchBridgeWindow(QMainWindow):
         sec_row.addWidget(self.btn_clear_sudo)
         sec_layout.addLayout(sec_row)
 
-        cb_style = """
-            QCheckBox {
+        check_svg = get_check_icon_path()
+        cb_style = f"""
+            QCheckBox {{
                 font-size: 13px;
                 color: #e2e8f0;
                 spacing: 10px;
                 background: transparent;
                 border: none;
                 padding: 4px 0px;
-            }
-            QCheckBox::indicator {
+            }}
+            QCheckBox::indicator {{
                 width: 18px;
                 height: 18px;
                 border-radius: 4px;
                 border: 1px solid #29415f;
                 background-color: #0c1829;
-            }
-            QCheckBox::indicator:hover {
+            }}
+            QCheckBox::indicator:hover {{
                 border-color: #0084d1;
-            }
-            QCheckBox::indicator:checked {
-                background-color: #0084d1;
+            }}
+            QCheckBox::indicator:checked {{
+                background-color: #0284c7;
                 border: 1px solid #38bdf8;
-            }
+                image: url("{check_svg}");
+            }}
         """
 
         self.cb_save_sudo = QCheckBox("Remember sudo password in memory during this app session (never saved to disk)")
