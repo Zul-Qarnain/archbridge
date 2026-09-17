@@ -15,7 +15,9 @@ class SourceContract(unittest.TestCase):
         manifest = tomllib.loads((ROOT / "Cargo.toml").read_text())
         self.assertEqual(manifest["package"]["name"], "archbridge")
         for module in re.findall(r"pub mod (\w+);", self.read("lib.rs")):
-            self.assertTrue((ROOT / "src" / f"{module}.rs").is_file())
+            flat = (ROOT / "src" / f"{module}.rs").is_file()
+            directory = (ROOT / "src" / module / "mod.rs").is_file()
+            self.assertTrue(flat or directory, f"Module '{module}' missing as .rs file or directory mod")
 
     def test_cli_is_rpc_client_not_packaging_engine(self):
         source = self.read("main.rs")

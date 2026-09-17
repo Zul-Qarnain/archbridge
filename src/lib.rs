@@ -4,6 +4,7 @@ pub mod config;
 pub mod discovery;
 pub mod doctor;
 pub mod engine;
+pub mod gui;
 pub mod inspect;
 pub mod process;
 pub mod recipe;

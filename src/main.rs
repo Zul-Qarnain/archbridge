@@ -13,27 +13,9 @@ fn main() {
 
     let command = args[1].as_str();
     if command == "gui" || command == "--gui" || command == "ui" || command == "--ui" {
-        let script = std::path::Path::new("archbridge-gui.py");
-        let script_path = if script.exists() {
-            script.to_path_buf()
-        } else if let Ok(exec_path) = std::env::current_exe() {
-            exec_path
-                .parent()
-                .unwrap_or_else(|| std::path::Path::new("."))
-                .join("archbridge-gui.py")
-        } else {
-            script.to_path_buf()
-        };
-
-        if script_path.exists() {
-            let status = std::process::Command::new("python3")
-                .arg(script_path)
-                .status();
-            std::process::exit(status.map_or(1, |s| s.code().unwrap_or(0)));
-        } else {
-            eprintln!("GUI script 'archbridge-gui.py' not found.");
-            std::process::exit(1);
-        }
+        // Launch the native GPUI window — no Python subprocess needed
+        archbridge::gui::run_gui();
+        return;
     }
 
     if command == "serve" {
