@@ -44,6 +44,7 @@ jobs:
           mkdir "$bundle"
           cp target/release/archbridge "$bundle/"
           cp archbridge-gui.py README.md LICENSE "$bundle/"
+          cp -r assets "$bundle/"
           tar -czf "${bundle}.tar.gz" "$bundle"
           sha256sum "${bundle}.tar.gz" > "${bundle}.tar.gz.sha256"
 

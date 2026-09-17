@@ -1,6 +1,6 @@
 [package]
 name = "archbridge"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 description = "Finds and builds the safest available installation path for software on Arch"
