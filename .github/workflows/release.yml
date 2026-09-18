@@ -27,6 +27,15 @@ jobs:
         with:
           python-version: "3.x"
 
+      - name: Install Linux GUI development libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            libxcb1-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            pkg-config
+
       - name: Run validation gates
         run: |
           cargo fmt --check
