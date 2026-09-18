@@ -544,17 +544,17 @@ impl Engine {
             protocol_version: "v1.0".to_string(),
             plan_id: plan_id.clone(),
             action: "uninstall".to_string(),
-            summary: format!("Remove installed package '{}' with pacman", package),
+            summary: format!("Uninstall installed package '{}' with pacman", package),
             steps: vec![Step::new(
                 "sudo",
                 vec!["-n", "pacman", "-Rns", "--noconfirm", package],
-                "Remove selected package and unused dependencies",
+                "Uninstall selected package and unused dependencies",
                 120,
             )],
             filesystem_changes: vec![FilesystemChange {
                 path: "/".to_string(),
                 action: "modify".to_string(),
-                description: format!("Remove package '{}' from the live system", package),
+                description: format!("Uninstall package '{}' from the live system", package),
             }],
             reviews: vec![],
             warnings: vec![

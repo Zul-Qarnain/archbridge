@@ -13,7 +13,7 @@ pub fn run_gui() {
     let engine: SharedEngine = Arc::new(Mutex::new(crate::rpc::RpcServer::new()));
 
     Application::new().run(move |cx: &mut App| {
-        let bounds = Bounds::centered(None, size(px(1280.0), px(820.0)), cx);
+        let bounds = Bounds::centered(None, size(px(1320.0), px(848.0)), cx);
         let engine_clone = Arc::clone(&engine);
 
         cx.open_window(

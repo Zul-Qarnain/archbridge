@@ -1705,7 +1705,7 @@ fn render_discover(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> 
                                     .w_full()
                                     .flex()
                                     .flex_col()
-                                    .gap_2_5()
+                                    .gap_1()
                                     .children(
                                         app.state
                                             .search_results
@@ -1739,7 +1739,7 @@ fn quick_try_tag(
             this.state.search_query = name.to_string();
             this.run_search(cx);
         }))
-        .child(format!("{},", name))
+        .child(format!("{}", name))
 }
 
 fn source_candidate_card(
@@ -1788,6 +1788,8 @@ fn source_candidate_card(
         // Left info block with app icon
         .child(
             div()
+                .flex_1()
+                .overflow_hidden()
                 .flex()
                 .items_center()
                 .gap_3()
@@ -1813,6 +1815,8 @@ fn source_candidate_card(
                 .child(source_badge(&result.source))
                 .child(
                     div()
+                        .flex_1()
+                        .overflow_hidden()
                         .flex()
                         .flex_col()
                         .gap_1()
@@ -2540,7 +2544,7 @@ fn render_build(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> imp
             div()
                 .flex_1()
                 .min_h(px(120.0))
-                .bg(if pal.is_light() { rgb(0x0f172a) } else { rgb(0x040810) })
+                .bg(if pal.is_light() { rgb(0xf8fafc) } else { rgb(0x040810) })
                 .border_1()
                 .border_color(rgb(pal.border_subtle))
                 .rounded_xl()
@@ -2583,7 +2587,13 @@ fn render_uninstall(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) ->
         .installed_packages
         .iter()
         .enumerate()
-        .filter(|(_, p)| query.is_empty() || p.name.to_lowercase().contains(&query))
+        .filter(|(_, p)| {
+            if query.is_empty() {
+                true
+            } else {
+                p.name.to_lowercase().contains(&query)
+            }
+        })
         .map(|(i, p)| (i, p.clone()))
         .collect();
 
@@ -2753,37 +2763,46 @@ fn render_uninstall(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) ->
         .when_some(app.state.uninstall_msg.clone(), |this, msg| {
             this.child(status_msg_bar(&msg, &pal))
         })
-        // Safety Confirmation Prompt Banner
+        // Safety Confirmation Prompt Popup Modal
         .when_some(app.state.uninstall_confirm_idx, |this, idx| {
             if let Some(pkg) = app.state.installed_packages.get(idx) {
                 let pkg_name = pkg.name.clone();
                 this.child(
                     div()
-                        .w_full()
-                        .py_2_5()
-                        .px_4()
-                        .rounded_lg()
-                        .bg(if pal.is_light() { rgb(0xfef2f2) } else { rgb(0x2d1214) })
-                        .border_1()
-                        .border_color(if pal.is_light() { rgb(0xfecaca) } else { rgb(0x7f1d1d) })
+                        .absolute()
+                        .inset_0()
+                        .bg(rgba(0x000000aa))
                         .flex()
-                        .flex_col()
-                        .gap_3()
+                        .items_center()
+                        .justify_center()
                         .child(
                             div()
-                                .w_full()
+                                .w(px(450.0))
+                                .p_5()
+                                .rounded_xl()
+                                .bg(if pal.is_light() { rgb(0xfef2f2) } else { rgb(0x2d1214) })
+                                .border_1()
+                                .border_color(if pal.is_light() { rgb(0xfecaca) } else { rgb(0x7f1d1d) })
+                                .shadow_lg()
                                 .flex()
-                                .items_center()
-                                .gap_2()
-                                .child(div().text_size(px(15.0)).child("⚠️"))
+                                .flex_col()
+                                .gap_4()
                                 .child(
                                     div()
-                                        .text_color(if pal.is_light() { rgb(0x991b1b) } else { rgb(0xfca5a5) })
-                                        .text_size(px(12.5))
-                                        .font_weight(FontWeight::BOLD)
-                                        .child(format!("Are you sure you want to uninstall '{}'? This will remove it from your system.", pkg_name)),
-                                ),
-                        )
+                                        .w_full()
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .gap_3()
+                                        .child(div().text_size(px(20.0)).child("⚠️"))
+                                        .child(
+                                            div()
+                                                .text_color(if pal.is_light() { rgb(0x991b1b) } else { rgb(0xfca5a5) })
+                                                .text_size(px(13.5))
+                                                .font_weight(FontWeight::BOLD)
+                                                .child(format!("Are you sure you want to uninstall '{}'? This will remove it from your system.", pkg_name)),
+                                        ),
+                                )
                         .child(
                             div()
                                 .w_full()
@@ -2813,7 +2832,8 @@ fn render_uninstall(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) ->
                                         cx.notify();
                                     }),
                                 )),
-                        ),
+                        )
+                    )
                 )
             } else {
                 this
@@ -2869,7 +2889,7 @@ fn render_uninstall(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) ->
                         )
                         .child(
                             div()
-                                .w(px(180.0))
+                                .w(px(220.0))
                                 .text_color(rgb(pal.text_muted))
                                 .text_size(px(12.0))
                                 .font_weight(FontWeight::BOLD)
@@ -2886,6 +2906,7 @@ fn render_uninstall(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) ->
                         .overflow_y_scroll()
                         .flex()
                         .flex_col()
+                        .gap_2()
                         .children(
                             visible_pkgs
                                 .into_iter()
@@ -2938,7 +2959,7 @@ fn render_uninstall(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) ->
                                         )
                                         .child(
                                             div()
-                                                .w(px(180.0))
+                                                .w(px(220.0))
                                                 .flex()
                                                 .justify_end()
                                                 .child(if is_confirming {
