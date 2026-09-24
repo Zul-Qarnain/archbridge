@@ -2,7 +2,7 @@
 Name=ArchBridge
 GenericName=Package Builder & Installer
 Comment=Safe, Native Arch Linux Package Builder & Foreign Format Translator
-Exec=python3 /home/zulqarnain/archbridge/archbridge-gui.py
+Exec=archbridge gui
 Icon=archbridge
 Terminal=false
 Type=Application

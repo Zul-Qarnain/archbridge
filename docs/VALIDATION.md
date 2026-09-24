@@ -3,8 +3,8 @@
 ## Environment evidence — September 16, 2026
 
 The current development host provides Rust/Cargo, `pacman`, `base-devel`,
-`devtools`, `mkarchroot`, `makechrootpkg`, compiler tooling, Python 3, and PyQt6.
-Local Rust compilation/tests and Python UI checks pass. HTTPS DNS access is
+`devtools`, `mkarchroot`, `makechrootpkg`, and compiler tooling.
+Local Rust compilation/tests pass. HTTPS DNS access is
 environment-dependent and real package builds still require a disposable Arch VM.
 
 Current local gates:
@@ -12,7 +12,7 @@ Current local gates:
 - `cargo fmt --check`: passed.
 - `cargo build --release`: passed.
 - `cargo test`: passed; Cargo currently reports 12 Rust tests.
-- Python compile and source-contract tests: passed.
+- Source-contract checks (now `tests/source_contract.rs`): passed.
 - `archbridge doctor`: `ready: true`; offline network is reported as unavailable.
 - Real clean-chroot package acceptance: not claimed until run in a disposable Arch VM.
 
@@ -24,7 +24,6 @@ On a machine with the Rust toolchain and allowed dependency access:
 cargo fmt --check
 cargo check --all-targets
 cargo test
-python3 -m unittest discover -s tests -p source_contract.py -v
 bash -n tests/acceptance.sh
 ```
 
@@ -36,8 +35,9 @@ config and noninteractive consent. CLI tests spawn the same JSON-RPC server as
 real CLI operations. They do not require privileged Arch builds.
 
 Because no Rust formatter ran here, apply `cargo fmt` if required, then rerun the
-checks. Resolve compiler/test findings before continuing. The supplementary Python
-test suite only checks source contracts; do not report it as passing Rust tests.
+checks. Resolve compiler/test findings before continuing. The supplementary
+`tests/source_contract.rs` suite only checks source contracts; do not report it as
+passing Rust tests.
 
 ## 2. Real foreign formats
 

@@ -5,7 +5,7 @@
 ```text
 src/                 Rust library, CLI, GPUI frontend, RPC, discovery, planning, and safety code
 src/gui/             Native GPUI desktop application (Zed's GPU-rendered engine)
-tests/               Rust integration tests, Python contracts, acceptance harness
+tests/               Rust integration tests, source contracts, acceptance harness
 docs/                Public architecture, security, IPC, validation, and release docs
 .github/             CI and contribution templates
 ```

@@ -224,6 +224,99 @@ pub fn compute_readiness(checks: &[CheckResult]) -> bool {
     true
 }
 
+/// Unprivileged user namespaces carry the smoke-test container. The old check
+/// passed whenever `/proc/self/ns/user` existed — which is always on Linux, even
+/// when an administrator has switched the feature off — so it could never fail.
+/// The knobs that actually gate it are read instead.
+pub fn check_user_namespaces() -> CheckResult {
+    let mut blocked: Vec<String> = Vec::new();
+
+    // Older kernels and some distributions expose an explicit on/off switch.
+    if let Ok(value) = fs::read_to_string("/proc/sys/kernel/unprivileged_userns_clone") {
+        let value = value.trim().to_string();
+        if value != "1" {
+            blocked.push(format!("kernel.unprivileged_userns_clone is {value}"));
+        }
+    }
+    // The limit that is set to 0 to disable the feature on current kernels.
+    if let Ok(value) = fs::read_to_string("/proc/sys/user/max_user_namespaces") {
+        let value = value.trim().to_string();
+        if value.parse::<u64>().unwrap_or(1) == 0 {
+            blocked.push("user.max_user_namespaces is 0".to_string());
+        }
+    }
+
+    if !blocked.is_empty() {
+        CheckResult {
+            name: "namespaces".to_string(),
+            status: "fail".to_string(),
+            message: format!(
+                "Unprivileged user namespaces are restricted: {}",
+                blocked.join(", ")
+            ),
+        }
+    } else if Path::new("/proc/self/ns/user").exists() {
+        CheckResult {
+            name: "namespaces".to_string(),
+            status: "pass".to_string(),
+            message: "Kernel user namespaces support detected".to_string(),
+        }
+    } else {
+        CheckResult {
+            name: "namespaces".to_string(),
+            status: "fail".to_string(),
+            message: "No user namespace interface found under /proc".to_string(),
+        }
+    }
+}
+
+/// Workspace free space. Clean chroot builds unpack a full base filesystem, so
+/// a nearly-full disk has to be reported before a build dies partway through.
+pub fn check_disk_space(workspace: &Path) -> CheckResult {
+    const MIN_FREE_KIB: u64 = 2 * 1024 * 1024;
+    let step = Step::new(
+        "df",
+        vec!["-Pk".to_string(), workspace.to_string_lossy().to_string()],
+        "Measure free workspace disk space",
+        10,
+    );
+    let available_kib = match run_step(&step, None) {
+        Ok(out) if out.exit_code == 0 => out
+            .stdout
+            .lines()
+            .last()
+            .and_then(|line| line.split_whitespace().nth(3))
+            .and_then(|value| value.parse::<u64>().ok()),
+        _ => None,
+    };
+
+    match available_kib {
+        Some(kib) if kib >= MIN_FREE_KIB => CheckResult {
+            name: "disk_space".to_string(),
+            status: "pass".to_string(),
+            message: format!(
+                "{:.1} GiB free in {:?}",
+                kib as f64 / 1024.0 / 1024.0,
+                workspace
+            ),
+        },
+        Some(kib) => CheckResult {
+            name: "disk_space".to_string(),
+            status: "fail".to_string(),
+            message: format!(
+                "Only {:.1} GiB free in {:?}; clean chroot builds need at least 2 GiB",
+                kib as f64 / 1024.0 / 1024.0,
+                workspace
+            ),
+        },
+        None => CheckResult {
+            name: "disk_space".to_string(),
+            status: "unavailable".to_string(),
+            message: "Could not measure free disk space (df unavailable)".to_string(),
+        },
+    }
+}
+
 pub fn run_doctor() -> DoctorReport {
     run_doctor_with_probe(probe_network, DEFAULT_NETWORK_ENDPOINT)
 }
@@ -320,30 +413,10 @@ where
     }
 
     // 4. Kernel unprivileged namespaces
-    let ns_file = Path::new("/proc/sys/kernel/unprivileged_userns_clone");
-    let user_ns = Path::new("/proc/self/ns/user");
-    if user_ns.exists()
-        || (ns_file.exists() && fs::read_to_string(ns_file).is_ok_and(|c| c.trim() == "1"))
-    {
-        checks.push(CheckResult {
-            name: "namespaces".to_string(),
-            status: "pass".to_string(),
-            message: "Kernel user namespaces support detected".to_string(),
-        });
-    } else {
-        checks.push(CheckResult {
-            name: "namespaces".to_string(),
-            status: "fail".to_string(),
-            message: "Unprivileged user namespaces unavailable or restricted".to_string(),
-        });
-    }
+    checks.push(check_user_namespaces());
 
-    // 5. Free disk space (heuristic check)
-    checks.push(CheckResult {
-        name: "disk_space".to_string(),
-        status: "pass".to_string(),
-        message: "Sufficient workspace disk space available".to_string(),
-    });
+    // 5. Free disk space for the build workspace
+    checks.push(check_disk_space(Path::new(".")));
 
     // 6. Compiler toolchain (gcc / cargo)
     let step_gcc = Step::new("gcc", vec!["--version"], "Check compiler toolchain", 5);

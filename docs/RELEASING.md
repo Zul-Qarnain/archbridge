@@ -7,7 +7,7 @@ release until the validation gates below pass on a supported Arch environment.
 
 1. Review the change log and security-impacting changes.
 2. Run `cargo fmt --check`, `cargo build --release`, and `cargo test`.
-3. Run Python syntax/source-contract checks.
+3. Run the structural source-contract checks (`cargo test --test source_contract`).
 4. Run `archbridge doctor`.
 5. Run the opt-in disposable Arch acceptance harness.
 6. Inspect the final diff and confirm no secrets, local docs, or build outputs are included.

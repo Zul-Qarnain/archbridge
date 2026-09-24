@@ -22,11 +22,6 @@ jobs:
         with:
           components: rustfmt
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.x"
-
       - name: Install Linux GUI development libraries
         run: |
           sudo apt-get update
@@ -40,8 +35,6 @@ jobs:
         run: |
           cargo fmt --check
           cargo test
-          python3 -m py_compile archbridge-gui.py
-          python3 -m unittest tests/source_contract.py
 
       - name: Build release binary
         run: cargo build --release
@@ -52,7 +45,7 @@ jobs:
           bundle="archbridge-${version}-linux-x86_64"
           mkdir "$bundle"
           cp target/release/archbridge "$bundle/"
-          cp archbridge-gui.py README.md LICENSE "$bundle/"
+          cp README.md LICENSE "$bundle/"
           cp -r assets "$bundle/"
           tar -czf "${bundle}.tar.gz" "$bundle"
           sha256sum "${bundle}.tar.gz" > "${bundle}.tar.gz.sha256"

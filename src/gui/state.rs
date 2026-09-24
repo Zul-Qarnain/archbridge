@@ -1,7 +1,9 @@
 use crate::engine::{ExecutionResult, Plan};
+use crate::process::ProgressSnapshot;
 use crate::rpc::{JsonRpcRequest, RpcServer};
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 /// Application Theme mode
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -24,6 +26,16 @@ pub enum ActiveTab {
     Settings,
 }
 
+/// Which text field currently owns keyboard focus.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputField {
+    Search,
+    Inspect,
+    Build,
+    Uninstall,
+    Auth,
+}
+
 /// Severity for inline messages
 #[derive(Debug, Clone, PartialEq)]
 pub enum MsgLevel {
@@ -40,20 +52,24 @@ pub struct StatusMsg {
     pub text: String,
 }
 
-/// One result item in the Discover search results list
+/// One result item in the Discover search results list. Optional metadata stays
+/// optional: a source that does not report a licence must not have one invented
+/// for it in the UI.
 #[derive(Debug, Clone)]
 pub struct SearchResult {
     pub name: String,
     pub version: String,
     pub description: String,
     pub source: String,
-    pub score: f64,
     pub repo: String,
     pub is_recommended: bool,
-    pub license: String,
-    pub arch: String,
-    pub size: String,
-    pub maintainer: String,
+    pub url: Option<String>,
+    pub source_url: Option<String>,
+    pub license: Option<String>,
+    pub arch: Option<String>,
+    pub size: Option<String>,
+    pub maintainer: Option<String>,
+    pub out_of_date: Option<String>,
 }
 
 /// One installed package in the Uninstall view
@@ -65,11 +81,13 @@ pub struct InstalledPackage {
     pub size: String,
 }
 
-/// Doctor health check item
+/// Doctor health check item. `status` is the engine's own verdict — "pass",
+/// "unavailable" or "fail" — and the three are not interchangeable: an offline
+/// network is unavailable, not a failure, and must not render as one.
 #[derive(Debug, Clone)]
 pub struct HealthCheck {
     pub name: String,
-    pub ok: bool,
+    pub status: String,
     pub message: String,
 }
 
@@ -110,10 +128,18 @@ pub struct AppState {
     pub build_log: String,
     pub build_busy: bool,
     pub build_result: Option<ExecutionResult>,
+    /// True once the staged plan shown in the review panel has been sent to the
+    /// engine. Plans are single-use, so a second click cannot run anything and
+    /// has to say so instead of resending a consumed plan id.
+    pub build_plan_consumed: bool,
+    /// Same, for the install plan a successful build hands off to.
+    pub install_plan_consumed: bool,
     pub build_msg: Option<StatusMsg>,
 
     // ──────────────────── uninstall ─────────────────────
     pub installed_packages: Vec<InstalledPackage>,
+    /// True while `pacman -Qe` is being read off the UI thread.
+    pub installed_loading: bool,
     pub uninstall_query: String,
     pub uninstall_selected: Option<usize>,
     pub uninstall_confirm_idx: Option<usize>,
@@ -128,6 +154,9 @@ pub struct AppState {
 
     // ──────────────────── settings ──────────────────────
     pub config_data: Option<Value>,
+    pub settings_busy: bool,
+    /// True when a toggle differs from what is on disk.
+    pub settings_dirty: bool,
     pub opt_official: bool,
     pub opt_aur: bool,
     pub opt_flatpak: bool,
@@ -141,14 +170,22 @@ pub struct AppState {
     // ──────────────────── auth ──────────────────────────
     pub auth_dialog_open: bool,
     pub auth_password_input: String,
+    pub auth_password_visible: bool,
+    pub auth_busy: bool,
     pub auth_pending_action: Option<String>,
     pub auth_error: Option<String>,
-    pub auth_focus_active: bool,
+    pub auth_started: Option<Instant>,
+    pub auth_fix_fingerprint: bool,
+    pub auth_needs_focus: bool,
+
+    // ──────────────────── live progress ──────────────────
+    pub tick: u32,
+    pub progress: ProgressSnapshot,
+    pub sudo_advice_slow: bool,
 
     // ──────────────────── theme & focus ──────────────────
     pub theme: AppTheme,
-    pub search_focused: bool,
-    pub uninstall_focused: bool,
+    pub focused_input: Option<InputField>,
 }
 
 impl Default for AppState {
@@ -157,7 +194,7 @@ impl Default for AppState {
             active_tab: ActiveTab::Discover,
             search_history: Vec::new(),
             show_history_menu: false,
-            doctor_ready: true,
+            doctor_ready: false,
             sudo_session_active: false,
             active_chroot: "None".into(),
             free_disk_space: "47 GiB Free".into(),
@@ -184,9 +221,12 @@ impl Default for AppState {
             build_log: "".into(),
             build_busy: false,
             build_result: None,
+            build_plan_consumed: false,
+            install_plan_consumed: false,
             build_msg: None,
 
             installed_packages: Vec::new(),
+            installed_loading: false,
             uninstall_query: "".into(),
             uninstall_selected: None,
             uninstall_confirm_idx: None,
@@ -194,53 +234,15 @@ impl Default for AppState {
             uninstall_busy: false,
             uninstall_msg: None,
 
-            // Pre-populated 8 health checks matching doctor report
-            health_checks: vec![
-                HealthCheck {
-                    name: "pacman".into(),
-                    ok: true,
-                    message: "pacman package manager is installed".into(),
-                },
-                HealthCheck {
-                    name: "base-devel".into(),
-                    ok: true,
-                    message: "base-devel group/meta-package is installed".into(),
-                },
-                HealthCheck {
-                    name: "devtools".into(),
-                    ok: true,
-                    message: "devtools (mkarchroot and makechrootpkg) are installed".into(),
-                },
-                HealthCheck {
-                    name: "namespaces".into(),
-                    ok: true,
-                    message: "Kernel user namespaces support detected".into(),
-                },
-                HealthCheck {
-                    name: "disk_space".into(),
-                    ok: true,
-                    message: "Sufficient workspace disk space available (142 GiB Free)".into(),
-                },
-                HealthCheck {
-                    name: "compiler".into(),
-                    ok: true,
-                    message: "GCC compiler toolchain is available".into(),
-                },
-                HealthCheck {
-                    name: "network".into(),
-                    ok: true,
-                    message: "HTTPS network connectivity verified (https://archlinux.org)".into(),
-                },
-                HealthCheck {
-                    name: "keyring".into(),
-                    ok: true,
-                    message: "Pacman keyring is populated and valid".into(),
-                },
-            ],
+            // Empty until the engine actually measures something: a health
+            // check shown before it ran is a claim about the user's system.
+            health_checks: Vec::new(),
             doctor_busy: false,
             doctor_msg: None,
 
             config_data: None,
+            settings_busy: false,
+            settings_dirty: false,
             opt_official: true,
             opt_aur: true,
             opt_flatpak: true,
@@ -253,19 +255,77 @@ impl Default for AppState {
 
             auth_dialog_open: false,
             auth_password_input: "".into(),
+            auth_password_visible: false,
+            auth_busy: false,
             auth_pending_action: None,
             auth_error: None,
-            auth_focus_active: false,
+            auth_started: None,
+            auth_fix_fingerprint: false,
+            auth_needs_focus: false,
+
+            tick: 0,
+            progress: ProgressSnapshot::default(),
+            sudo_advice_slow: false,
 
             theme: AppTheme::Dark,
-            search_focused: false,
-            uninstall_focused: false,
+            focused_input: None,
         }
     }
 }
 
 /// Thread-safe handle to the engine / RPC server
 pub type SharedEngine = Arc<Mutex<RpcServer>>;
+
+impl AppState {
+    /// The persisted config keys behind the source-routing checkboxes, in the
+    /// order the Settings card shows them.
+    pub fn source_preferences(&self) -> [(&'static str, bool); 7] {
+        [
+            ("official", self.opt_official),
+            ("aur", self.opt_aur),
+            ("flatpak", self.opt_flatpak),
+            ("appimage", self.opt_appimage),
+            ("upstream", self.opt_upstream),
+            ("deb", self.opt_deb),
+            ("rpm", self.opt_rpm),
+        ]
+    }
+
+    /// Read the checkbox states back from a `v1.config.get` "all" payload so the
+    /// card reflects what is on disk rather than compile-time defaults.
+    pub fn apply_source_preferences(&mut self, config: &Value) {
+        let read = |key: &str, slot: &mut bool| {
+            if let Some(value) = config.get(key).and_then(|v| v.as_bool()) {
+                *slot = value;
+            }
+        };
+        read("official", &mut self.opt_official);
+        read("aur", &mut self.opt_aur);
+        read("flatpak", &mut self.opt_flatpak);
+        read("appimage", &mut self.opt_appimage);
+        read("upstream", &mut self.opt_upstream);
+        read("deb", &mut self.opt_deb);
+        read("rpm", &mut self.opt_rpm);
+        self.config_data = Some(config.clone());
+        self.settings_dirty = false;
+    }
+
+    /// True while any engine-backed operation is running.
+    pub fn engine_busy(&self) -> bool {
+        self.search_busy
+            || self.inspect_busy
+            || self.build_busy
+            || self.uninstall_busy
+            || self.doctor_busy
+            || self.settings_busy
+    }
+
+    /// True when the 400 ms UI ticker must keep running (busy animations,
+    /// live progress polling, or a blinking caret in a focused field).
+    pub fn ticker_needed(&self) -> bool {
+        self.engine_busy() || self.auth_dialog_open || self.focused_input.is_some()
+    }
+}
 
 /// Convenience: call one RPC method synchronously
 pub fn rpc_call(engine: &SharedEngine, method: &str, params: Value) -> Result<Value, String> {
@@ -278,7 +338,7 @@ pub fn rpc_call(engine: &SharedEngine, method: &str, params: Value) -> Result<Va
     let mut srv = engine.lock().map_err(|e| e.to_string())?;
     let resp = srv.handle_request(req);
     if let Some(err) = resp.error {
-        Err(format!("RPC {}: {}", err.code, err.message))
+        Err(err.message)
     } else if let Some(res) = resp.result {
         Ok(res)
     } else {

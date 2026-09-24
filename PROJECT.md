@@ -8,7 +8,7 @@ ArchBridge is not a universal DEB/RPM converter. It discovers safer alternatives
 first and treats foreign packages as inspection inputs, not installation recipes.
 
 This repository contains an **initial Phase 1 implementation**. Rust compilation,
-unit/integration tests, Python UI checks, and local Doctor checks run in the current
+unit/integration tests, and local Doctor checks run in the current
 development environment. Real clean-chroot package acceptance remains an explicit
 Arch VM gate. See `docs/VALIDATION.md` for exactly what was and was not tested.
 
@@ -46,7 +46,7 @@ The library is available as the `archbridge` crate.
 - Explicit argument vectors for child processes; no user-built host shell command.
 - System `curl` handles HTTPS, timeouts, redirects and certificate verification.
 - The Rust engine and GPUI frontend form a self-contained native binary.
-  Python source-contract checks and the Bash acceptance harness are development
+  The Rust source-contract checks and the Bash acceptance harness are development
   tooling, not alternate packaging engines.
 
 JSON-RPC was chosen over D-Bus because it has no session/system bus deployment
@@ -287,7 +287,7 @@ Interrupted jobs may need manual cleanup; see the security/validation documents.
 | `tests/core.rs` | Pure Rust policy/parser/recipe/planning regressions |
 | `tests/cli.rs` | CLI/RPC dry-run, persistence and consent regressions |
 | `tests/foreign_formats.rs` | Explicit opt-in real-format integration tests |
-| `tests/source_contract.py` | Supplementary static checks usable without Rust |
+| `tests/source_contract.rs` | Supplementary static checks over the crate's own source |
 | `tests/acceptance.sh` | Explicitly gated disposable-Arch real-build matrix |
 
 ## 10. Remaining gates and excluded work

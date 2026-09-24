@@ -43,8 +43,8 @@ cargo check --all-targets
 # Run all standard Rust unit & integration tests
 cargo test
 
-# Run supplementary source contract checks (enforces architectural invariants)
-python3 -m unittest tests/source_contract.py
+# Run the structural source-contract checks alone (asserts architectural invariants)
+cargo test --test source_contract
 
 # Run foreign format inspection integration tests (includes ignored fixtures)
 cargo test --test foreign_formats -- --nocapture
@@ -116,7 +116,7 @@ archbridge/
 │   ├── cli.rs            # CLI argument parsing and DirectRpcClient tests
 │   ├── doctor.rs         # Doctor probe evaluation & readiness tests
 │   ├── foreign_formats.rs# Real DEB/RPM inspection & script non-execution tests
-│   ├── source_contract.py# Python contract asserting structural security invariants
+│   ├── source_contract.rs# Static checks asserting structural security invariants
 │   └── acceptance.sh     # Disposable Arch VM end-to-end acceptance harness
 ├── docs/                 # Architectural Decision Records, Security Model, IPC specs
 └── Cargo.toml            # Package manifest & release profiles
@@ -159,7 +159,7 @@ archbridge/
 
 ## 4. Key Invariants & Security Rules
 
-Enforced continuously by unit tests and `tests/source_contract.py`:
+Enforced continuously by unit tests and `tests/source_contract.rs`:
 
 1. **CLI is an RPC Client, Not a Packaging Engine**: `src/main.rs` communicates via `DirectRpcClient` calling methods on `RpcServer` (`v1.prepare`, `v1.execute`). Direct packaging tools (`makepkg`, `mkarchroot`) must never be called directly in `main.rs`.
 2. **No Foreign Script Execution**: `src/inspect.rs` extracts metadata only. `maintainer_scripts` entries must have `executed: false`. Never invoke `sh`, `bash`, `ldd`, or `Command::new` to evaluate foreign packages or inspected ELFs.

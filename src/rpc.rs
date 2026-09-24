@@ -47,6 +47,14 @@ impl RpcServer {
         }
     }
 
+    /// A server bound to a preferences file at `config_path` rather than the
+    /// user's real one, so tests cannot rewrite discovery settings.
+    pub fn with_config_path(config_path: &std::path::Path) -> Self {
+        Self {
+            engine: Engine::with_config_path(config_path),
+        }
+    }
+
     pub fn handle_request(&mut self, req: JsonRpcRequest) -> JsonRpcResponse {
         if req.jsonrpc != "2.0" {
             return JsonRpcResponse {
@@ -60,10 +68,22 @@ impl RpcServer {
             };
         }
 
+        let phase_label = match req.method.as_str() {
+            "v1.search" | "v1.info" => Some("Discovering sources"),
+            "v1.inspect" => Some("Inspecting foreign package"),
+            "v1.doctor" => Some("Running system diagnostics"),
+            "v1.authenticate" => Some("Authenticating administrator session"),
+            "v1.prepare" => Some("Preparing plan"),
+            _ => None,
+        };
+        if let Some(label) = phase_label {
+            crate::process::begin_phase(label, 0);
+        }
+
         let res = match req.method.as_str() {
             "v1.capabilities" => Ok(serde_json::json!({
                 "protocol": "v1.0",
-                "methods": ["v1.capabilities", "v1.search", "v1.info", "v1.inspect", "v1.doctor", "v1.config.get", "v1.prepare", "v1.execute"],
+                "methods": ["v1.capabilities", "v1.search", "v1.info", "v1.inspect", "v1.doctor", "v1.config.get", "v1.authenticate", "v1.deauthenticate", "v1.sudo_advice", "v1.optimize_sudo_auth", "v1.prepare", "v1.execute"],
                 "chroot_build": true,
                 "runtime_smoke_test": true,
                 "foreign_script_execution": false
@@ -85,14 +105,40 @@ impl RpcServer {
                     .get("target")
                     .and_then(|t| t.as_str())
                     .unwrap_or("");
-                self.engine
-                    .prepare_inspect(target)
-                    .and_then(|p| serde_json::to_value(&p).map_err(|e| e.to_string()))
+                // v1.inspect is the read-only review path, so it answers with the
+                // report itself (the findings a human reads). The staged plan is
+                // returned by `v1.prepare` with action "inspect" instead.
+                self.engine.prepare_inspect(target).and_then(|(_, report)| {
+                    serde_json::to_value(report).map_err(|e| e.to_string())
+                })
             }
             "v1.doctor" => {
                 let doc = run_doctor();
                 serde_json::to_value(doc).map_err(|e| e.to_string())
             }
+            "v1.authenticate" => match req.params.get("password").and_then(|p| p.as_str()) {
+                Some(password) => self
+                    .engine
+                    .authenticate(password)
+                    .map(|_| serde_json::json!({"authenticated": true})),
+                None => Err("Authentication password is required".to_string()),
+            },
+            "v1.deauthenticate" => self
+                .engine
+                .deauthenticate()
+                .map(|_| serde_json::json!({"authenticated": false})),
+            "v1.sudo_advice" => Ok(serde_json::json!({
+                "fingerprint_before_password": crate::engine::Engine::fingerprint_before_password()
+            })),
+            "v1.optimize_sudo_auth" => match req.params.get("password").and_then(|p| p.as_str()) {
+                Some(password) => crate::engine::Engine::optimize_sudo_auth(password).map(|message| {
+                    serde_json::json!({
+                        "message": message,
+                        "fingerprint_before_password": crate::engine::Engine::fingerprint_before_password()
+                    })
+                }),
+                None => Err("Administrator password is required".to_string()),
+            },
             "v1.config.get" => {
                 let key = req
                     .params
@@ -136,7 +182,7 @@ impl RpcServer {
                     "search" | "info" => self
                         .engine
                         .prepare_search(target, req_obj.get("repo").and_then(|r| r.as_str())),
-                    "inspect" => self.engine.prepare_inspect(target),
+                    "inspect" => self.engine.prepare_inspect(target).map(|(plan, _)| plan),
                     "config.set" => {
                         let k = req.params.get("key").and_then(|k| k.as_str()).unwrap_or("");
                         let v = req
@@ -176,6 +222,10 @@ impl RpcServer {
             }
             _ => Err(format!("Method not found: '{}'", req.method)),
         };
+
+        if phase_label.is_some() {
+            crate::process::end_phase();
+        }
 
         match res {
             Ok(val) => JsonRpcResponse {

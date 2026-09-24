@@ -1,5 +1,6 @@
 use crate::process::{run_step, Step};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::Path;
 use tempfile::TempDir;
@@ -27,7 +28,11 @@ pub struct InspectionReport {
     pub systemd_units: Vec<String>,
     pub needed_libraries: Vec<String>,
     pub compatibility_note: String,
-    pub package_bytes: Option<Vec<u8>>,
+    /// Identity of the exact bytes reviewed, so a later build can be checked
+    /// against this inspection. The payload itself is never carried in the
+    /// report: serializing it turned a 200 MB package into a ~1 GB JSON string.
+    pub size_bytes: u64,
+    pub sha256: String,
 }
 
 pub fn inspect_package(file_path: &str) -> Result<InspectionReport, String> {
@@ -37,13 +42,15 @@ pub fn inspect_package(file_path: &str) -> Result<InspectionReport, String> {
     }
 
     let bytes = fs::read(path).map_err(|e| format!("Failed to read file '{:?}': {}", path, e))?;
-    let package_bytes: Option<Vec<u8>> = Some(bytes.to_vec());
+    let size_bytes = bytes.len() as u64;
+    let sha256 = format!("{:x}", Sha256::digest(&bytes));
+    drop(bytes);
 
     let file_str = file_path.to_lowercase();
     if file_str.ends_with(".deb") {
-        inspect_deb(file_path, package_bytes)
+        inspect_deb(file_path, size_bytes, sha256)
     } else if file_str.ends_with(".rpm") {
-        inspect_rpm(file_path, package_bytes)
+        inspect_rpm(file_path, size_bytes, sha256)
     } else {
         Err(format!(
             "Unsupported foreign package format for file '{}'",
@@ -54,7 +61,8 @@ pub fn inspect_package(file_path: &str) -> Result<InspectionReport, String> {
 
 fn inspect_deb(
     file_path: &str,
-    package_bytes: Option<Vec<u8>>,
+    size_bytes: u64,
+    sha256: String,
 ) -> Result<InspectionReport, String> {
     let temp_dir = TempDir::new().map_err(|e| format!("Failed to create temp directory: {}", e))?;
     let control_dir = temp_dir.path().join("control");
@@ -214,13 +222,15 @@ fn inspect_deb(
         systemd_units,
         needed_libraries,
         compatibility_note: note,
-        package_bytes,
+        size_bytes,
+        sha256,
     })
 }
 
 fn inspect_rpm(
     file_path: &str,
-    package_bytes: Option<Vec<u8>>,
+    size_bytes: u64,
+    sha256: String,
 ) -> Result<InspectionReport, String> {
     let mut desktop_files = Vec::new();
     let mut systemd_units = Vec::new();
@@ -279,7 +289,8 @@ fn inspect_rpm(
         systemd_units,
         needed_libraries,
         compatibility_note: note,
-        package_bytes,
+        size_bytes,
+        sha256,
     })
 }
 

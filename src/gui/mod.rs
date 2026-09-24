@@ -8,7 +8,7 @@ use state::SharedEngine;
 use std::sync::{Arc, Mutex};
 
 /// Launch the native GPUI window for ArchBridge.
-/// This replaces the old Python archbridge-gui.py launcher.
+/// This replaces the retired Python front-end, which no longer ships.
 pub fn run_gui() {
     let engine: SharedEngine = Arc::new(Mutex::new(crate::rpc::RpcServer::new()));
 

@@ -19,6 +19,74 @@ pub struct SourceSnapshot {
     pub reviews: Vec<FileReview>,
 }
 
+/// Review every regular file under `root`, addressed by its path relative to
+/// `root`. Each entry hashes the file's own bytes, so the manifest states what
+/// a later step can verify rather than a value derived from the file name.
+pub fn walk_tree(root: &Path) -> Result<Vec<FileReview>, String> {
+    let mut reviews = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(current_dir) = stack.pop() {
+        let entries = fs::read_dir(&current_dir)
+            .map_err(|e| format!("Failed to read directory '{:?}': {}", current_dir, e))?;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let rel_str = path
+                .strip_prefix(root)
+                .map_err(|e| e.to_string())?
+                .to_string_lossy()
+                .to_string();
+            let meta = fs::symlink_metadata(&path).map_err(|e| e.to_string())?;
+
+            if meta.is_dir() {
+                stack.push(path);
+            } else if meta.file_type().is_symlink() {
+                // A link carries no bytes of its own, so the manifest records the
+                // target instead of pretending to hash content.
+                let target = fs::read_link(&path)
+                    .map(|t| t.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                let mut hasher = Sha256::new();
+                hasher.update(target.as_bytes());
+                reviews.push(FileReview {
+                    path: rel_str,
+                    sha256: format!("{:x}", hasher.finalize()),
+                    bytes: 0,
+                    executable: false,
+                    content: Some(format!("symlink -> {}", target)),
+                });
+            } else if meta.is_file() {
+                let mut bytes = Vec::new();
+                fs::File::open(&path)
+                    .and_then(|mut f| f.read_to_end(&mut bytes))
+                    .map_err(|e| format!("Failed to read file '{}': {}", rel_str, e))?;
+                let mut hasher = Sha256::new();
+                hasher.update(&bytes);
+                #[cfg(unix)]
+                let is_exec = {
+                    use std::os::unix::fs::PermissionsExt;
+                    (meta.permissions().mode() & 0o111) != 0
+                };
+                #[cfg(not(unix))]
+                let is_exec = false;
+                let content = if bytes.len() < 10_000 && !bytes.contains(&0) {
+                    String::from_utf8(bytes.clone()).ok()
+                } else {
+                    None
+                };
+                reviews.push(FileReview {
+                    path: rel_str,
+                    sha256: format!("{:x}", hasher.finalize()),
+                    bytes: bytes.len() as u64,
+                    executable: is_exec,
+                    content,
+                });
+            }
+        }
+    }
+    reviews.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(reviews)
+}
+
 pub fn snapshot_directory(dir_path: &Path) -> Result<SourceSnapshot, String> {
     if !dir_path.exists() || !dir_path.is_dir() {
         return Err(format!(

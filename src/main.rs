@@ -115,7 +115,12 @@ impl DirectRpcClient {
     }
 }
 
-fn parse_flags(args: &[String]) -> (Vec<String>, bool, bool, Option<String>) {
+/// Flags every single-target command understands. Anything else is reported by
+/// the caller: an ignored `--dryrun` silently meant a real run.
+fn parse_flags(
+    args: &[String],
+    problems: &mut Vec<String>,
+) -> (Vec<String>, bool, bool, Option<String>) {
     let mut positional = Vec::new();
     let mut dry_run = false;
     let mut yes = false;
@@ -130,20 +135,67 @@ fn parse_flags(args: &[String]) -> (Vec<String>, bool, bool, Option<String>) {
                 if i + 1 < args.len() {
                     repo = Some(args[i + 1].clone());
                     i += 1;
+                } else {
+                    problems.push("Flag '--repo' requires a value".to_string());
                 }
             }
-            arg if !arg.starts_with("--") => positional.push(arg.to_string()),
-            _ => {}
+            arg if arg.starts_with("--") => problems.push(format!("Unknown flag '{}'", arg)),
+            arg => positional.push(arg.to_string()),
         }
         i += 1;
     }
     (positional, dry_run, yes, repo)
 }
 
+/// Every command takes exactly one target. Extra positionals used to be dropped
+/// silently, so `install foo bar` acted on one package and said nothing about
+/// the other.
+fn report_extra_targets(command: &str, positional: &[String], problems: &mut Vec<String>) {
+    for extra in positional.iter().skip(1) {
+        problems.push(format!(
+            "Unexpected argument '{}' for '{}'; expected a single target",
+            extra, command
+        ));
+    }
+}
+
+/// Exit code for an `ExecutionResult`. The plan was accepted and ran, so the
+/// transport succeeded even when the operation did not: reporting 0 for
+/// `ok: false` made failed builds and smoke tests look green to scripts.
+fn exit_code_for_execution(result: &serde_json::Value) -> i32 {
+    if result.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+        0
+    } else {
+        1
+    }
+}
+
+/// A missing or malformed argument is a usage problem (exit 2), not an
+/// operational failure (exit 1).
+fn usage_error(message: &str) -> Result<i32, String> {
+    eprintln!("Error: {}", message);
+    Ok(2)
+}
+
+/// Unknown flags used to be dropped silently, so a mistyped `--dryrun` became a
+/// real, unreviewed run instead of an error.
+fn usage_errors(problems: &[String]) -> Result<i32, String> {
+    for problem in problems {
+        eprintln!("Error: {}", problem);
+    }
+    print_usage();
+    Ok(2)
+}
+
 fn handle_search(client: &mut DirectRpcClient, args: &[String]) -> Result<i32, String> {
-    let (positional, _dry_run, _yes, repo) = parse_flags(args);
+    let mut problems = Vec::new();
+    let (positional, _dry_run, _yes, repo) = parse_flags(args, &mut problems);
     if positional.is_empty() {
-        return Err("Missing target name for search".to_string());
+        return usage_error("Missing target name for search");
+    }
+    report_extra_targets("search", &positional, &mut problems);
+    if !problems.is_empty() {
+        return usage_errors(&problems);
     }
     let target = &positional[0];
 
@@ -158,9 +210,14 @@ fn handle_search(client: &mut DirectRpcClient, args: &[String]) -> Result<i32, S
 }
 
 fn handle_inspect(client: &mut DirectRpcClient, args: &[String]) -> Result<i32, String> {
-    let (positional, _dry_run, _yes, _repo) = parse_flags(args);
+    let mut problems = Vec::new();
+    let (positional, _dry_run, _yes, _repo) = parse_flags(args, &mut problems);
     if positional.is_empty() {
-        return Err("Missing package file for inspect".to_string());
+        return usage_error("Missing package file for inspect");
+    }
+    report_extra_targets("inspect", &positional, &mut problems);
+    if !problems.is_empty() {
+        return usage_errors(&problems);
     }
     let target = &positional[0];
 
@@ -172,7 +229,7 @@ fn handle_inspect(client: &mut DirectRpcClient, args: &[String]) -> Result<i32, 
 #[rustfmt::skip]
 fn handle_config(client: &mut DirectRpcClient, args: &[String]) -> Result<i32, String> {
     if args.is_empty() {
-        return Err("Usage: archbridge config <get|set> <key> [value]".to_string());
+        return usage_error("Usage: archbridge config <get|set> <key> [value]");
     }
     let sub = args[0].as_str();
     match sub {
@@ -183,9 +240,14 @@ fn handle_config(client: &mut DirectRpcClient, args: &[String]) -> Result<i32, S
             Ok(0)
         }
         "set" => {
-            let (positional, dry_run, yes, _repo) = parse_flags(&args[1..]);
+            let mut problems = Vec::new();
+            let (positional, dry_run, yes, _repo) = parse_flags(&args[1..], &mut problems);
             if positional.len() < 2 {
-                return Err("Usage: archbridge config set <key> <value>".to_string());
+                return usage_error("Usage: archbridge config set <key> <value>");
+            }
+            report_extra_targets("config set", &positional, &mut problems);
+            if !problems.is_empty() {
+                return usage_errors(&problems);
             }
             let key = &positional[0];
             let value = &positional[1];
@@ -200,6 +262,12 @@ fn handle_config(client: &mut DirectRpcClient, args: &[String]) -> Result<i32, S
 
             if dry_run { return Ok(0); }
 
+            let plan: Plan = serde_json::from_value(plan_val).map_err(|e| e.to_string())?;
+            if plan.blocked.is_some() {
+                eprintln!("Plan is blocked and cannot be executed.");
+                return Ok(3);
+            }
+
             if !yes {
                 eprint!("Confirm configuration change [y/N]? ");
                 io::stderr().flush().ok();
@@ -213,16 +281,15 @@ fn handle_config(client: &mut DirectRpcClient, args: &[String]) -> Result<i32, S
                 }
             }
 
-            let plan: Plan = serde_json::from_value(plan_val).map_err(|e| e.to_string())?;
             let exec_params = json!({
                 "plan_id": plan.plan_id,
                 "confirmed": true
             });
             let exec_res = client.call("v1.execute", exec_params)?;
             println!("{}", serde_json::to_string_pretty(&exec_res).unwrap());
-            Ok(0)
+            Ok(exit_code_for_execution(&exec_res))
         }
-        _ => Err(format!("Unknown config subcommand '{}'", sub)),
+        _ => usage_error(&format!("Unknown config subcommand '{}'", sub)),
     }
 }
 
@@ -248,23 +315,31 @@ fn handle_build(client: &mut DirectRpcClient, args: &[String]) -> Result<i32, St
     let mut yes = false;
 
     let mut i = 0;
+    let mut problems: Vec<String> = Vec::new();
     while i < args.len() {
         match args[i].as_str() {
             "--dry-run" => dry_run = true,
             "--yes" | "-y" => yes = true,
-            "--name" => { if i + 1 < args.len() { name = Some(args[i + 1].clone()); i += 1; } }
-            "--version" => { if i + 1 < args.len() { version = Some(args[i + 1].clone()); i += 1; } }
-            "--entry" => { if i + 1 < args.len() { entry = Some(args[i + 1].clone()); i += 1; } }
-            "--dependency" => { if i + 1 < args.len() { deps.push(args[i + 1].clone()); i += 1; } }
-            "--smoke-arg" => { if i + 1 < args.len() { smoke_args.push(args[i + 1].clone()); i += 1; } }
-            arg if !arg.starts_with("--") && target.is_none() => { target = Some(arg.to_string()); }
-            _ => {}
+            "--name" => { if i + 1 < args.len() { name = Some(args[i + 1].clone()); i += 1; } else { problems.push("Flag '--name' requires a value".to_string()); } }
+            "--version" => { if i + 1 < args.len() { version = Some(args[i + 1].clone()); i += 1; } else { problems.push("Flag '--version' requires a value".to_string()); } }
+            "--entry" => { if i + 1 < args.len() { entry = Some(args[i + 1].clone()); i += 1; } else { problems.push("Flag '--entry' requires a value".to_string()); } }
+            "--dependency" => { if i + 1 < args.len() { deps.push(args[i + 1].clone()); i += 1; } else { problems.push("Flag '--dependency' requires a value".to_string()); } }
+            "--smoke-arg" => { if i + 1 < args.len() { smoke_args.push(args[i + 1].clone()); i += 1; } else { problems.push("Flag '--smoke-arg' requires a value".to_string()); } }
+            arg if arg.starts_with("--") => problems.push(format!("Unknown flag '{}'", arg)),
+            arg if target.is_none() => { target = Some(arg.to_string()); }
+            arg => problems.push(format!("Unexpected argument '{}'", arg)),
         }
         i += 1;
     }
 
-    let tgt = target.ok_or_else(|| "Missing target for build".to_string())?;
+    if !problems.is_empty() {
+        return usage_errors(&problems);
+    }
 
+    let tgt = match target {
+        Some(t) => t,
+        None => return usage_error("Missing target for build"),
+    };
     let req_params = json!({
         "action": "build",
         "request": {
@@ -303,14 +378,19 @@ fn handle_build(client: &mut DirectRpcClient, args: &[String]) -> Result<i32, St
 
     let exec_res = client.call("v1.execute", json!({ "plan_id": plan.plan_id, "confirmed": true }))?;
     println!("{}", serde_json::to_string_pretty(&exec_res).unwrap());
-    Ok(0)
+    Ok(exit_code_for_execution(&exec_res))
 }
 
 #[rustfmt::skip]
 fn handle_install(client: &mut DirectRpcClient, args: &[String]) -> Result<i32, String> {
-    let (positional, dry_run, yes, _repo) = parse_flags(args);
+    let mut problems = Vec::new();
+    let (positional, dry_run, yes, _repo) = parse_flags(args, &mut problems);
     if positional.is_empty() {
-        return Err("Missing target for install".to_string());
+        return usage_error("Missing target for install");
+    }
+    report_extra_targets("install", &positional, &mut problems);
+    if !problems.is_empty() {
+        return usage_errors(&problems);
     }
     let target = &positional[0];
 
@@ -326,7 +406,7 @@ fn handle_install(client: &mut DirectRpcClient, args: &[String]) -> Result<i32, 
 
     let plan: Plan = serde_json::from_value(plan_val.clone()).map_err(|e| e.to_string())?;
     if plan.blocked.is_some() {
-        eprintln!("Plan is blocked.");
+        eprintln!("Plan is blocked and cannot be executed.");
         return Ok(3);
     }
 
@@ -343,14 +423,19 @@ fn handle_install(client: &mut DirectRpcClient, args: &[String]) -> Result<i32, 
 
     let exec_res = client.call("v1.execute", json!({ "plan_id": plan.plan_id, "confirmed": true }))?;
     println!("{}", serde_json::to_string_pretty(&exec_res).unwrap());
-    Ok(0)
+    Ok(exit_code_for_execution(&exec_res))
 }
 
 #[rustfmt::skip]
 fn handle_uninstall(client: &mut DirectRpcClient, args: &[String]) -> Result<i32, String> {
-    let (positional, dry_run, yes, _repo) = parse_flags(args);
+    let mut problems = Vec::new();
+    let (positional, dry_run, yes, _repo) = parse_flags(args, &mut problems);
     if positional.is_empty() {
-        return Err("Missing installed package name for uninstall".to_string());
+        return usage_error("Missing installed package name for uninstall");
+    }
+    report_extra_targets("uninstall", &positional, &mut problems);
+    if !problems.is_empty() {
+        return usage_errors(&problems);
     }
     let target = &positional[0];
     let plan_val = client.call("v1.prepare", json!({
@@ -361,7 +446,10 @@ fn handle_uninstall(client: &mut DirectRpcClient, args: &[String]) -> Result<i32
     if dry_run { return Ok(0); }
 
     let plan: Plan = serde_json::from_value(plan_val).map_err(|e| e.to_string())?;
-    if plan.blocked.is_some() { return Ok(3); }
+    if plan.blocked.is_some() {
+        eprintln!("Plan is blocked and cannot be executed.");
+        return Ok(3);
+    }
     if !yes {
         eprint!("Confirm package removal [y/N]? ");
         io::stderr().flush().ok();
@@ -374,7 +462,7 @@ fn handle_uninstall(client: &mut DirectRpcClient, args: &[String]) -> Result<i32
     }
     let result = client.call("v1.execute", json!({ "plan_id": plan.plan_id, "confirmed": true }))?;
     println!("{}", serde_json::to_string_pretty(&result).unwrap());
-    Ok(0)
+    Ok(exit_code_for_execution(&result))
 }
 
 #[rustfmt::skip]
@@ -386,19 +474,28 @@ fn handle_test(client: &mut DirectRpcClient, args: &[String]) -> Result<i32, Str
     let mut yes = false;
 
     let mut i = 0;
+    let mut problems: Vec<String> = Vec::new();
     while i < args.len() {
         match args[i].as_str() {
             "--dry-run" => dry_run = true,
             "--yes" | "-y" => yes = true,
-            "--entry" => { if i + 1 < args.len() { entry = Some(args[i + 1].clone()); i += 1; } }
-            "--smoke-arg" => { if i + 1 < args.len() { smoke_args.push(args[i + 1].clone()); i += 1; } }
-            arg if !arg.starts_with("--") && pkg_path.is_none() => { pkg_path = Some(arg.to_string()); }
-            _ => {}
+            "--entry" => { if i + 1 < args.len() { entry = Some(args[i + 1].clone()); i += 1; } else { problems.push("Flag '--entry' requires a value".to_string()); } }
+            "--smoke-arg" => { if i + 1 < args.len() { smoke_args.push(args[i + 1].clone()); i += 1; } else { problems.push("Flag '--smoke-arg' requires a value".to_string()); } }
+            arg if arg.starts_with("--") => problems.push(format!("Unknown flag '{}'", arg)),
+            arg if pkg_path.is_none() => { pkg_path = Some(arg.to_string()); }
+            arg => problems.push(format!("Unexpected argument '{}'", arg)),
         }
         i += 1;
     }
 
-    let pkg = pkg_path.ok_or_else(|| "Missing package file for test".to_string())?;
+    if !problems.is_empty() {
+        return usage_errors(&problems);
+    }
+
+    let pkg = match pkg_path {
+        Some(p) => p,
+        None => return usage_error("Missing package file for test"),
+    };
 
     let req_params = json!({
         "action": "test",
@@ -416,6 +513,12 @@ fn handle_test(client: &mut DirectRpcClient, args: &[String]) -> Result<i32, Str
 
     if dry_run { return Ok(0); }
 
+    let plan: Plan = serde_json::from_value(plan_val).map_err(|e| e.to_string())?;
+    if plan.blocked.is_some() {
+        eprintln!("Plan is blocked and cannot be executed.");
+        return Ok(3);
+    }
+
     if !yes {
         eprint!("Confirm test execution [y/N]? ");
         io::stderr().flush().ok();
@@ -427,8 +530,7 @@ fn handle_test(client: &mut DirectRpcClient, args: &[String]) -> Result<i32, Str
         }
     }
 
-    let plan: Plan = serde_json::from_value(plan_val).map_err(|e| e.to_string())?;
     let exec_res = client.call("v1.execute", json!({ "plan_id": plan.plan_id, "confirmed": true }))?;
     println!("{}", serde_json::to_string_pretty(&exec_res).unwrap());
-    Ok(0)
+    Ok(exit_code_for_execution(&exec_res))
 }

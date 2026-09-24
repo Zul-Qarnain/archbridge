@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Config {
@@ -23,6 +23,12 @@ pub struct Config {
 
     #[serde(default)]
     pub repos: BTreeMap<String, String>,
+
+    /// File this config was read from and must be written back to. Not part of
+    /// the payload: it lets a test or a sandboxed run point preferences at a
+    /// temporary path instead of the real `~/.config/archbridge/config.json`.
+    #[serde(skip, default = "Config::config_path")]
+    pub path: PathBuf,
 }
 
 fn default_true() -> bool {
@@ -40,6 +46,7 @@ impl Default for Config {
             deb: true,
             rpm: true,
             repos: BTreeMap::new(),
+            path: Self::config_path(),
         }
     }
 }
@@ -61,26 +68,33 @@ impl Config {
     }
 
     pub fn load() -> Result<Self, String> {
-        let path = Self::config_path();
+        Self::load_from(&Self::config_path())
+    }
+
+    pub fn load_from(path: &Path) -> Result<Self, String> {
         if !path.exists() {
-            return Ok(Self::default());
+            return Ok(Self {
+                path: path.to_path_buf(),
+                ..Self::default()
+            });
         }
-        let content = fs::read_to_string(&path)
+        let content = fs::read_to_string(path)
             .map_err(|e| format!("Failed to read config file '{:?}': {}", path, e))?;
-        let config: Config = serde_json::from_str(&content)
+        let mut config: Config = serde_json::from_str(&content)
             .map_err(|e| format!("Invalid config file format in '{:?}': {}", path, e))?;
+        config.path = path.to_path_buf();
         Ok(config)
     }
 
     pub fn save(&self) -> Result<(), String> {
-        let path = Self::config_path();
+        let path = &self.path;
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
                 .map_err(|e| format!("Failed to create config directory '{:?}': {}", parent, e))?;
         }
         let content = serde_json::to_string_pretty(self)
             .map_err(|e| format!("Failed to serialize config: {}", e))?;
-        fs::write(&path, content)
+        fs::write(path, content)
             .map_err(|e| format!("Failed to write config file '{:?}': {}", path, e))?;
         Ok(())
     }

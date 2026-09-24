@@ -1,10 +1,12 @@
 use archbridge::doctor::{
-    compute_readiness, evaluate_network_probe_result, run_doctor_with_probe, CheckResult,
-    DEFAULT_NETWORK_ENDPOINT,
+    check_disk_space, check_user_namespaces, compute_readiness, evaluate_network_probe_result,
+    run_doctor_with_probe, CheckResult, DEFAULT_NETWORK_ENDPOINT,
 };
 use archbridge::process::ProcessOutput;
 use archbridge::rpc::{JsonRpcRequest, RpcServer};
 use serde_json::json;
+use std::fs;
+use std::path::Path;
 
 #[test]
 fn test_network_probe_pass_integration() {
@@ -129,4 +131,55 @@ fn test_rpc_doctor_returns_valid_structure() {
         "Status must be pass, unavailable, or fail, got: {}",
         status
     );
+}
+
+/// The disk check used to return a hardcoded "pass" without measuring anything.
+#[test]
+fn test_disk_space_check_measures_instead_of_asserting() {
+    let missing = check_disk_space(Path::new("/archbridge-does-not-exist"));
+    assert_eq!(missing.name, "disk_space");
+    assert_ne!(
+        missing.status, "pass",
+        "an unresolvable path must not report a healthy measurement"
+    );
+
+    let real = check_disk_space(Path::new("/"));
+    assert!(
+        matches!(real.status.as_str(), "pass" | "fail" | "unavailable"),
+        "unexpected status: {}",
+        real.status
+    );
+    if real.status != "unavailable" {
+        assert!(
+            real.message.contains("GiB"),
+            "a measured result must quote the free space: {}",
+            real.message
+        );
+    }
+}
+
+/// The namespaces check used to test for `/proc/self/ns/user`, which exists on
+/// every Linux host even after an administrator disables the feature.
+#[test]
+fn test_namespaces_check_fails_when_sysctls_disable_user_namespaces() {
+    let result = check_user_namespaces();
+    assert_eq!(result.name, "namespaces");
+    assert!(
+        matches!(result.status.as_str(), "pass" | "fail"),
+        "unexpected status: {}",
+        result.status
+    );
+
+    let max = fs::read_to_string("/proc/sys/user/max_user_namespaces")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok());
+    let clone_off = fs::read_to_string("/proc/sys/kernel/unprivileged_userns_clone")
+        .ok()
+        .is_some_and(|v| v.trim() != "1");
+    if max == Some(0) || clone_off {
+        assert_eq!(
+            result.status, "fail",
+            "kernel restrictions on unprivileged user namespaces must be reported"
+        );
+    }
 }

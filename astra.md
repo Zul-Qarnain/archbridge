@@ -103,7 +103,7 @@ Unlike legacy tools that run shell scripts or unpack directly onto the host, Arc
    - The payload is fed into `makechrootpkg` inside a clean chroot to produce a valid, signed, standard Arch Linux `.pkg.tar.zst` package.
 
 ### 2.3 Strict Security & Isolation Invariants
-Enforced by automated source contract tests (`tests/source_contract.py`):
+Enforced by automated source contract tests (`tests/source_contract.rs`):
 - **No Foreign Script Execution**: Maintainer scripts (`preinst`, `postinst`) in `.deb` and `.rpm` files are inspected and reviewed, but **never executed** on the host.
 - **No `ldd` on Untrusted Binaries**: Dynamic library dependencies are inspected via raw ELF header parsing, never by running `ldd` (which can execute code on malicious binaries).
 - **Pinned Bytes**: Package review structures work on cryptographically pinned SHA-256 byte buffers in memory to prevent Time-Of-Check to Time-Of-Use (TOCTOU) exploits.
@@ -122,9 +122,9 @@ Enforced by automated source contract tests (`tests/source_contract.py`):
 - **Rust (2021 Edition)**:
   - Core engine, JSON-RPC daemon, package extraction, recipe generation, chroot build orchestrator, and CLI binary.
   - Chosen for memory safety, performance, concurrency, and zero-runtime dependency distribution.
-- **Python 3 (3.10+)**:
-  - Desktop GUI frontend (`archbridge-gui.py`) using `PyQt6`.
-  - Architectural source contract tests (`tests/source_contract.py`).
+- **GPUI (native Rust)**:
+  - Desktop GUI frontend (`src/gui/`), compiled into the same binary as the engine.
+  - Architectural source contract tests (`tests/source_contract.rs`).
 - **POSIX Shell / Bash**:
   - End-to-end integration acceptance scripts (`tests/acceptance.sh`).
 - **YAML**:
@@ -180,8 +180,7 @@ archbridge/
 │   ├── core.rs                     # Engine plans, DB rejection, Imported recipe tests
 │   ├── doctor.rs                   # Doctor checks, network probe pass/fail/unavailable
 │   ├── foreign_formats.rs          # Safe .deb/.rpm analysis without script execution
-│   └── source_contract.py          # Python AST/source assertions verifying security rules
-├── archbridge-gui.py               # Modern PyQt6 desktop application with package browser
+│   └── source_contract.rs          # Rust source assertions verifying security rules
 ├── Cargo.toml                      # Rust package manifest & release profiles
 ├── Cargo.lock                      # Locked dependency tree
 ├── .gitignore                      # Git exclusion rules
@@ -330,12 +329,7 @@ __pycache__/
                                  v
   +-------------------------------------------------------------+
   | 3. Source Contract Enforcement:                             |
-  |    python3 -m unittest tests/source_contract.py             |
-  +------------------------------|------------------------------+
-                                 v
-  +-------------------------------------------------------------+
-  | 4. GUI Frontend Syntax Check:                               |
-  |    python3 -m py_compile archbridge-gui.py                  |
+  |    cargo test --test source_contract                        |
   +-------------------------------------------------------------+
 ```
 
@@ -349,8 +343,8 @@ __pycache__/
    - `tests/foreign_formats.rs`: Safe `.deb` and `.rpm` inspection without code execution.
    - `tests/cli.rs`: JSON-RPC 2.0 capabilities and configuration get/set commands.
 
-### 6.2 Structural Security Contract Tests (`tests/source_contract.py`)
-Enforces architectural rules via Python AST inspection:
+### 6.2 Structural Security Contract Tests (`tests/source_contract.rs`)
+Enforces architectural rules by reading the crate's own source:
 - Verifies CLI is purely an RPC client, not a direct build runner.
 - Verifies `inspect.rs` never invokes `sh`, `bash`, `ldd`, or `Command::new`.
 - Verifies smoke tests have mandatory isolation flags (`--private-users=pick`, `--private-network`, `--user 65534`).
@@ -361,11 +355,8 @@ Enforces architectural rules via Python AST inspection:
 - Runs on `ubuntu-latest`.
 - Steps executed:
   1. Installs stable Rust toolchain with `rustfmt`.
-  2. Sets up Python 3.x.
-  3. `cargo fmt --check`
-  4. `cargo test`
-  5. `python3 -m py_compile archbridge-gui.py`
-  6. `python3 -m unittest tests/source_contract.py`
+  2. `cargo fmt --check`
+  3. `cargo test`
 - **Current Status**: **Passing 100% Green**.
 
 ---
@@ -381,6 +372,6 @@ Enforces architectural rules via Python AST inspection:
 4. **Zero Heavy Container Overhead**:
    - Fully replaced Docker/Podman requirements with native Arch Linux `devtools` (`mkarchroot` / `makechrootpkg`) and `systemd-nspawn`.
 5. **Modern Desktop GUI & High-Performance CLI**:
-   - Desktop GUI in Python/PyQt6 with file browser for `.deb`/`.rpm`, "Import & Build" workflow, animated progress indicators, multi-stage status tracking, and direct `pacman -U` installation.
+   - Desktop GUI in native Rust (GPUI) with file browser for `.deb`/`.rpm`, "Import & Build" workflow, animated progress indicators, multi-stage status tracking, and direct `pacman -U` installation.
 6. **Open Source & CI Certified**:
    - Published on GitHub with an automated CI pipeline passing all tests on every commit.

@@ -1,4 +1,4 @@
-use crate::archive::{FileReview, SourceSnapshot};
+use crate::archive::{walk_tree, FileReview, SourceSnapshot};
 use crate::process::{run_step, run_step_in_dir, Step};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -30,6 +30,7 @@ pub fn snapshot_foreign_package(path: &Path) -> Result<SourceSnapshot, String> {
     }
 
     let temp_dir = TempDir::new().map_err(|e| format!("Failed to create import workspace: {e}"))?;
+    let payload_dir = temp_dir.path().join("payload");
 
     let (tarball_path, _tarball_name) = if name.ends_with(".deb") {
         let step_ar = Step::new(
@@ -65,7 +66,6 @@ pub fn snapshot_foreign_package(path: &Path) -> Result<SourceSnapshot, String> {
             )
         })?
     } else {
-        let payload_dir = temp_dir.path().join("payload");
         fs::create_dir_all(&payload_dir).map_err(|e| e.to_string())?;
         let step_ext = Step::new(
             "bsdtar",
@@ -113,34 +113,34 @@ pub fn snapshot_foreign_package(path: &Path) -> Result<SourceSnapshot, String> {
     hasher.update(&tarball_bytes);
     let sha256_hash = format!("{:x}", hasher.finalize());
 
-    let mut reviews = Vec::new();
-    let step_list = Step::new(
-        "bsdtar",
-        vec!["-tvf".to_string(), tarball_path.display().to_string()],
-        "List payload archive contents",
-        30,
-    );
-    if let Ok(out) = run_step(&step_list, None) {
-        for line in out.stdout.lines() {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() >= 6 {
-                let mode_str = parts[0];
-                let is_exec = mode_str.contains('x');
-                let size = parts[4].parse::<u64>().unwrap_or(0);
-                let path_str = parts[5..].join(" ");
-                let mut h = Sha256::new();
-                h.update(path_str.as_bytes());
-                let p_hash = format!("{:x}", h.finalize());
-                reviews.push(FileReview {
-                    path: path_str,
-                    sha256: p_hash,
-                    bytes: size,
-                    executable: is_exec,
-                    content: None,
-                });
-            }
+    // The manifest a user reviews has to state real paths, sizes and content
+    // digests. Scraping them out of a `bsdtar -tvf` listing produced file names
+    // with timestamps glued in front, sizes parsed from a date column, and
+    // digests of the name string, which verify nothing at all.
+    if name.ends_with(".deb") {
+        fs::create_dir_all(&payload_dir).map_err(|e| e.to_string())?;
+        let step_unpack = Step::new(
+            "bsdtar",
+            vec![
+                "-xf".to_string(),
+                tarball_path.display().to_string(),
+                "-C".to_string(),
+                payload_dir.display().to_string(),
+            ],
+            "Unpack foreign payload for review",
+            120,
+        );
+        let out =
+            run_step(&step_unpack, None).map_err(|e| format!("bsdtar execution failed: {e}"))?;
+        if out.exit_code != 0 {
+            return Err(format!(
+                "Failed to unpack payload of '{}': {}",
+                path.display(),
+                out.stderr
+            ));
         }
     }
+    let reviews = walk_tree(&payload_dir)?;
 
     Ok(SourceSnapshot {
         tarball_bytes,
@@ -163,34 +163,105 @@ pub struct SmokeTestReport {
     pub stderr: String,
 }
 
-pub fn package_files(bytes: &[u8]) -> Result<Vec<FileReview>, String> {
-    let mut reviews = Vec::new();
-    let gz_decoder = flate2::read::GzDecoder::new(bytes);
-    let mut archive = tar::Archive::new(gz_decoder);
-
-    if let Ok(entries) = archive.entries() {
-        for entry_res in entries.flatten() {
-            let path_str = entry_res
-                .path()
-                .map_or("unknown".to_string(), |p| p.to_string_lossy().to_string());
-            let size = entry_res.header().size().unwrap_or(0);
-            let mode = entry_res.header().mode().unwrap_or(0);
-            let is_exec = (mode & 0o111) != 0;
-
-            let mut hasher = Sha256::new();
-            hasher.update(path_str.as_bytes());
-            let sha256 = format!("{:x}", hasher.finalize());
-
-            reviews.push(FileReview {
-                path: path_str,
-                sha256,
-                bytes: size,
-                executable: is_exec,
-                content: None,
-            });
-        }
+/// Unpack an Arch package into `dest` with the system `bsdtar`, which handles
+/// whatever compression the artifact uses.
+fn unpack_to(pkg: &Path, dest: &Path, purpose: &str) -> Result<(), String> {
+    let step = Step::new(
+        "bsdtar",
+        vec![
+            "-xf".to_string(),
+            pkg.display().to_string(),
+            "-C".to_string(),
+            dest.display().to_string(),
+        ],
+        purpose,
+        120,
+    );
+    let out = run_step(&step, None).map_err(|e| format!("bsdtar execution failed: {e}"))?;
+    if out.exit_code != 0 {
+        return Err(format!(
+            "Failed to unpack '{}': {}",
+            pkg.display(),
+            out.stderr.trim()
+        ));
     }
-    Ok(reviews)
+    Ok(())
+}
+
+/// The files a built package contains, each hashed over its own bytes.
+pub fn package_files(bytes: &[u8]) -> Result<Vec<FileReview>, String> {
+    let temp_dir = TempDir::new().map_err(|e| format!("Failed to create review workspace: {e}"))?;
+    let staged = temp_dir.path().join("package.pkg");
+    fs::write(&staged, bytes).map_err(|e| format!("Failed to stage package bytes: {e}"))?;
+    let root = temp_dir.path().join("root");
+    fs::create_dir_all(&root).map_err(|e| e.to_string())?;
+    unpack_to(&staged, &root, "Unpack built package for review")?;
+    walk_tree(&root)
+}
+
+/// Map the entry binary a plan names onto the path the container will exec.
+pub fn resolve_entry(reviews: &[FileReview], entry: &str) -> Result<String, String> {
+    let mut paths: Vec<&String> = reviews
+        .iter()
+        .filter(|review| {
+            Path::new(&review.path)
+                .file_name()
+                .map(|name| name == entry)
+                .unwrap_or(false)
+        })
+        .map(|review| &review.path)
+        .collect();
+    paths.sort_by_key(|path| (!path.starts_with("usr/bin/"), path.split('/').count()));
+    paths
+        .first()
+        .map(|path| format!("/{}", path))
+        .ok_or_else(|| {
+            let shipped: Vec<&str> = reviews
+                .iter()
+                .filter(|review| review.path.starts_with("usr/bin/"))
+                .map(|review| review.path.as_str())
+                .take(8)
+                .collect();
+            format!(
+                "Entry binary '{}' is not part of the built package (it ships {:?})",
+                entry, shipped
+            )
+        })
+}
+
+/// The staged source payload lives in the same directory as the build output and
+/// can itself be zstd-compressed, so only a real `.pkg.tar.*` archive counts as
+/// an artifact. Picking the freshest match avoids returning one from an earlier run.
+/// The path is absolute because the plan that consumes it may be reviewed later.
+/// Append one phase of toolchain output to the job's build log. Logging is
+/// best-effort: a failure to write must not fail an otherwise good build.
+fn write_build_log(job_dir: &Path, phase: &str, log: &str) {
+    let path = job_dir.join("build.log");
+    let mut text = fs::read_to_string(&path).unwrap_or_default();
+    text.push_str(&format!("==> {phase}\n{log}\n\n"));
+    let _ = fs::write(&path, text);
+}
+
+fn find_built_package(dir: &Path) -> Option<PathBuf> {
+    let mut matches: Vec<(std::time::SystemTime, PathBuf)> = fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .map(|name| name.to_string_lossy().contains(".pkg.tar."))
+                .unwrap_or(false)
+        })
+        .filter_map(|path| {
+            let modified = path.metadata().and_then(|m| m.modified()).ok()?;
+            Some((modified, path))
+        })
+        .collect();
+    matches.sort_by(|a, b| b.0.cmp(&a.0));
+    matches
+        .into_iter()
+        .next()
+        .map(|(_, path)| fs::canonicalize(&path).unwrap_or(path))
 }
 
 pub fn execute_chroot_build(
@@ -219,20 +290,26 @@ pub fn execute_chroot_build(
         "makepkg",
         vec!["--force".to_string(), "--clean".to_string()],
         "Build package with native makepkg",
-        300,
+        900,
     );
-    let _ = run_step_in_dir(&makepkg_step, None, Some(job_dir));
+    let native = run_step_in_dir(&makepkg_step, None, Some(job_dir));
 
-    if let Ok(entries) = fs::read_dir(job_dir) {
-        for entry in entries.flatten() {
-            let p = entry.path();
-            if let Some(ext) = p.extension() {
-                if ext == "zst" || p.to_string_lossy().contains(".pkg.tar.") {
-                    return Ok(p);
-                }
-            }
-        }
+    // A native build needs no privilege at all, so keep its diagnostics: they
+    // explain the failure when the privileged chroot fallback also gives up.
+    let native_log = match native {
+        Ok(out) => format!("{}{}", out.stdout, out.stderr),
+        Err(err) => err,
+    };
+    // The caller only ever sees the last error string, and a UI can lose even
+    // that, so the toolchain output stays on disk next to the PKGBUILD.
+    write_build_log(job_dir, "native makepkg", &native_log);
+
+    if let Some(artifact) = find_built_package(job_dir) {
+        return Ok(artifact);
     }
+
+    // Native build failed: the chroot fallback needs two more steps.
+    crate::process::set_phase_total(3);
 
     // 2. Fallback: clean chroot build with mkarchroot and makechrootpkg
     let chroot_dir = job_dir.join("chroot");
@@ -259,16 +336,26 @@ pub fn execute_chroot_build(
             "base-devel".to_string(),
             "sudo".to_string(),
         ],
-        "Initialize clean chroot root",
-        180,
+        "Initialize clean chroot environment (fallback)",
+        900,
     );
 
     let mkchroot_result = run_step(&mkchroot_step, None)
         .map_err(|e| format!("Clean chroot initialization failed: {e}"))?;
     if mkchroot_result.exit_code != 0 {
+        let chroot_log = format!("{}{}", mkchroot_result.stdout, mkchroot_result.stderr);
+        write_build_log(job_dir, "mkarchroot", &chroot_log);
+        let needs_auth = chroot_log.contains("password is required");
         return Err(format!(
-            "Clean chroot initialization failed: {}{}",
-            mkchroot_result.stdout, mkchroot_result.stderr
+            "Clean chroot initialization failed: {}{}\
+             \n\nNative (unprivileged) build attempted first and did not produce a package:\n{}",
+            if needs_auth {
+                "No cached administrator credential — authorize the build and retry. "
+            } else {
+                ""
+            },
+            chroot_log.trim(),
+            native_log.trim()
         ));
     }
 
@@ -287,36 +374,29 @@ pub fn execute_chroot_build(
             "--clean".to_string(),
             "--force".to_string(),
         ],
-        "Build package inside clean chroot",
-        600,
+        "Build package inside clean chroot (fallback)",
+        1200,
     );
 
     let res = run_step_in_dir(&makechroot_step, None, Some(job_dir));
 
-    let mut artifact = None;
-    if let Ok(entries) = fs::read_dir(job_dir) {
-        for entry in entries.flatten() {
-            let p = entry.path();
-            if let Some(ext) = p.extension() {
-                if ext == "zst" || p.to_string_lossy().contains(".pkg.tar.") {
-                    artifact = Some(p);
-                    break;
-                }
-            }
-        }
+    if let Some(artifact) = find_built_package(job_dir) {
+        return Ok(artifact);
     }
 
-    if let Some(art) = artifact {
-        Ok(art)
-    } else {
-        let err_msg = res.map_or("Build failed with no output".to_string(), |o| {
-            format!("Build output: {}\n{}", o.stdout, o.stderr)
-        });
-        Err(format!(
-            "Package build failed to produce artifact. {}",
-            err_msg
-        ))
-    }
+    // A step that could not be run at all (timeout, missing binary) carries its
+    // own reason; dropping it in favour of a generic string made every chroot
+    // failure read as "no output".
+    let err_msg = match res {
+        Ok(o) => format!("Build output: {}\n{}", o.stdout, o.stderr),
+        Err(e) => e,
+    };
+    write_build_log(job_dir, "makechrootpkg", &err_msg);
+    Err(format!(
+        "Package build failed to produce a .pkg.tar.* artifact. {}\n\nNative (unprivileged) build output:\n{}",
+        err_msg,
+        native_log.trim()
+    ))
 }
 
 pub fn run_runtime_smoke_test(
@@ -325,16 +405,45 @@ pub fn run_runtime_smoke_test(
     smoke_args: &[String],
 ) -> Result<SmokeTestReport, String> {
     if !pkg_path.exists() {
-        return Err(format!("Package artifact not found at '{:?}'", pkg_path));
+        return Err(format!(
+            "Package artifact not found at {}",
+            pkg_path.display()
+        ));
     }
-
-    let bytes =
-        fs::read(pkg_path).map_err(|e| format!("Failed to read package artifact: {}", e))?;
-    let _file_reviews = package_files(&bytes)?;
 
     let temp_dir = TempDir::new().map_err(|e| format!("Failed to create temp test root: {}", e))?;
     let test_root = temp_dir.path().join("test_root");
     fs::create_dir_all(&test_root).map_err(|e| e.to_string())?;
+    // A root that holds nothing can never start the binary under test, so the
+    // package is installed into it and the entry point is resolved to the path
+    // the container will actually exec.
+    unpack_to(
+        pkg_path,
+        &test_root,
+        "Install package into isolated test root",
+    )?;
+    let reviews = walk_tree(&test_root)?;
+    let program = resolve_entry(&reviews, entry_point)?;
+    if !reviews.iter().any(|review| {
+        review.path.starts_with("usr/lib/ld-linux") || review.path.starts_with("lib/ld-linux")
+    }) {
+        // The test root is this package alone: no dynamic loader, no system
+        // libraries. Running the binary would fail for reasons that say nothing
+        // about the package, so the finding is reported instead.
+        return Ok(SmokeTestReport {
+            passed: false,
+            entry_point: program,
+            exit_code: -1,
+            stdout: String::new(),
+            stderr: format!(
+                "The isolated test root contains only '{}' and its own files, so the dynamic \
+                 loader and system libraries '{}' needs are absent. Install the package, or run \
+                 the smoke test inside a full Arch root, to check runtime behaviour.",
+                pkg_path.display(),
+                entry_point
+            ),
+        });
+    }
 
     let mut smoke = SmokeConfig { timeout_seconds: 0 };
     smoke.timeout_seconds = 30;
@@ -346,7 +455,7 @@ pub fn run_runtime_smoke_test(
         "65534".to_string(),
         "-D".to_string(),
         test_root.to_str().unwrap().to_string(),
-        entry_point.to_string(),
+        program.clone(),
     ];
 
     if smoke_args.is_empty() {
@@ -365,14 +474,14 @@ pub fn run_runtime_smoke_test(
     match run_step(&step, None) {
         Ok(out) => Ok(SmokeTestReport {
             passed: out.exit_code == 0,
-            entry_point: entry_point.to_string(),
+            entry_point: program.clone(),
             exit_code: out.exit_code,
             stdout: out.stdout,
             stderr: out.stderr,
         }),
         Err(e) => Ok(SmokeTestReport {
             passed: false,
-            entry_point: entry_point.to_string(),
+            entry_point: program.clone(),
             exit_code: -1,
             stdout: String::new(),
             stderr: format!("Runtime test execution failed: {}", e),

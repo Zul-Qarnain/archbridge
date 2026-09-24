@@ -17,8 +17,6 @@ mutations, and foreign maintainer scripts are never executed.
 cargo fmt --check
 cargo build
 XDG_CONFIG_HOME=$(mktemp -d) cargo test
-python3 -m py_compile archbridge-gui.py
-python3 -m unittest tests/source_contract.py
 ```
 
 Run `target/debug/archbridge doctor` before Arch-specific work. Use a disposable
