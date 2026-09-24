@@ -385,6 +385,19 @@ fn the_smoke_test_runs_the_path_the_container_will_actually_exec() {
 
 #[test]
 fn a_foreign_snapshot_reports_paths_sizes_and_content_digests() {
+    // The fixture needs the same archive tools the inspector uses. A runner
+    // without them (CI images ship no bsdtar) has to skip, not fail.
+    let tool = ["bsdtar", "ar"].into_iter().find(|program| {
+        std::process::Command::new(program)
+            .arg("--version")
+            .output()
+            .is_err()
+    });
+    if let Some(missing) = tool {
+        eprintln!("{missing} is unavailable; skipping");
+        return;
+    }
+
     let deb_dir = TempDir::new().unwrap();
     fs::create_dir_all(deb_dir.path().join("usr/bin")).unwrap();
     let launcher = deb_dir.path().join("usr/bin/demo");
