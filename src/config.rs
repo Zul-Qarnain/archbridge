@@ -24,6 +24,12 @@ pub struct Config {
     #[serde(default)]
     pub repos: BTreeMap<String, String>,
 
+    /// Where finished build artifacts are copied. Empty keeps the default: the
+    /// per-job build directory. An absolute path only, so a build run from a
+    /// different working directory cannot scatter artifacts around the disk.
+    #[serde(default)]
+    pub output_dir: String,
+
     /// File this config was read from and must be written back to. Not part of
     /// the payload: it lets a test or a sandboxed run point preferences at a
     /// temporary path instead of the real `~/.config/archbridge/config.json`.
@@ -46,6 +52,7 @@ impl Default for Config {
             deb: true,
             rpm: true,
             repos: BTreeMap::new(),
+            output_dir: String::new(),
             path: Self::config_path(),
         }
     }
@@ -108,6 +115,7 @@ impl Config {
             "upstream" => Ok(serde_json::Value::Bool(self.upstream)),
             "deb" => Ok(serde_json::Value::Bool(self.deb)),
             "rpm" => Ok(serde_json::Value::Bool(self.rpm)),
+            "output_dir" => Ok(serde_json::Value::String(self.output_dir.clone())),
             "all" => Ok(serde_json::to_value(self).unwrap_or_default()),
             k if k.starts_with("repo.") => {
                 let repo_name = &k[5..];
@@ -130,6 +138,15 @@ impl Config {
             "upstream" => self.upstream = parse_bool(value)?,
             "deb" => self.deb = parse_bool(value)?,
             "rpm" => self.rpm = parse_bool(value)?,
+            "output_dir" => {
+                let dir = value.trim();
+                if !dir.is_empty() && !Path::new(dir).is_absolute() {
+                    return Err(format!(
+                        "Output directory must be an absolute path, got '{dir}'"
+                    ));
+                }
+                self.output_dir = dir.to_string();
+            }
             k if k.starts_with("repo.") => {
                 let repo_name = &k[5..];
                 if repo_name.is_empty() {

@@ -1097,6 +1097,10 @@ impl Engine {
                         Ok(absolute) => absolute,
                         Err(_) => art_path,
                     };
+                    let art_path =
+                        publish_artifact(&art_path, &self.config.output_dir).map_err(|e| {
+                            format!("{e}; the build itself succeeded at {}", art_path.display())
+                        })?;
 
                     if staged.run_smoke_test {
                         bump_phase_total(1);
@@ -1243,6 +1247,45 @@ fn blocked_build_plan(target: &str, reviews: Vec<FileReview>, reason: String) ->
         downstream: None,
         blocked: Some(reason),
     }
+}
+
+/// Copy a finished artifact into the user's configured output directory.
+/// An empty setting leaves the artifact in the job directory that built it.
+/// The copy is re-hashed before it is trusted, so the install plan can only
+/// ever point at the bytes the build produced.
+pub fn publish_artifact(artifact: &Path, output_dir: &str) -> Result<PathBuf, String> {
+    let dir = output_dir.trim();
+    if dir.is_empty() {
+        return Ok(artifact.to_path_buf());
+    }
+    let name = artifact
+        .file_name()
+        .ok_or_else(|| "Build artifact has no file name to publish".to_string())?;
+    let dest = Path::new(dir).join(name);
+    if dest == artifact {
+        return Ok(artifact.to_path_buf());
+    }
+    fs::create_dir_all(dir).map_err(|e| format!("Cannot create output directory '{dir}': {e}"))?;
+    fs::copy(artifact, &dest).map_err(|e| {
+        format!(
+            "Cannot copy the artifact to '{dir}': {e}",
+            dir = dest.display()
+        )
+    })?;
+    let source_hash = sha256_file(artifact)?;
+    let copy_hash = sha256_file(&dest)?;
+    if source_hash != copy_hash {
+        return Err(format!(
+            "Published artifact '{}' does not match the bytes the build produced",
+            dest.display()
+        ));
+    }
+    Ok(dest.canonicalize().unwrap_or(dest))
+}
+
+fn sha256_file(path: &Path) -> Result<String, String> {
+    let bytes = fs::read(path).map_err(|e| format!("Cannot read '{}': {}", path.display(), e))?;
+    Ok(format!("{:x}", Sha256::digest(&bytes)))
 }
 
 fn generate_plan_id(action: &str, target: &str) -> String {

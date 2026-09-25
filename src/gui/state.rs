@@ -1,7 +1,9 @@
 use crate::engine::{ExecutionResult, Plan};
+use crate::inspect::InspectionReport;
 use crate::process::ProgressSnapshot;
 use crate::rpc::{JsonRpcRequest, RpcServer};
 use serde_json::{json, Value};
+use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -24,6 +26,15 @@ pub enum ActiveTab {
     Uninstall,
     Doctor,
     Settings,
+}
+
+/// Which engine operation the next native path-chooser result belongs to. The
+/// XDG portal answers asynchronously, so the picker cannot return a value to
+/// the caller and has to be routed when it lands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathPrompt {
+    BuildTarget,
+    OutputDir,
 }
 
 /// Which text field currently owns keyboard focus.
@@ -95,6 +106,8 @@ pub struct HealthCheck {
 pub struct AppState {
     // ──────────────────── navigation ────────────────────
     pub active_tab: ActiveTab,
+    /// Set when a native path chooser is opened, cleared when its result lands.
+    pub path_prompt: Option<PathPrompt>,
 
     // ──────────────────── top status bar ────────────────
     pub search_history: Vec<String>,
@@ -116,7 +129,10 @@ pub struct AppState {
 
     // ──────────────────── inspect ───────────────────────
     pub inspect_path: String,
-    pub inspect_data: Option<Value>,
+    /// Parsed once when the engine answers, not on every repaint: the report
+    /// carries every maintainer script body, and re-reading it per frame is what
+    /// made this tab stutter.
+    pub inspect_report: Option<Rc<InspectionReport>>,
     pub inspect_active_subtab: usize, // 0: Scripts, 1: Deps, 2: Desktop & Units, 3: ELF Libs
     pub inspect_busy: bool,
     pub inspect_msg: Option<StatusMsg>,
@@ -165,6 +181,11 @@ pub struct AppState {
     pub opt_deb: bool,
     pub opt_rpm: bool,
     pub opt_remember_sudo: bool,
+    /// The output folder shown in the UI. It is written through the engine the
+    /// moment the user picks it, so it never sits unsaved next to the build.
+    pub opt_output_dir: String,
+    /// True while a chosen output folder is being written through the engine.
+    pub output_dir_saving: bool,
     pub settings_msg: Option<StatusMsg>,
 
     // ──────────────────── auth ──────────────────────────
@@ -192,6 +213,7 @@ impl Default for AppState {
     fn default() -> Self {
         Self {
             active_tab: ActiveTab::Discover,
+            path_prompt: None,
             search_history: Vec::new(),
             show_history_menu: false,
             doctor_ready: false,
@@ -210,7 +232,7 @@ impl Default for AppState {
             search_msg: None,
 
             inspect_path: "".into(),
-            inspect_data: None,
+            inspect_report: None,
             inspect_active_subtab: 0,
             inspect_busy: false,
             inspect_msg: None,
@@ -251,6 +273,8 @@ impl Default for AppState {
             opt_deb: true,
             opt_rpm: true,
             opt_remember_sudo: true,
+            opt_output_dir: String::new(),
+            output_dir_saving: false,
             settings_msg: None,
 
             auth_dialog_open: false,
@@ -306,8 +330,26 @@ impl AppState {
         read("upstream", &mut self.opt_upstream);
         read("deb", &mut self.opt_deb);
         read("rpm", &mut self.opt_rpm);
+        if let Some(dir) = config.get("output_dir").and_then(|v| v.as_str()) {
+            self.opt_output_dir = dir.to_string();
+        }
         self.config_data = Some(config.clone());
         self.settings_dirty = false;
+    }
+
+    /// The output directory currently on disk.
+    pub fn saved_output_dir(&self) -> &str {
+        self.config_data
+            .as_ref()
+            .and_then(|c| c.get("output_dir"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+    }
+
+    /// True while either the source toggles differ from what is on disk. The
+    /// output folder is not part of this: it saves the moment it is picked.
+    pub fn settings_unsaved(&self) -> bool {
+        self.settings_dirty
     }
 
     /// True while any engine-backed operation is running.
@@ -318,6 +360,7 @@ impl AppState {
             || self.uninstall_busy
             || self.doctor_busy
             || self.settings_busy
+            || self.output_dir_saving
     }
 
     /// True when the 400 ms UI ticker must keep running (busy animations,

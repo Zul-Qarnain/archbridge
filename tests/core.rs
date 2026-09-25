@@ -1,7 +1,7 @@
 use archbridge::archive::FileReview;
 use archbridge::build::{resolve_entry, snapshot_foreign_package};
 use archbridge::config::Config;
-use archbridge::engine::{foreign_entry, Engine};
+use archbridge::engine::{foreign_entry, publish_artifact, Engine};
 use archbridge::recipe::{
     detect_build_system, detect_build_system_in_archive, generate_pkgbuild, sanitize_entry_name,
     BuildSystem, PkgbuildParams,
@@ -26,6 +26,71 @@ fn test_config_defaults_and_toggle() {
     assert_eq!(
         config.get("repo.mytool").unwrap(),
         serde_json::Value::String("https://github.com/owner/repo".to_string())
+    );
+}
+
+#[test]
+fn an_output_folder_receives_the_exact_bytes_the_build_produced() {
+    let temp = TempDir::new().unwrap();
+    let job_dir = temp.path().join("job");
+    let out_dir = temp.path().join("out");
+    fs::create_dir_all(&job_dir).unwrap();
+    let artifact = job_dir.join("demo-1.0.0-1-x86_64.pkg.tar.zst");
+    fs::write(&artifact, b"reviewed package bytes").unwrap();
+
+    let published = publish_artifact(&artifact, &out_dir.to_string_lossy()).unwrap();
+    assert_eq!(
+        published.parent().map(|p| p.canonicalize().unwrap()),
+        Some(out_dir.canonicalize().unwrap()),
+        "the artifact has to land in the folder the user chose"
+    );
+    assert_eq!(
+        fs::read(&published).unwrap(),
+        b"reviewed package bytes",
+        "the published copy must be byte-identical"
+    );
+    assert_eq!(
+        published
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned()),
+        Some("demo-1.0.0-1-x86_64.pkg.tar.zst".to_string()),
+        "the package file name has to survive the copy"
+    );
+    assert!(
+        artifact.is_file(),
+        "publishing copies: the job directory keeps what the build wrote"
+    );
+}
+
+#[test]
+fn an_unset_output_folder_leaves_the_artifact_where_it_was_built() {
+    let temp = TempDir::new().unwrap();
+    let artifact = temp.path().join("demo.pkg.tar.zst");
+    fs::write(&artifact, b"bytes").unwrap();
+
+    for unset in ["", "   "] {
+        assert_eq!(
+            publish_artifact(&artifact, unset).unwrap(),
+            artifact,
+            "no folder chosen means no copy"
+        );
+    }
+}
+
+#[test]
+fn a_relative_output_directory_is_refused_before_it_scatters_artifacts() {
+    let mut config = Config::default();
+    let error = config
+        .set("output_dir", "builds/here")
+        .expect_err("a relative folder resolves against whatever directory the build ran from");
+    assert!(error.contains("absolute path"), "{error}");
+
+    config
+        .set("output_dir", "")
+        .expect("empty is the documented default");
+    assert_eq!(
+        config.get("output_dir").unwrap(),
+        serde_json::Value::String(String::new())
     );
 }
 

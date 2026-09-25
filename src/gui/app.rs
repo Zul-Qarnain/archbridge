@@ -1,12 +1,13 @@
 use crate::gui::state::{
     rpc_call, ActiveTab, AppState, AppTheme, HealthCheck, InputField, InstalledPackage, MsgLevel,
-    SearchResult, SharedEngine, StatusMsg,
+    PathPrompt, SearchResult, SharedEngine, StatusMsg,
 };
 use crate::gui::theme::*;
 use crate::process::{format_elapsed, progress_snapshot, run_step, Step};
 use gpui::prelude::*;
 use gpui::*;
 use serde_json::{json, Value};
+use std::rc::Rc;
 use std::time::Duration;
 
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -209,18 +210,18 @@ impl ArchBridgeApp {
         );
     }
 
-    /// Persist every toggled source through the engine, which is the only
+    /// Persist every changed preference through the engine, which is the only
     /// writer of config.json. Reporting success without calling the engine is
     /// how this card previously lied.
     pub fn save_preferences(&mut self, cx: &mut Context<Self>) {
         if self.state.settings_busy {
             return;
         }
-        let changes: Vec<(&'static str, String)> = self
+        let changes: Vec<(String, String)> = self
             .state
             .source_preferences()
             .into_iter()
-            .map(|(key, value)| (key, value.to_string()))
+            .map(|(key, value)| (key.to_string(), value.to_string()))
             .collect();
         self.state.settings_busy = true;
         self.state.settings_msg = None;
@@ -283,10 +284,7 @@ impl ArchBridgeApp {
                 app.state.settings_msg = Some(if failures.is_empty() {
                     StatusMsg {
                         level: MsgLevel::Success,
-                        text: format!(
-                            "Saved {count} source preference(s) to {}.",
-                            config_path.display()
-                        ),
+                        text: format!("Saved {count} preference(s) to {}.", config_path.display()),
                     }
                 } else {
                     StatusMsg {
@@ -304,6 +302,123 @@ impl ArchBridgeApp {
             .ok();
         })
         .detach();
+    }
+
+    /// Save the build output folder where it is chosen, instead of leaving it
+    /// unsaved until the user finds a Save button on another page. The engine is
+    /// config.json's only writer, and writing any preference voids the staged
+    /// plans the old value was reviewed under, so a prepared build is reset too.
+    pub fn save_output_dir(&mut self, dir: String, cx: &mut Context<Self>) {
+        if self.state.output_dir_saving {
+            return;
+        }
+        self.state.output_dir_saving = true;
+        self.state.opt_output_dir = dir.clone();
+        self.reset_build_flow("Preparing a fresh plan for the new output folder.");
+        self.state.build_msg = Some(StatusMsg {
+            level: MsgLevel::Info,
+            text: "Saving output folder…".to_string(),
+        });
+        cx.notify();
+        self.rpc_async(
+            "v1.prepare",
+            json!({ "action": "config.set", "key": "output_dir", "value": dir }),
+            |app, result, cx| {
+                let plan_id = match result.and_then(|val| {
+                    val.get("plan_id")
+                        .and_then(|p| p.as_str())
+                        .map(str::to_string)
+                        .ok_or_else(|| "the engine returned no plan id".to_string())
+                }) {
+                    Ok(plan_id) => plan_id,
+                    Err(error) => return app.finish_output_dir_save(Err(error), cx),
+                };
+                app.rpc_async(
+                    "v1.execute",
+                    json!({ "plan_id": plan_id, "confirmed": true }),
+                    |app, result, cx| {
+                        let outcome = result.and_then(|val| {
+                            if val.get("ok").and_then(|o| o.as_bool()).unwrap_or(false) {
+                                Ok(val
+                                    .get("message")
+                                    .and_then(|m| m.as_str())
+                                    .unwrap_or("saved")
+                                    .to_string())
+                            } else {
+                                Err(val
+                                    .get("message")
+                                    .and_then(|m| m.as_str())
+                                    .unwrap_or("the engine rejected the change")
+                                    .to_string())
+                            }
+                        });
+                        app.finish_output_dir_save(outcome, cx);
+                    },
+                    cx,
+                );
+            },
+            cx,
+        );
+    }
+
+    fn finish_output_dir_save(&mut self, outcome: Result<String, String>, cx: &mut Context<Self>) {
+        self.state.output_dir_saving = false;
+        let dir = self.state.opt_output_dir.clone();
+        let msg = match outcome {
+            Ok(_) if dir.trim().is_empty() => StatusMsg {
+                level: MsgLevel::Success,
+                text: "Output folder cleared. Builds stay in their job directory until you \
+                       choose a folder."
+                    .to_string(),
+            },
+            Ok(_) => StatusMsg {
+                level: MsgLevel::Success,
+                text: format!("Finished packages will be saved to {dir}."),
+            },
+            Err(error) => StatusMsg {
+                level: MsgLevel::Error,
+                text: format!("Could not save the output folder: {error}"),
+            },
+        };
+        // The chooser lives on two pages, so the answer has to show on whichever
+        // one the user pressed it from.
+        self.state.settings_msg = Some(StatusMsg {
+            level: msg.level.clone(),
+            text: msg.text.clone(),
+        });
+        self.state.build_msg = Some(msg);
+        self.load_preferences(cx);
+        cx.notify();
+    }
+
+    /// Clear the build page back to its starting state, keeping the typed
+    /// target so the next run needs one edit rather than a retype.
+    fn start_new_build(&mut self, cx: &mut Context<Self>) {
+        self.state.build_stage = 1;
+        self.state.active_plan = None;
+        self.state.build_result = None;
+        self.state.build_log.clear();
+        self.state.build_plan_consumed = false;
+        self.state.install_plan_consumed = false;
+        self.state.build_msg = None;
+        cx.notify();
+    }
+
+    /// Put the build page back to its starting state after the plan it was
+    /// showing can no longer run.
+    fn reset_build_flow(&mut self, note: &str) {
+        if self.state.active_plan.is_none() && self.state.build_stage <= 1 {
+            return;
+        }
+        self.state.active_plan = None;
+        self.state.build_result = None;
+        self.state.build_stage = 1;
+        self.state.build_plan_consumed = false;
+        self.state.install_plan_consumed = false;
+        self.state.build_msg = Some(StatusMsg {
+            level: MsgLevel::Warning,
+            text: format!("The prepared plan was withdrawn: {note}"),
+        });
     }
 
     /// `pacman -Qe` can take a second on a large system, so it runs on a
@@ -564,7 +679,7 @@ impl ArchBridgeApp {
             cx.notify();
             return;
         }
-        self.state.inspect_data = None;
+        self.state.inspect_report = None;
         self.state.inspect_busy = true;
         self.state.inspect_msg = None;
         cx.notify();
@@ -576,12 +691,24 @@ impl ArchBridgeApp {
                 app.state.inspect_busy = false;
                 match result {
                     Ok(val) => {
-                        app.state.inspect_data = Some(val);
-                        app.state.inspect_msg = Some(StatusMsg {
-                            level: MsgLevel::Success,
-                            text: "Foreign package analyzed in data-only mode (EXECUTED: FALSE)"
-                                .to_string(),
-                        });
+                        match serde_json::from_value::<crate::inspect::InspectionReport>(val) {
+                            Ok(report) => {
+                                app.state.inspect_report = Some(Rc::new(report));
+                                app.state.inspect_msg = Some(StatusMsg {
+                                level: MsgLevel::Success,
+                                text: "Foreign package analyzed in data-only mode (EXECUTED: FALSE)"
+                                    .to_string(),
+                            });
+                            }
+                            Err(_) => {
+                                app.state.inspect_msg = Some(StatusMsg {
+                                    level: MsgLevel::Error,
+                                    text: "The inspection response could not be read. Re-run the \
+                                       inspection."
+                                        .to_string(),
+                                });
+                            }
+                        }
                     }
                     Err(e) => {
                         app.state.inspect_msg = Some(StatusMsg {
@@ -767,20 +894,34 @@ impl ArchBridgeApp {
     pub fn browse_build_target(&mut self, cx: &mut Context<Self>) {
         // The XDG portal file chooser cannot mix file and folder selection,
         // and folder mode hides files entirely — so package picking must be
-        // a pure file prompt. Use browse_build_dir() for source directories.
-        self.prompt_for_build_path(false, "Choose a package file or PKGBUILD", cx);
+        // a pure file prompt. A local source directory is typed into the
+        // target field instead.
+        self.prompt_for_path(
+            false,
+            "Choose a package file or PKGBUILD",
+            PathPrompt::BuildTarget,
+            cx,
+        );
     }
 
-    pub fn browse_build_dir(&mut self, cx: &mut Context<Self>) {
-        self.prompt_for_build_path(true, "Choose a local source directory to build", cx);
+    /// Pick the directory finished builds are copied into.
+    pub fn browse_output_dir(&mut self, cx: &mut Context<Self>) {
+        self.prompt_for_path(
+            true,
+            "Choose where built packages are saved",
+            PathPrompt::OutputDir,
+            cx,
+        );
     }
 
-    fn prompt_for_build_path(
+    fn prompt_for_path(
         &mut self,
         directories: bool,
         prompt: &'static str,
+        target: PathPrompt,
         cx: &mut Context<Self>,
     ) {
+        self.state.path_prompt = Some(target);
         let receiver = cx.prompt_for_paths(PathPromptOptions {
             files: !directories,
             directories,
@@ -792,18 +933,29 @@ impl ArchBridgeApp {
                 if let Some(path) = paths.into_iter().next() {
                     let selected = path.to_string_lossy().into_owned();
                     this.update(cx, |app, cx| {
-                        app.state.build_target_input = selected;
-                        app.state.active_plan = None;
-                        app.state.build_result = None;
-                        app.state.build_msg = None;
+                        match app.state.path_prompt.take() {
+                            Some(PathPrompt::OutputDir) => {
+                                app.save_output_dir(selected, cx);
+                            }
+                            _ => {
+                                app.state.build_target_input = selected;
+                                app.state.active_plan = None;
+                                app.state.build_result = None;
+                                app.state.build_msg = None;
+                            }
+                        }
                         cx.notify();
                     })
                     .ok();
                 }
             }
-            Ok(Ok(None)) | Err(_) => {}
+            Ok(Ok(None)) | Err(_) => {
+                this.update(cx, |app, _cx| app.state.path_prompt = None)
+                    .ok();
+            }
             Ok(Err(error)) => {
                 this.update(cx, |app, cx| {
+                    app.state.path_prompt = None;
                     app.state.build_msg = Some(StatusMsg {
                         level: MsgLevel::Error,
                         text: format!("Could not open package chooser: {error}"),
@@ -829,7 +981,7 @@ impl ArchBridgeApp {
                     let selected = path.to_string_lossy().into_owned();
                     this.update(cx, |app, cx| {
                         app.state.inspect_path = selected;
-                        app.state.inspect_data = None;
+                        app.state.inspect_report = None;
                         app.state.inspect_msg = None;
                         cx.notify();
                     })
@@ -849,6 +1001,87 @@ impl ArchBridgeApp {
             }
         })
         .detach();
+    }
+
+    /// Run the install plan a successful build handed off to. Reached only from
+    /// the build page's primary button once the artifact exists.
+    pub fn install_built_package(&mut self, cx: &mut Context<Self>) {
+        let Some(plan_id) = self
+            .state
+            .build_result
+            .as_ref()
+            .and_then(|result| result.next_plan.as_ref())
+            .map(|next_plan| next_plan.plan_id.clone())
+        else {
+            return;
+        };
+        if self.state.install_plan_consumed {
+            self.state.build_msg = Some(StatusMsg {
+                level: MsgLevel::Warning,
+                text: "This install plan already ran and was consumed. Its output is still shown \
+                       below; prepare the build again to review and confirm a fresh install plan."
+                    .to_string(),
+            });
+            cx.notify();
+            return;
+        }
+        if !self.state.sudo_session_active {
+            self.state.active_plan = self
+                .state
+                .build_result
+                .as_ref()
+                .and_then(|r| r.next_plan.clone());
+            self.open_auth_dialog(Some("execute"));
+            cx.notify();
+            return;
+        }
+        self.state.build_busy = true;
+        self.state.install_plan_consumed = true;
+        self.state.build_msg = Some(StatusMsg {
+            level: MsgLevel::Info,
+            text: "Installing built package to the host system…".to_string(),
+        });
+        cx.notify();
+        self.rpc_async(
+            "v1.execute",
+            json!({ "plan_id": plan_id, "confirmed": true }),
+            |app, result, cx| {
+                app.state.build_busy = false;
+                match result {
+                    Ok(val) => {
+                        let ok = val.get("ok").and_then(|o| o.as_bool()).unwrap_or(false);
+                        if ok {
+                            // The install plan is consumed once it runs, so the
+                            // button that ran it has to go with it.
+                            app.state.build_stage = 5;
+                        }
+                        app.state.build_msg = Some(StatusMsg {
+                            level: if ok {
+                                MsgLevel::Success
+                            } else {
+                                MsgLevel::Error
+                            },
+                            text: val
+                                .get("message")
+                                .and_then(|m| m.as_str())
+                                .unwrap_or("Installation finished")
+                                .to_string(),
+                        });
+                    }
+                    Err(e) => {
+                        if e.contains("password is required") {
+                            app.state.sudo_session_active = false;
+                        }
+                        app.state.build_msg = Some(StatusMsg {
+                            level: MsgLevel::Error,
+                            text: e,
+                        });
+                    }
+                }
+                cx.notify();
+            },
+            cx,
+        );
     }
 
     pub fn execute_plan(&mut self, cx: &mut Context<Self>) {
@@ -1316,6 +1549,84 @@ fn status_msg_bar(msg: &StatusMsg, pal: &ThemePalette) -> impl IntoElement {
         .child(msg.text.clone())
 }
 
+/// Column budget for soft-wrapped monospace blocks. Wide enough to keep code
+/// readable, narrow enough that the longest line fits a small window.
+const WRAP_COLUMN: usize = 100;
+
+/// One div per visual line. GPUI gives a text run exactly one line, so
+/// multi-line content has to be split before it is rendered.
+///
+/// Lines longer than `WRAP_COLUMN` are folded rather than left to an ellipsis:
+/// these blocks show the exact bytes a user is being asked to review, and a
+/// truncated PKGBUILD or log line is a review that proves nothing.
+fn text_lines<S: AsRef<str>>(text: S, size: f32, color: u32) -> Vec<AnyElement> {
+    wrap_columns(text.as_ref(), WRAP_COLUMN)
+        .into_iter()
+        .map(|line| {
+            div()
+                .w_full()
+                .text_size(px(size))
+                .text_color(rgb(color))
+                .whitespace_nowrap()
+                .child(line)
+                .into_any_element()
+        })
+        .collect()
+}
+
+/// Folds over-long lines at word boundaries, hard-splitting a single word that
+/// is itself longer than the budget. Blank lines are preserved, and every
+/// continuation keeps the original line's indentation so a folded shell script
+/// still reads as the script it was.
+fn wrap_columns(text: &str, width: usize) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    for line in text.split('\n') {
+        if line.chars().count() <= width {
+            lines.push(line.to_string());
+            continue;
+        }
+        let indent: String = line
+            .chars()
+            .take_while(|c| *c == ' ' || *c == '\t')
+            .collect();
+        let body = line.trim_start();
+        let budget = width.saturating_sub(indent.chars().count()).max(1);
+        let mut current = String::new();
+        for word in body.split(' ') {
+            if word.is_empty() {
+                continue;
+            }
+            let candidate = if current.is_empty() {
+                word.to_string()
+            } else {
+                format!("{} {}", current, word)
+            };
+            if candidate.chars().count() <= budget {
+                current = candidate;
+                continue;
+            }
+            if !current.is_empty() {
+                lines.push(format!("{indent}{}", std::mem::take(&mut current)));
+            }
+            let mut rest = word.to_string();
+            while rest.chars().count() > budget {
+                let cut = rest
+                    .char_indices()
+                    .nth(budget)
+                    .map(|(i, _)| i)
+                    .unwrap_or(rest.len());
+                lines.push(format!("{indent}{}", &rest[..cut]));
+                rest = rest[cut..].to_string();
+            }
+            current = rest;
+        }
+        if !current.is_empty() {
+            lines.push(format!("{indent}{current}"));
+        }
+    }
+    lines
+}
+
 fn section_header(title: &'static str, pal: &ThemePalette) -> impl IntoElement {
     div()
         .flex()
@@ -1334,21 +1645,31 @@ fn section_header(title: &'static str, pal: &ThemePalette) -> impl IntoElement {
 
 fn detail_row(key: &str, value: &str, pal: &ThemePalette) -> impl IntoElement {
     div()
+        .w_full()
         .flex()
         .items_center()
-        .justify_between()
+        .gap_2()
         .py_1()
         .child(
             div()
+                .flex_none()
                 .text_color(rgb(pal.text_muted))
                 .text_size(px(12.0))
                 .child(key.to_string()),
         )
+        // The value owns the remaining width and truncates: an unbounded
+        // min-width would let a long path push past the row and paint over
+        // the rows below it.
         .child(
             div()
+                .flex_1()
+                .min_w(px(0.0))
+                .text_right()
                 .text_color(rgb(pal.text_primary))
                 .text_size(px(12.0))
                 .font_weight(FontWeight::MEDIUM)
+                .whitespace_nowrap()
+                .text_ellipsis()
                 .child(value.to_string()),
         )
 }
@@ -2210,7 +2531,7 @@ fn render_top_bar(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> i
 fn render_sidebar(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> impl IntoElement {
     let pal = get_palette(app.state.theme);
     div()
-        .w(px(215.0))
+        .w(px(236.0))
         .flex_none()
         .h_full()
         .bg(rgb(pal.bg_sidebar))
@@ -2285,7 +2606,8 @@ fn render_sidebar(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> i
                     div()
                         .flex()
                         .flex_col()
-                        .gap_1_5()
+                        .gap_1()
+                        .child(sidebar_group(&pal, "Workflow"))
                         .child(sidebar_nav_btn(
                             app,
                             cx,
@@ -2298,7 +2620,7 @@ fn render_sidebar(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> i
                             cx,
                             ActiveTab::Inspect,
                             "📦",
-                            "Inspect (.deb / .rpm)",
+                            "Inspect (.deb/.rpm)",
                         ))
                         .child(sidebar_nav_btn(
                             app,
@@ -2314,6 +2636,7 @@ fn render_sidebar(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> i
                             "🗑",
                             "Uninstall Software",
                         ))
+                        .child(sidebar_group(&pal, "System"))
                         .child(sidebar_nav_btn(
                             app,
                             cx,
@@ -2361,6 +2684,20 @@ fn render_sidebar(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> i
         )
 }
 
+/// Section caption above a run of sidebar nav rows.
+fn sidebar_group(pal: &ThemePalette, label: &'static str) -> impl IntoElement {
+    div()
+        .flex()
+        .items_center()
+        .px_1()
+        .pt_3()
+        .pb_1()
+        .text_color(rgb(pal.text_muted))
+        .text_size(px(9.5))
+        .font_weight(FontWeight::BOLD)
+        .child(label.to_uppercase())
+}
+
 fn sidebar_nav_btn(
     app: &mut ArchBridgeApp,
     cx: &mut Context<ArchBridgeApp>,
@@ -2378,8 +2715,8 @@ fn sidebar_nav_btn(
         .h(px(38.0))
         .flex()
         .items_center()
-        .gap_3()
-        .px_3()
+        .gap_2()
+        .pr_2()
         .rounded_lg()
         .cursor_pointer()
         .bg(if is_active {
@@ -2387,16 +2724,6 @@ fn sidebar_nav_btn(
                 rgb(0xdbeafe)
             } else {
                 rgb(0x14233c)
-            }
-        } else {
-            rgba(0x00000000)
-        })
-        .border_1()
-        .border_color(if is_active {
-            if pal.is_light() {
-                rgb(0x93c5fd)
-            } else {
-                rgb(0x285485)
             }
         } else {
             rgba(0x00000000)
@@ -2409,13 +2736,36 @@ fn sidebar_nav_btn(
                 cx.notify();
             }
         }))
-        .child(div().text_size(px(14.0)).child(icon))
+        // Accent and icon keep a fixed slot in both states, so switching tabs
+        // never shifts the label sideways.
+        .child(
+            div()
+                .flex_none()
+                .w(px(3.0))
+                .h(px(16.0))
+                .rounded(px(1.5))
+                .bg(if is_active {
+                    rgb(pal.accent_cyan)
+                } else {
+                    rgba(0x00000000)
+                }),
+        )
+        .child(
+            div()
+                .flex_none()
+                .w(px(20.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_size(px(13.5))
+                .child(icon),
+        )
         .child(
             div()
                 .text_color(if is_active {
                     rgb(pal.accent_cyan)
                 } else {
-                    rgb(pal.text_muted)
+                    rgb(pal.text_secondary)
                 })
                 .text_size(px(13.0))
                 .font_weight(if is_active {
@@ -3400,7 +3750,7 @@ fn render_inspect_body(
     pal: &ThemePalette,
     cx: &mut Context<ArchBridgeApp>,
 ) -> impl IntoElement {
-    match &app.state.inspect_data {
+    match &app.state.inspect_report {
         None => div()
             .w_full()
             .flex_1()
@@ -3419,23 +3769,9 @@ fn render_inspect_body(
             )
             .into_any_element(),
 
-        Some(payload) => {
-            let report: Option<crate::inspect::InspectionReport> =
-                serde_json::from_value(payload.clone()).ok();
-            match report {
-                None => div()
-                    .w_full()
-                    .p_4()
-                    .border_1()
-                    .border_color(rgb(pal.border_subtle))
-                    .rounded_xl()
-                    .bg(rgb(pal.bg_card))
-                    .text_color(rgb(ACCENT_RED))
-                    .text_size(px(12.0))
-                    .child("The inspection response could not be read. Re-run the inspection.")
-                    .into_any_element(),
-                Some(report) => render_inspection_report(&report, app, pal, cx).into_any_element(),
-            }
+        Some(report) => {
+            let report = Rc::clone(report);
+            render_inspection_report(&report, app, pal, cx).into_any_element()
         }
     }
 }
@@ -3668,6 +4004,11 @@ fn inspect_script_card(script: &crate::inspect::ScriptInfo, pal: &ThemePalette) 
         )
         .child(
             div()
+                .id("inspect-script-body-scroll")
+                .w_full()
+                .min_w(px(0.0))
+                .max_h(px(280.0))
+                .overflow_y_scroll()
                 .p_2()
                 .rounded_md()
                 .bg(if pal.is_light() {
@@ -3675,14 +4016,16 @@ fn inspect_script_card(script: &crate::inspect::ScriptInfo, pal: &ThemePalette) 
                 } else {
                     rgb(0x01040a)
                 })
-                .text_color(rgb(pal.text_secondary))
-                .text_size(px(11.0))
                 .font_family("monospace")
-                .child(if truncated {
-                    format!("{}\n… truncated for display …", preview)
-                } else {
-                    preview.to_string()
-                }),
+                .children(text_lines(
+                    if truncated {
+                        format!("{}\n… truncated for display …", preview)
+                    } else {
+                        preview.to_string()
+                    },
+                    11.0,
+                    pal.text_secondary,
+                )),
         )
         .into_any_element()
 }
@@ -3710,9 +4053,12 @@ fn inspect_list_card(
     } else {
         card = card.children(items.iter().map(|item| {
             div()
+                .w_full()
                 .text_color(rgb(pal.text_primary))
                 .text_size(px(12.0))
                 .font_family("monospace")
+                .whitespace_nowrap()
+                .text_ellipsis()
                 .child(format!("• {}", item))
         }));
     }
@@ -3800,6 +4146,69 @@ fn inspect_tab_pill(
 // ─────────────────────────────────────────────────────────────────────────────
 // 3. Build & Clean Chroot Studio View
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// The build page's single primary action. Its label follows the stage the user
+/// is actually in, so "prepare", "execute" and "install" never sit side by side
+/// and ask a first-time user to work out the order.
+fn build_primary_button(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> AnyElement {
+    let pal = get_palette(app.state.theme);
+    if app.state.build_busy || app.state.output_dir_saving {
+        return action_button(
+            "build-primary-btn",
+            "⏳ Working…",
+            if pal.is_light() { 0xcbd5e1 } else { 0x1e293b },
+            pal.text_muted,
+            |_, _, _| {},
+        )
+        .into_any_element();
+    }
+    match app.state.build_stage {
+        2 => {
+            let installing = app
+                .state
+                .active_plan
+                .as_ref()
+                .map(|plan| plan.action == "install")
+                .unwrap_or(false);
+            action_button(
+                "build-primary-btn",
+                if installing {
+                    "▶ Execute Install"
+                } else {
+                    "▶ Execute Build"
+                },
+                ACCENT_GREEN,
+                0xffffff,
+                cx.listener(|this, _, _, cx| this.execute_plan(cx)),
+            )
+            .into_any_element()
+        }
+        4 => action_button(
+            "build-primary-btn",
+            "📥 Install Built Package",
+            ACCENT_PURPLE,
+            0xffffff,
+            cx.listener(|this, _, _, cx| this.install_built_package(cx)),
+        )
+        .into_any_element(),
+        5 => action_button(
+            "build-primary-btn",
+            "＋ Start a New Build",
+            ACCENT_BLUE,
+            0xffffff,
+            cx.listener(|this, _, _, cx| this.start_new_build(cx)),
+        )
+        .into_any_element(),
+        _ => action_button(
+            "build-primary-btn",
+            "⚙ Prepare Build Plan",
+            ACCENT_BLUE,
+            0xffffff,
+            cx.listener(|this, _, _, cx| this.prepare_build_plan(cx)),
+        )
+        .into_any_element(),
+    }
+}
 
 fn render_build(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> impl IntoElement {
     let pal = get_palette(app.state.theme);
@@ -3911,7 +4320,7 @@ fn render_build(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> imp
                                     div()
                                         .text_color(rgb(pal.text_placeholder))
                                         .text_size(px(13.0))
-                                        .child("Target: .deb/.rpm file, GitHub URL, local directory, PKGBUILD, or package name...")
+                                        .child("Package name, path, or URL...")
                                         .into_any_element()
                                 } else {
                                     div()
@@ -3943,33 +4352,49 @@ fn render_build(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> imp
                     pal.text_secondary,
                     cx.listener(|this, _, _, cx| this.browse_build_target(cx)),
                 ))
-                .child(action_button(
-                    "build-browse-dir-btn",
-                    "📁 Folder...",
+                .child(build_primary_button(app, cx)),
+        )
+        // Where the finished artifact goes, chosen here rather than on another
+        // page, and saved the moment it is picked.
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .child(
+                    div()
+                        .text_color(rgb(if app.state.saved_output_dir().is_empty() {
+                            ACCENT_AMBER
+                        } else {
+                            pal.text_muted
+                        }))
+                        .text_size(px(11.5))
+                        .font_family("monospace")
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .child(if app.state.saved_output_dir().is_empty() {
+                            "Save folder: none yet — built packages would be left in the build job directory".to_string()
+                        } else {
+                            format!(
+                                "Save folder: {}",
+                                app.state.saved_output_dir()
+                            )
+                        }),
+                )
+                .child(small_button(
+                    "pick-build-output-dir-btn",
+                    if app.state.output_dir_saving {
+                        "Saving…"
+                    } else {
+                        "Choose Save Folder…"
+                    },
                     if pal.is_light() { 0xe2e8f0 } else { 0x12233a },
                     pal.text_secondary,
-                    cx.listener(|this, _, _, cx| this.browse_build_dir(cx)),
-                ))
-                .child(action_button(
-                    "prepare-plan-btn",
-                    if app.state.build_busy { "Preparing Plan…" } else { "Prepare Build Plan (Dry-Run)" },
-                    ACCENT_BLUE,
-                    0xffffff,
-                    cx.listener(|this, _, _, cx| this.prepare_build_plan(cx)),
+                    cx.listener(|this, _, _, cx| this.browse_output_dir(cx)),
                 )),
-        )
-        // Advanced Options Toggle
-        .child(
-            div()
-                .text_color(rgb(pal.accent_cyan))
-                .text_size(px(11.0))
-                .child("▾ Advanced Build Options (optional name, version, entry, dependencies)"),
-        )
-        .child(
-            div()
-                .text_color(rgb(pal.text_muted))
-                .text_size(px(12.0))
-                .child("Ready — choose a package or build target."),
         )
         .when_some(app.state.build_msg.clone(), |this, msg| {
             this.child(status_msg_bar(&msg, &pal))
@@ -3978,6 +4403,9 @@ fn render_build(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> imp
         .child(section_header("Prepared Plan & Review Manifest", &pal))
         .child(
             div()
+                .id("plan-manifest-panel")
+                .w_full()
+                .min_w(px(0.0))
                 .bg(if pal.is_light() { rgb(0xf8fafc) } else { rgb(0x040810) })
                 .border_1()
                 .border_color(rgb(pal.border_subtle))
@@ -3999,6 +4427,19 @@ fn render_build(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> imp
                             .iter()
                             .find(|review| review.path == "PKGBUILD")
                             .and_then(|review| review.content.clone());
+                        let mut manifest = format!(
+                            "# Plan {} — action: {}\n# {}\n# Steps: {}",
+                            plan.plan_id,
+                            plan.action,
+                            plan.summary,
+                            plan.steps.len()
+                        );
+                        for step in &plan.steps {
+                            manifest.push_str(&format!("\n- {}", step.purpose));
+                        }
+                        if pkgbuild.is_none() {
+                            manifest.push_str("\n(this plan runs no PKGBUILD)");
+                        }
                         div()
                             .flex()
                             .flex_col()
@@ -4008,158 +4449,68 @@ fn render_build(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> imp
                                     .text_color(rgb(pal.text_secondary))
                                     .text_size(px(12.0))
                                     .font_family("monospace")
-                                    .child(format!(
-                                        "# Plan {} — action: {}\n# {}\n# Steps: {}",
-                                        plan.plan_id,
-                                        plan.action,
-                                        plan.summary,
-                                        plan.steps.len()
-                                    )),
-                            )
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .children(plan.steps.iter().map(|step| {
-                                        div()
-                                            .text_color(rgb(pal.text_muted))
-                                            .text_size(px(12.0))
-                                            .font_family("monospace")
-                                            .child(format!("  - {}", step.purpose))
-                                    }))
-                                    .when(pkgbuild.is_none(), |this| {
-                                        this.child(
-                                            div()
-                                                .text_color(rgb(pal.text_muted))
-                                                .text_size(px(12.0))
-                                                .font_family("monospace")
-                                                .child("  (this plan runs no PKGBUILD)"),
-                                        )
-                                    }),
+                                    .children(text_lines(manifest, 12.0, pal.text_secondary)),
                             )
                             .when_some(pkgbuild, |this, script| {
                                 this.child(
                                     div()
-                                        .id("plan-pkgbuild-view")
-                                        .bg(rgb(pal.bg_darkest))
-                                        .border_1()
-                                        .border_color(rgb(pal.border_subtle))
-                                        .rounded_lg()
-                                        .p_3()
-                                        .max_h(px(320.0))
-                                        .overflow_y_scroll()
-                                        .text_color(rgb(pal.text_primary))
-                                        .text_size(px(11.5))
-                                        .font_family("monospace")
-                                        .child("# --- PKGBUILD to be executed ---\n".to_string())
-                                        .child(script),
+                                        .w_full()
+                                        .flex()
+                                        .flex_col()
+                                        .gap_1()
+                                        .child(
+                                            div()
+                                                .text_color(rgb(pal.text_muted))
+                                                .text_size(px(11.0))
+                                                .font_family("monospace")
+                                                .child("# --- PKGBUILD to be executed ---"),
+                                        )
+                                        .child(
+                                            div()
+                                                .id("plan-pkgbuild-view")
+                                                .w_full()
+                                                .min_w(px(0.0))
+                                                .h(px(320.0))
+                                                .px_3()
+                                                .py_2()
+                                                .bg(rgb(pal.bg_darkest))
+                                                .border_1()
+                                                .border_color(rgb(pal.border_subtle))
+                                                .rounded_lg()
+                                                .overflow_y_scroll()
+                                                .font_family("monospace")
+                                                .children(text_lines(
+                                                    script,
+                                                    11.5,
+                                                    pal.text_primary,
+                                                )),
+                                        ),
                                 )
                             })
                     }
                 }),
         )
-        // Confirm & Execute button
-        .child(
-            div()
-                .flex()
-                .gap_3()
-                .child(action_button(
-                    "confirm-exec-chroot-btn",
-                    if app.state.build_busy {
-                        "Executing Plan…"
-                    } else {
-                        "Confirm and Execute Plan"
-                    },
-                    ACCENT_GREEN,
-                    0xffffff,
-                    cx.listener(|this, _, _, cx| this.execute_plan(cx)),
-                ))
-                .when(app.state.build_stage == 4, |this| {
-                    this.child(action_button(
-                        "install-built-pkg-btn",
-                        "Install Built Package",
-                        ACCENT_PURPLE,
-                        0xffffff,
-                        cx.listener(|this, _, _, cx| {
-                            let plan_id = this
-                                .state
-                                .build_result
-                                .as_ref()
-                                .and_then(|result| result.next_plan.as_ref())
-                                .map(|next_plan| next_plan.plan_id.clone());
-                            let Some(plan_id) = plan_id else { return };
-                            if this.state.install_plan_consumed {
-                                this.state.build_msg = Some(StatusMsg {
-                                    level: MsgLevel::Warning,
-                                    text: "This install plan already ran and was consumed. Its \
-                                           output is still shown below; prepare the build again \
-                                           to review and confirm a fresh install plan."
-                                        .to_string(),
-                                });
+        // Secondary action only: the stage's main action is the single button in
+        // the target row, so nothing here asks the user to guess the order.
+        .when(
+            app.state.active_plan.is_some() && !app.state.build_busy,
+            |this| {
+                this.child(
+                    div()
+                        .flex()
+                        .gap_3()
+                        .child(small_button(
+                            "discard-plan-btn",
+                            "Discard Prepared Plan",
+                            if pal.is_light() { 0xe2e8f0 } else { 0x12233a },
+                            pal.text_secondary,
+                            cx.listener(|this, _, _, cx| {
+                                this.reset_build_flow("you discarded the prepared plan");
                                 cx.notify();
-                                return;
-                            }
-                            if !this.state.sudo_session_active {
-                                this.state.active_plan =
-                                    this.state.build_result.as_ref().and_then(|r| r.next_plan.clone());
-                                this.open_auth_dialog(Some("execute"));
-                                cx.notify();
-                                return;
-                            }
-                            this.state.build_busy = true;
-                            this.state.install_plan_consumed = true;
-                            this.state.build_msg = Some(StatusMsg {
-                                level: MsgLevel::Info,
-                                text: "Installing built package to the host system…".to_string(),
-                            });
-                            cx.notify();
-                            this.rpc_async(
-                                "v1.execute",
-                                json!({ "plan_id": plan_id, "confirmed": true }),
-                                |app, result, cx| {
-                                    app.state.build_busy = false;
-                                    match result {
-                                        Ok(val) => {
-                                            let ok = val
-                                                .get("ok")
-                                                .and_then(|o| o.as_bool())
-                                                .unwrap_or(false);
-                                            if ok {
-                                                // The install plan is consumed once it
-                                                // runs, so the button that ran it has to
-                                                // go with it.
-                                                app.state.build_stage = 5;
-                                            }
-                                            app.state.build_msg = Some(StatusMsg {
-                                                level: if ok {
-                                                    MsgLevel::Success
-                                                } else {
-                                                    MsgLevel::Error
-                                                },
-                                                text: val
-                                                    .get("message")
-                                                    .and_then(|m| m.as_str())
-                                                    .unwrap_or("Installation finished")
-                                                    .to_string(),
-                                            });
-                                        }
-                                        Err(e) => {
-                                            if e.contains("password is required") {
-                                                app.state.sudo_session_active = false;
-                                            }
-                                            app.state.build_msg = Some(StatusMsg {
-                                                level: MsgLevel::Error,
-                                                text: e,
-                                            });
-                                        }
-                                    }
-                                    cx.notify();
-                                },
-                                cx,
-                            );
-                        }),
-                    ))
-                }),
+                            }),
+                        )),
+                )
+            },
         )
         // Terminal Execution Console
         .child(
@@ -4182,18 +4533,37 @@ fn render_build(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> imp
                 .child(
                     div()
                         .id("terminal-output-scroll")
+                        .w_full()
+                        .min_w(px(0.0))
+                        .min_h(px(0.0))
                         .overflow_y_scroll()
                         .flex_1()
-                        .text_color(rgb(ACCENT_GREEN))
-                        .text_size(px(12.0))
                         .font_family("monospace")
-                        .child(if app.state.build_busy && app.state.build_log.is_empty() {
-                            "⏳ Engine work in progress — chroot setup, makepkg, and smoke test output will appear here when the plan finishes…".to_string()
-                        } else if app.state.build_log.is_empty() {
-                            "Execution output and runtime smoke test logs will stream here...".to_string()
-                        } else {
-                            app.state.build_log.clone()
-                        }),
+                        .when(
+                            app.state.build_log.is_empty(),
+                            |this| {
+                                this.child(
+                                    div()
+                                        .text_color(rgb(ACCENT_GREEN))
+                                        .text_size(px(12.0))
+                                        .child(if app.state.build_busy {
+                                            "⏳ Engine work in progress — chroot setup, makepkg, and smoke test output will appear here when the plan finishes…"
+                                        } else {
+                                            "Execution output and runtime smoke test logs will stream here..."
+                                        }),
+                                )
+                            },
+                        )
+                        .when(
+                            !app.state.build_log.is_empty(),
+                            |this| {
+                                this.children(text_lines(
+                                    app.state.build_log.clone(),
+                                    12.0,
+                                    ACCENT_GREEN,
+                                ))
+                            },
+                        ),
                 )
                 .when(app.state.build_busy && app.state.tick % 2 == 0, |this| {
                     this.child(
@@ -5147,7 +5517,93 @@ fn render_settings(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> 
                         ),
                 ),
         )
-        // Card 2: Source Routing Checkboxes & Save Button
+        // Card 2: Build Output Folder
+        .child(
+            div()
+                .w_full()
+                .bg(rgb(pal.bg_card))
+                .border_1()
+                .border_color(rgb(pal.border_subtle))
+                .rounded_xl()
+                .p_4()
+                .flex()
+                .flex_col()
+                .gap_3()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(div().text_size(px(14.0)).child("📂"))
+                        .child(
+                            div()
+                                .text_color(rgb(pal.text_primary))
+                                .text_size(px(14.0))
+                                .font_weight(FontWeight::BOLD)
+                                .child("Build Output Folder"),
+                        ),
+                )
+                .child(
+                    div()
+                        .text_color(rgb(pal.text_muted))
+                        .text_size(px(12.0))
+                        .child("Where a finished .pkg.tar.zst is copied after a build. The build itself always happens in the isolated job directory."),
+                )
+                .child(
+                    div()
+                        .id("output-dir-value")
+                        .w_full()
+                        .overflow_x_scroll()
+                        .px_3()
+                        .py_2()
+                        .rounded_lg()
+                        .bg(rgb(pal.bg_input))
+                        .border_1()
+                        .border_color(rgb(pal.border))
+                        .text_color(rgb(pal.text_primary))
+                        .text_size(px(12.0))
+                        .font_family("monospace")
+                        .child(if app.state.opt_output_dir.is_empty() {
+                            "(default — keep the artifact in the build job directory)".to_string()
+                        } else {
+                            app.state.opt_output_dir.clone()
+                        }),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_3()
+                        .child(action_button(
+                            "pick-output-dir-btn",
+                            "📁 Choose Folder…",
+                            if pal.is_light() { 0xe2e8f0 } else { 0x12233a },
+                            pal.text_secondary,
+                            cx.listener(|this, _, _, cx| this.browse_output_dir(cx)),
+                        ))
+                        .when(!app.state.opt_output_dir.is_empty(), |this| {
+                            this.child(action_button(
+                                "reset-output-dir-btn",
+                                "Use Default",
+                                if pal.is_light() { 0xe2e8f0 } else { 0x12233a },
+                                pal.text_secondary,
+                                cx.listener(|this, _, _, cx| {
+                                    this.save_output_dir(String::new(), cx);
+                                }),
+                            ))
+                        })
+                        .when(app.state.output_dir_saving, |this| {
+                            this.child(
+                                div()
+                                    .text_color(rgb(pal.text_muted))
+                                    .text_size(px(11.0))
+                                    .child("Saving…"),
+                            )
+                        }),
+                ),
+        )
+        // Card 3: Source Routing Checkboxes & Save Button
         .child(
             div()
                 .w_full()
@@ -5244,7 +5700,7 @@ fn render_settings(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> 
                             "save-prefs-btn",
                             if app.state.settings_busy {
                                 "Saving…"
-                            } else if app.state.settings_dirty {
+                            } else if app.state.settings_unsaved() {
                                 "Save Preferences (unsaved changes)"
                             } else {
                                 "Save Preferences"
@@ -5449,4 +5905,39 @@ fn render_bottom_bar(app: &ArchBridgeApp) -> impl IntoElement {
                         .child("ArchBridge"),
                 ),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::wrap_columns;
+
+    #[test]
+    fn short_lines_pass_through_untouched() {
+        assert_eq!(
+            wrap_columns("pkgver=1.0\n\n    arch=('x86_64')", 100),
+            vec!["pkgver=1.0", "", "    arch=('x86_64')"]
+        );
+    }
+
+    #[test]
+    fn long_lines_fold_at_words_without_losing_text() {
+        let line = "source".repeat(40);
+        let folded = wrap_columns(&line, 20);
+        assert!(folded.iter().all(|l| l.chars().count() <= 20));
+        assert_eq!(folded.concat(), line);
+    }
+
+    #[test]
+    fn folded_continuations_keep_the_original_indent() {
+        let folded = wrap_columns(&format!("    {}", "word ".repeat(20)), 20);
+        assert!(folded.len() > 1);
+        assert!(folded.iter().all(|l| l.starts_with("    ")));
+    }
+
+    #[test]
+    fn a_single_overwide_token_is_hard_split() {
+        let folded = wrap_columns(&"x".repeat(45), 10);
+        assert_eq!(folded.iter().map(|l| l.chars().count()).sum::<usize>(), 45);
+        assert!(folded.iter().all(|l| l.chars().count() <= 10));
+    }
 }

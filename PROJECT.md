@@ -141,6 +141,13 @@ anywhere. Repositories with no published release do not get guessed branch build
 Preferences live in `$XDG_CONFIG_HOME/archbridge/config.json`, falling back to
 `$HOME/.config/archbridge/config.json`. Supported boolean keys are `official`,
 `aur`, `flatpak`, `appimage`, `upstream`, `deb`, and `rpm`; default is enabled.
+`output_dir` is a string: an absolute directory that a finished package artifact
+is copied into after a build. Empty (the default) leaves the artifact in the
+per-job build directory, and the Build page says so until a folder is chosen.
+The desktop app writes the value through the engine the moment it is picked, on
+either the Build or Settings page, so no build can run against a folder that only
+exists in unsaved UI state. A relative `output_dir` is rejected, and the copy is
+re-hashed against the bytes the build produced before it is offered for install.
 Unknown keys/values and invalid config schemas fail rather than silently resetting
 preferences. Read-only operations and dry-runs do not initialize directories.
 

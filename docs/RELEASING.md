@@ -24,6 +24,15 @@ Use Semantic Versioning for CLI/RPC compatibility:
 
 Keep `v1.*` RPC methods compatible within the major protocol version.
 
+## Development versions
+
+`Cargo.toml` carries a `-dev` pre-release suffix between releases, such as
+`0.5.0-dev`. Bump the base number as soon as work heading for the next release
+lands locally, so the running binary, the GUI version label, and the RPC
+capabilities response never claim an already-published release. Before tagging,
+drop the `-dev` suffix so `Cargo.toml` and the tag agree, and land that change in
+the same commit that becomes the release.
+
 ## Release artifacts
 
 Build artifacts must identify the commit, target architecture, and verification
