@@ -973,6 +973,15 @@ mod tests {
     }
 
     #[test]
+    fn startup_doctor_does_not_cover_the_window() {
+        let mut state = AppState::default();
+        state.doctor_busy = true;
+        assert!(!state.shows_progress_overlay());
+        state.search_busy = true;
+        assert!(state.shows_progress_overlay());
+    }
+
+    #[test]
     fn status_bar_starts_unmeasured() {
         let state = AppState::default();
         assert_eq!(state.free_disk_space, STATUS_UNMEASURED);
