@@ -387,3 +387,34 @@ fn a_full_or_closed_stdout_is_reported_not_a_panic() {
     assert!(!stderr.contains("panicked"), "{stderr}");
     assert_eq!(out.status.code(), Some(1), "{stderr}");
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn an_unwritable_stderr_does_not_replace_the_exit_code_with_a_panic() {
+    // Regression: eprintln! panics on a closed/full stderr, so a usage error
+    // (exit 2) became exit 101 whenever its message could not be written.
+    let home = tempfile::tempdir().unwrap();
+    let full = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/full")
+        .expect("/dev/full");
+    let out = Command::new(env!("CARGO_BIN_EXE_archbridge"))
+        .arg("definitely-not-a-command")
+        .env("XDG_CONFIG_HOME", home.path())
+        .stderr(full)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2), "a usage error stays exit 2");
+
+    let full = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/full")
+        .expect("/dev/full");
+    let out = Command::new(env!("CARGO_BIN_EXE_archbridge"))
+        .args(["config", "get", "no_such_key"])
+        .env("XDG_CONFIG_HOME", home.path())
+        .stderr(full)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "a failure stays exit 1");
+}

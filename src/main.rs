@@ -24,7 +24,10 @@ fn write_stdout(args: std::fmt::Arguments<'_>, newline: bool) {
         if err.kind() == io::ErrorKind::BrokenPipe {
             std::process::exit(0);
         }
-        eprintln!("Error: failed writing to stdout: {}", err);
+        write_stderr(
+            format_args!("Error: failed writing to stdout: {}", err),
+            true,
+        );
         std::process::exit(1);
     }
 }
@@ -35,6 +38,27 @@ macro_rules! print {
 
 macro_rules! println {
     ($($arg:tt)*) => { write_stdout(format_args!($($arg)*), true) };
+}
+
+/// `eprintln!` panics when stderr is closed or full (`2>&1 | head -1`,
+/// `2>/dev/full`), which replaced the real exit code of a usage error (2) or a
+/// failure (1) with 101. Nobody is left to read a diagnostic that cannot be
+/// written, so it is dropped and the exit code stays truthful.
+fn write_stderr(args: std::fmt::Arguments<'_>, newline: bool) {
+    let mut err = io::stderr().lock();
+    let _ = err.write_fmt(args);
+    if newline {
+        let _ = err.write_all(b"\n");
+    }
+    let _ = err.flush();
+}
+
+macro_rules! eprint {
+    ($($arg:tt)*) => { write_stderr(format_args!($($arg)*), false) };
+}
+
+macro_rules! eprintln {
+    ($($arg:tt)*) => { write_stderr(format_args!($($arg)*), true) };
 }
 
 fn main() {
