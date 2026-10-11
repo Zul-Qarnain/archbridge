@@ -310,3 +310,80 @@ fn test_rpc_config_get_set() {
     assert!(!reloaded.engine.config.aur);
     drop(dir);
 }
+
+fn cli_with_config_home(args: &[&str], home: &std::path::Path) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_archbridge"))
+        .args(args)
+        .env("XDG_CONFIG_HOME", home)
+        .output()
+        .expect("the archbridge binary must be runnable from tests")
+}
+
+#[test]
+fn config_set_takes_a_key_and_a_value_from_the_command_line() {
+    // Regression: the value was reported as an "unexpected argument", so
+    // `config set <key> <value>` could never succeed from the CLI.
+    let home = tempfile::tempdir().unwrap();
+    let out = cli_with_config_home(&["config", "set", "aur", "false", "--yes"], home.path());
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
+
+    let out = cli_with_config_home(&["config", "get", "aur"], home.path());
+    assert_eq!(stdout_of(&out).trim(), "false");
+
+    // A third positional is still surplus.
+    let out = cli_with_config_home(&["config", "set", "aur", "false", "extra"], home.path());
+    assert_eq!(out.status.code(), Some(2));
+}
+
+#[test]
+fn a_blank_target_is_a_usage_error_not_a_discovery() {
+    let home = tempfile::tempdir().unwrap();
+    for command in ["search", "info", "inspect", "install", "uninstall"] {
+        for blank in ["", "   "] {
+            let out = cli_with_config_home(&[command, blank], home.path());
+            assert_eq!(
+                out.status.code(),
+                Some(2),
+                "{command} {blank:?}: {}",
+                stderr_of(&out)
+            );
+        }
+    }
+}
+
+#[test]
+fn double_dash_ends_option_parsing() {
+    let home = tempfile::tempdir().unwrap();
+    // Without `--` a leading '-' is an unknown flag (exit 2); after it, it is a value.
+    let out = cli_with_config_home(&["config", "set", "output_dir", "-x"], home.path());
+    assert_eq!(out.status.code(), Some(2));
+    let out = cli_with_config_home(
+        &["config", "set", "--dry-run", "--", "repo.x", "-weird"],
+        home.path(),
+    );
+    assert!(
+        !stderr_of(&out).contains("Unknown flag"),
+        "{}",
+        stderr_of(&out)
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_full_or_closed_stdout_is_reported_not_a_panic() {
+    // Regression: println! panicked (exit 101) when stdout could not be written.
+    let home = tempfile::tempdir().unwrap();
+    let full = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/full")
+        .expect("/dev/full");
+    let out = Command::new(env!("CARGO_BIN_EXE_archbridge"))
+        .args(["config", "get"])
+        .env("XDG_CONFIG_HOME", home.path())
+        .stdout(full)
+        .output()
+        .unwrap();
+    let stderr = stderr_of(&out);
+    assert!(!stderr.contains("panicked"), "{stderr}");
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+}

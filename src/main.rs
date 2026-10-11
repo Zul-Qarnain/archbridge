@@ -4,6 +4,39 @@ use serde_json::json;
 use std::env;
 use std::io::{self, BufReader, Write};
 
+/// Write to stdout without panicking. `println!` panics when stdout is closed
+/// (`archbridge search foo | head -0`) or full (`> /dev/full`), turning a
+/// routine pipe into exit 101 and a backtrace hint. A closed pipe is the
+/// reader's choice and ends quietly; any other write error is reported once.
+fn write_stdout(args: std::fmt::Arguments<'_>, newline: bool) {
+    let mut out = io::stdout().lock();
+    let result = out
+        .write_fmt(args)
+        .and_then(|_| {
+            if newline {
+                out.write_all(b"\n")
+            } else {
+                Ok(())
+            }
+        })
+        .and_then(|_| out.flush());
+    if let Err(err) = result {
+        if err.kind() == io::ErrorKind::BrokenPipe {
+            std::process::exit(0);
+        }
+        eprintln!("Error: failed writing to stdout: {}", err);
+        std::process::exit(1);
+    }
+}
+
+macro_rules! print {
+    ($($arg:tt)*) => { write_stdout(format_args!($($arg)*), false) };
+}
+
+macro_rules! println {
+    ($($arg:tt)*) => { write_stdout(format_args!($($arg)*), true) };
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
@@ -363,6 +396,12 @@ fn parse_flags(
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
+            // End of options: everything after is a positional, so a target or a
+            // value that begins with '-' can still be passed.
+            "--" => {
+                positional.extend(args[i + 1..].iter().cloned());
+                break;
+            }
             "--dry-run" => dry_run = true,
             "--yes" | "-y" => yes = true,
             "--repo" => {
@@ -414,6 +453,14 @@ fn report_extra_targets(command: &str, positional: &[String], problems: &mut Vec
     }
 }
 
+/// A blank target used to run a full discovery (or reach the engine) for
+/// nothing; it is a usage error like a missing one.
+fn report_blank_target(command: &str, positional: &[String], problems: &mut Vec<String>) {
+    if positional.first().is_some_and(|t| t.trim().is_empty()) {
+        problems.push(format!("The target for '{}' must not be empty", command));
+    }
+}
+
 /// Exit code for an `ExecutionResult`. The plan was accepted and ran, so the
 /// transport succeeded even when the operation did not: reporting 0 for
 /// `ok: false` made failed builds and smoke tests look green to scripts.
@@ -459,6 +506,7 @@ fn handle_search(client: &mut DirectRpcClient, args: &[String]) -> Result<i32, S
     let mut problems = Vec::new();
     let (positional, _dry_run, _yes, repo) = parse_flags(args, &mut problems);
     report_extra_targets("search", &positional, &mut problems);
+    report_blank_target("search", &positional, &mut problems);
     if positional.is_empty() {
         problems.push("Missing target name for search".to_string());
     }
@@ -485,6 +533,7 @@ fn handle_inspect(client: &mut DirectRpcClient, args: &[String]) -> Result<i32, 
     let mut problems = Vec::new();
     let (positional, _dry_run, _yes, _repo) = parse_flags(args, &mut problems);
     report_extra_targets("inspect", &positional, &mut problems);
+    report_blank_target("inspect", &positional, &mut problems);
     if positional.is_empty() {
         problems.push("Missing package file for inspect".to_string());
     }
@@ -528,7 +577,14 @@ fn handle_config(client: &mut DirectRpcClient, args: &[String]) -> Result<i32, S
         "set" => {
             let mut problems = Vec::new();
             let (positional, dry_run, yes, _repo) = parse_flags(&args[1..], &mut problems);
-            report_extra_targets("config set", &positional, &mut problems);
+            // `config set <key> <value>` takes exactly two positionals; only a
+            // third one is surplus (the value used to be reported as an extra).
+            for extra in positional.iter().skip(2) {
+                problems.push(format!(
+                    "Unexpected argument '{}' for 'config set'; expected <key> <value>",
+                    extra
+                ));
+            }
             if positional.len() < 2 {
                 problems.push("Usage: archbridge config set <key> <value>".to_string());
             }
@@ -735,6 +791,7 @@ fn handle_install(client: &mut DirectRpcClient, args: &[String]) -> Result<i32, 
     let mut problems = Vec::new();
     let (positional, dry_run, yes, _repo) = parse_flags(args, &mut problems);
     report_extra_targets("install", &positional, &mut problems);
+    report_blank_target("install", &positional, &mut problems);
     if positional.is_empty() {
         problems.push("Missing target for install".to_string());
     }
@@ -784,6 +841,7 @@ fn handle_uninstall(client: &mut DirectRpcClient, args: &[String]) -> Result<i32
     let mut problems = Vec::new();
     let (positional, dry_run, yes, _repo) = parse_flags(args, &mut problems);
     report_extra_targets("uninstall", &positional, &mut problems);
+    report_blank_target("uninstall", &positional, &mut problems);
     if positional.is_empty() {
         problems.push("Missing installed package name for uninstall".to_string());
     }
