@@ -533,3 +533,71 @@ fn a_blocked_plan_is_never_staged_for_execution() {
     assert!(err.contains("no longer staged"), "got '{err}'");
     assert!(!reason.is_empty());
 }
+
+/// An engine whose sources are all switched off answers discovery without ever
+/// touching the network, which is what makes this path testable off Arch.
+fn offline_engine(temp: &TempDir) -> Engine {
+    let config_path = temp.path().join("config.json");
+    fs::write(
+        &config_path,
+        r#"{"official":false,"aur":false,"flatpak":false,"appimage":false,"upstream":false,"deb":false,"rpm":false}"#,
+    )
+    .expect("write config");
+    Engine::with_config_path(&config_path)
+}
+
+#[test]
+fn install_by_name_reports_discovery_not_a_path_error() {
+    // `install htop` used to fall through to prepare_build and answer
+    // "not a valid local path, PKGBUILD, or HTTPS URL" for input that was
+    // never meant to be a path.
+    let temp = TempDir::new().expect("tempdir");
+    let mut engine = offline_engine(&temp);
+    let err = engine
+        .prepare_install("htop")
+        .expect_err("an unresolvable name must not fabricate a plan");
+    assert!(
+        !err.contains("not a valid local path"),
+        "the old path-shaped message came back: {err}"
+    );
+    assert!(err.contains("htop"), "must name the target: {err}");
+    assert!(
+        err.contains("archbridge search htop"),
+        "must point at the discovery command: {err}"
+    );
+    assert!(
+        err.contains("archbridge install <file"),
+        "must offer installing a concrete artifact: {err}"
+    );
+}
+
+#[test]
+fn install_by_name_lists_every_source_answer() {
+    let temp = TempDir::new().expect("tempdir");
+    let mut engine = offline_engine(&temp);
+    let err = engine
+        .prepare_install("htop")
+        .expect_err("no source is enabled, so nothing resolves");
+    for source in ["official", "aur", "flatpak", "appimage", "upstream"] {
+        assert!(
+            err.contains(source),
+            "the decision for '{source}' must reach the user: {err}"
+        );
+    }
+    assert!(err.contains("disabled"), "the reason must be shown: {err}");
+}
+
+#[test]
+fn install_still_accepts_a_source_url_for_building() {
+    // Installing from a repository URL is a build-then-install path; it must not
+    // be swallowed by the new discovery error for bare names.
+    let temp = TempDir::new().expect("tempdir");
+    let mut engine = offline_engine(&temp);
+    let err = engine
+        .prepare_install("https://github.com/htop-dev/htop")
+        .expect_err("the source lookup is disabled in this engine");
+    assert!(
+        err.contains("Cannot prepare a build"),
+        "a URL must be routed to the build-then-install path, got: {err}"
+    );
+}

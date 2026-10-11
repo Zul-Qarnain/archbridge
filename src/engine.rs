@@ -821,6 +821,16 @@ impl Engine {
             );
         }
 
+        // `install` also accepts something that must be built before it can be
+        // installed — a source URL, a directory or a PKGBUILD. A bare name is a
+        // discovery lookup instead, handled below.
+        if target.starts_with("https://")
+            || target.ends_with("PKGBUILD")
+            || (target.contains('/') && Path::new(target).is_dir())
+        {
+            return self.prepare_build(target, None, None, None, &[], &[]);
+        }
+
         if target.contains(".pkg.tar.") {
             let plan_id = generate_plan_id("install", target);
             let steps = vec![Step::new(
@@ -851,9 +861,7 @@ impl Engine {
         }
 
         let report = search(target, None, &self.config);
-        let rec = report.recommended_source.clone();
-
-        match rec.as_deref() {
+        match report.recommended_source.as_deref() {
             Some("official") => {
                 let plan_id = generate_plan_id("install", target);
                 let steps = vec![Step::new(
@@ -878,7 +886,11 @@ impl Engine {
                 let plan = self.stage_plan(plan, None);
                 Ok(plan)
             }
-            _ => self.prepare_build(target, None, None, None, &[], &[]),
+            // A bare name is not a build target, so the old fall-through into
+            // `prepare_build` answered "install htop" with "not a valid local
+            // path, PKGBUILD, or HTTPS URL" — a message about a different input.
+            Some(other) => Err(install_resolution_error(target, Some(other), &report)),
+            None => Err(install_resolution_error(target, None, &report)),
         }
     }
 
@@ -1229,6 +1241,46 @@ pub fn foreign_entry(reviews: &[FileReview], preferred: &str) -> Option<String> 
     shipped.sort();
     shipped.sort_by_key(|name| (name != preferred, name.len()));
     shipped.into_iter().next()
+}
+
+/// `install <name>` is a discovery lookup. When discovery cannot name a source
+/// that installs with a package command, the error has to say what was asked,
+/// what each source answered, and what to run next — the old message complained
+/// about "a valid local path, PKGBUILD, or HTTPS URL" for input that was never
+/// meant to be a path.
+fn install_resolution_error(
+    target: &str,
+    recommended: Option<&str>,
+    report: &DecisionReport,
+) -> String {
+    let mut message = match recommended {
+        Some(source) => format!(
+            "Cannot install '{target}' by name: discovery recommends the '{source}' source, which has no install-by-name command. Decide the action explicitly:",
+        ),
+        None => format!(
+            "Cannot install '{target}' by name: no enabled source reported an available package. What each source said:",
+        ),
+    };
+    for row in &report.decision_table {
+        message.push_str(&format!(
+            "\n  {}: {} — {}",
+            row.source, row.availability, row.reason
+        ));
+    }
+    message.push_str(&format!("\n\nNext steps:\n  archbridge search {target}"));
+    if let Some(url) = report
+        .decision_table
+        .iter()
+        .find(|row| row.source == "upstream")
+        .and_then(|row| row.candidates.first())
+        .and_then(|candidate| candidate.url.clone())
+    {
+        message.push_str(&format!(
+            "\n  archbridge build {url}   # build from the upstream source"
+        ));
+    }
+    message.push_str("\n  archbridge install <file.pkg.tar.zst|file.deb|file.rpm>   # install a concrete artifact");
+    message
 }
 
 /// A plan that reviewed the source but runs no steps, so the reason reaches the

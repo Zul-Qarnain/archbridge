@@ -162,16 +162,45 @@ fn no_unsigned_integrity_bypass() {
 #[test]
 fn dry_run_stops_before_rpc_execution() {
     let main = source("main.rs");
-    let stop = main
-        .find("if dry_run { return Ok(0); }")
-        .expect("main.rs must return before executing on --dry-run");
-    let execute = main
-        .find("client.call(\"v1.execute\"")
-        .expect("main.rs must call v1.execute");
+    let execute = "client.call(\"v1.execute\"";
+    // Every handler that can execute must short-circuit on `--dry-run` first.
+    // Checking only the first occurrence in the file let one correct handler
+    // stand in for the others, so a handler that dropped its guard stayed green.
+    let mut checked = 0;
+    for name in extract_fn_names(&main) {
+        let Some(start) = main.find(&format!("fn {name}(")) else {
+            continue;
+        };
+        let body = &main[start..];
+        let body = match body.find("\nfn ") {
+            Some(next) => &body[..next],
+            None => body,
+        };
+        if !body.contains(execute) {
+            continue;
+        }
+        checked += 1;
+        let stop = body
+            .find("if dry_run")
+            .unwrap_or_else(|| panic!("'{}' calls v1.execute but never checks --dry-run", name));
+        let execute = body.find(execute).expect("handler calls v1.execute");
+        assert!(
+            stop < execute,
+            "the dry-run short circuit at {stop} in '{name}' must precede v1.execute at {execute}"
+        );
+    }
     assert!(
-        stop < execute,
-        "the dry-run short circuit at {stop} must precede the v1.execute call at {execute}"
+        checked >= 4,
+        "expected the mutating handlers to stage plans, only found {checked}"
     );
+}
+
+fn extract_fn_names(text: &str) -> Vec<String> {
+    text.lines()
+        .filter_map(|line| line.trim().strip_prefix("fn "))
+        .filter_map(|rest| rest.split('(').next())
+        .map(str::to_string)
+        .collect()
 }
 
 #[test]
