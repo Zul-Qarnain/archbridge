@@ -115,7 +115,11 @@ fn native_package_review_uses_pinned_bytes() {
     assert_contains(&build, "walk_tree(&root)", "build.rs");
     assert_absent(&build, "hasher.update(path_str.as_bytes())", "build.rs");
     assert_absent(&build, "\"-tvf\".to_string()", "build.rs");
-    assert_contains(&source("archive.rs"), "hasher.update(&bytes)", "archive.rs");
+    assert_contains(
+        &source("archive.rs"),
+        "hasher.update(&chunk[..read])",
+        "archive.rs",
+    );
 
     let inspect = source("inspect.rs");
     assert_contains(&inspect, "Sha256::digest(&bytes)", "inspect.rs");
