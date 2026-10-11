@@ -643,6 +643,240 @@ fn the_first_available_source_in_preference_order_wins() {
     assert_eq!(report.recommended_source.as_deref(), Some("aur"));
 }
 
+/// A release asset is a prebuilt binary for one machine. An arm64 AppImage
+/// offered to an x86_64 host is a download that cannot run, and a name spelled
+/// `.APPIMAGE` is the same artifact as `.AppImage`.
+#[test]
+fn a_release_asset_for_another_architecture_is_not_offered() {
+    let (host_alias, foreign_alias) = if cfg!(target_arch = "x86_64") {
+        ("x86_64", "aarch64")
+    } else if cfg!(target_arch = "aarch64") {
+        ("aarch64", "x86_64")
+    } else {
+        eprintln!("unhandled host architecture; skipping");
+        return;
+    };
+    let body = serde_json::json!({
+        "tag_name": "v1.2.3",
+        "assets": [
+            {"name": format!("Tool-{foreign_alias}.AppImage"),
+             "browser_download_url": format!("https://example.com/t-{foreign_alias}.AppImage")},
+            {"name": format!("Tool-{host_alias}.APPIMAGE"),
+             "browser_download_url": format!("https://example.com/t-{host_alias}.APPIMAGE")},
+            {"name": "Tool-universal.AppImage",
+             "browser_download_url": "https://example.com/t-universal.AppImage"},
+            {"name": format!("Tool-{host_alias}.AppImage.debug"),
+             "browser_download_url": "https://example.com/t.AppImage.debug"},
+            {"name": "Tool.AppImage.sha256",
+             "browser_download_url": "https://example.com/t.AppImage.sha256"}
+        ]
+    })
+    .to_string();
+
+    let mut fake = Fake::new();
+    fake.on("api.github.com/repos/o/r/releases/latest", &body);
+    let report = search_with(
+        "tool",
+        Some("https://github.com/o/r"),
+        &all_enabled(),
+        &fake,
+    );
+    let appimage = row(&report, "appimage");
+    let names: Vec<&str> = appimage
+        .candidates
+        .iter()
+        .map(|candidate| candidate.name.as_str())
+        .collect();
+    assert!(
+        !names.iter().any(|name| name.contains(foreign_alias)),
+        "an asset built for {foreign_alias} was offered to a {host_alias} host: {names:?}"
+    );
+    assert!(
+        names.contains(&format!("Tool-{host_alias}.APPIMAGE").as_str()),
+        "a differently cased extension lost the artifact: {names:?}"
+    );
+    assert_eq!(names.len(), 2, "{names:?}");
+    let kept = &appimage.candidates[0];
+    assert_eq!(
+        kept.architecture.as_deref(),
+        Some(host_alias),
+        "the architecture a name states has to reach the review"
+    );
+    // The asset that names no architecture is kept: silence is not a mismatch.
+    assert_eq!(appimage.candidates[1].architecture, None, "{names:?}");
+}
+
+/// Both the sync database and the AUR answer a search case-insensitively, so a
+/// case-sensitive substring test loses packages the user can plainly install.
+#[test]
+fn a_source_that_matches_case_insensitively_is_read_case_insensitively() {
+    let mut fake = Fake::new();
+    fake.on("pacman -Ss", "extra/MyHtopViewer 1.0-1\nviewer\n");
+    fake.on("pacman -Si", "");
+    let report = search_with("htop", None, &all_enabled(), &fake);
+    assert_eq!(
+        row(&report, "official").availability,
+        "available",
+        "an embedded match with different case was dropped: {:?}",
+        row(&report, "official")
+    );
+
+    let mut fake = Fake::new();
+    fake.on(
+        "aur.archlinux.org",
+        r#"{"results":[{"Name":"MyHtopViewer","Version":"1.0-1"}]}"#,
+    );
+    let report = search_with("htop", None, &all_enabled(), &fake);
+    assert_eq!(
+        row(&report, "aur").availability,
+        "available",
+        "AUR matched case-sensitively: {:?}",
+        row(&report, "aur")
+    );
+}
+
+/// One source can report the same package twice, and the review has to show the
+/// newest of the two — `1.10` is newer than `1.9`, which text order gets wrong.
+#[test]
+fn a_repeated_record_keeps_the_newest_version() {
+    let canned = "\
+extra/htop 1.9-1
+old description
+extra/htop 1.10-1
+Interactive process viewer
+core/htop 0.1-1
+a different repository is a different choice
+";
+    let mut fake = Fake::new();
+    fake.on("pacman -Ss", canned);
+    fake.on("pacman -Si", "");
+    let report = search_with("htop", None, &all_enabled(), &fake);
+    let official = row(&report, "official");
+    let listed: Vec<(&str, &str)> = official
+        .candidates
+        .iter()
+        .map(|candidate| {
+            (
+                candidate.name.as_str(),
+                candidate.version.as_deref().unwrap_or(""),
+            )
+        })
+        .collect();
+    assert_eq!(
+        listed,
+        vec![("htop", "1.10-1"), ("htop", "0.1-1")],
+        "the duplicate must collapse to the newer record: {listed:?}"
+    );
+    assert_eq!(official.candidates[0].repository.as_deref(), Some("extra"));
+}
+
+/// A release listing can point at an archive that is served over plain HTTP
+/// after a redirect. The bytes then have no integrity at all, so the answer is
+/// "unavailable", not a candidate whose download can be replaced in transit.
+#[test]
+fn an_archive_that_redirects_off_https_is_refused() {
+    for reply in [
+        "200 application/gzip http://mirror.example/o/r.tar.gz",
+        "200 application/octet-stream ftp://mirror.example/o/r.tar.gz",
+    ] {
+        let mut fake = Fake::new();
+        fake.on("/repos/o/r/releases/latest", r#"{"message":"Not Found"}"#);
+        fake.on("-sSL", r#"{"default_branch":"main"}"#);
+        fake.on("-sSIL", reply);
+        let report = search_with(
+            "tool",
+            Some("https://github.com/o/r"),
+            &all_enabled(),
+            &fake,
+        );
+        let upstream = row(&report, "upstream");
+        for candidate in &upstream.candidates {
+            let url = candidate.url.clone().unwrap_or_default();
+            assert!(url.starts_with("https://"), "reply {reply:?} offered {url}");
+        }
+        assert_eq!(
+            upstream.availability, "unavailable",
+            "reply {reply:?} was treated as a source: {upstream:?}"
+        );
+    }
+
+    // A probe that names no final URL still falls back to the https request.
+    let mut fake = Fake::new();
+    fake.on("/repos/o/r/releases/latest", r#"{"message":"Not Found"}"#);
+    fake.on("-sSL", r#"{"default_branch":"main"}"#);
+    fake.on("-sSIL", "200 application/gzip");
+    let report = search_with(
+        "tool",
+        Some("https://github.com/o/r"),
+        &all_enabled(),
+        &fake,
+    );
+    assert_eq!(row(&report, "upstream").availability, "available");
+}
+
+/// Every request a search makes is a child `curl` that follows redirects: a
+/// response may not be a bottomless stream and a redirect may not leave TLS.
+#[test]
+fn every_curl_request_bounds_its_response_and_its_redirects() {
+    let mut fake = Fake::new();
+    fake.on("aur.archlinux.org", r#"{"results":[]}"#);
+    fake.on("api.github.com", r#"{"assets":[]}"#);
+    fake.on(
+        "-sSIL",
+        "200 application/gzip https://codeload.github.com/o/r/tar.gz/1234567",
+    );
+    search_with(
+        "tool",
+        Some("https://github.com/o/r"),
+        &all_enabled(),
+        &fake,
+    );
+    let lines = fake.command_lines();
+    let curls: Vec<&String> = lines
+        .iter()
+        .filter(|line| line.starts_with("curl"))
+        .collect();
+    assert!(curls.len() >= 4, "expected several requests, got {curls:?}");
+    for line in curls {
+        assert!(
+            line.contains("--proto-redir =https"),
+            "a redirect could leave TLS: {line}"
+        );
+        assert!(
+            line.contains("--max-filesize"),
+            "an unbounded reply: {line}"
+        );
+    }
+}
+
+/// A foreign file is offered for inspection only when it is a file, and the
+/// importer that reads it decides by lower-cased suffix.
+#[test]
+fn a_foreign_file_is_detected_the_way_the_inspector_reads_it() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let upper = dir.path().join("Sample.DEB");
+    std::fs::write(&upper, b"not really a deb").expect("write");
+    let directory = dir.path().join("looks-like.deb");
+    std::fs::create_dir(&directory).expect("mkdir");
+
+    let mut fake = Fake::new();
+    fake.fail("pacman", "pacman is unavailable");
+    fake.fail("curl", "offline");
+    let report = search_with(upper.to_str().unwrap(), None, &all_enabled(), &fake);
+    assert_eq!(
+        row(&report, "deb").availability,
+        "available",
+        "an uppercase suffix is the same format to the inspector"
+    );
+
+    let report = search_with(directory.to_str().unwrap(), None, &all_enabled(), &fake);
+    assert_eq!(
+        row(&report, "deb").availability,
+        "unavailable",
+        "a directory called x.deb holds no package to inspect"
+    );
+}
+
 /// Deterministic sweep: hostile targets and hostile payloads through every
 /// source at once. Nothing may panic, and no control character or traversal
 /// segment may come out in a candidate or a reason.

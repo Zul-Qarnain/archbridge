@@ -1,6 +1,7 @@
 use crate::config::Config;
 use crate::process::{run_step, ProcessOutput, Step};
 use serde::{Deserialize, Serialize};
+use std::cmp::Ordering;
 use std::path::Path;
 
 /// Everything discovery does to the outside world goes through a probe, so a
@@ -26,6 +27,31 @@ const URL_BYTES: usize = 2048;
 /// Candidate cap per source: enough to choose from, far below what a hostile
 /// mirror can return in one response.
 const MAX_CANDIDATES: usize = 25;
+
+/// Bytes one discovery response may occupy. A search answer is a few hundred
+/// records of text; anything larger is a mirror trying to fill the daemon's
+/// memory, and `curl` is the only place the transfer can be stopped cheaply.
+const MAX_RESPONSE_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Build the one `curl` invocation shape discovery uses. `head` carries the
+/// caller's own switches (`-fsSL` for a body, `-sSIL` to ask a URL about
+/// itself), and what every request adds is a ceiling on the response and a
+/// refusal to follow a redirect onto a weaker transport than it started on —
+/// an https answer redirected to http can be rewritten by anyone on the path.
+fn curl_step(head: &str, extra: &[&str], url: &str, purpose: &str, timeout: u64) -> Step {
+    let mut args: Vec<String> = vec![head.to_string()];
+    args.extend(extra.iter().map(|arg| arg.to_string()));
+    args.extend([
+        "--proto-redir".to_string(),
+        "=https".to_string(),
+        "--max-filesize".to_string(),
+        MAX_RESPONSE_BYTES.to_string(),
+        "-m".to_string(),
+        timeout.to_string(),
+        url.to_string(),
+    ]);
+    Step::new("curl", args, purpose, timeout)
+}
 
 /// A search target is also a command argument and a URL segment, so it has a
 /// ceiling of its own.
@@ -90,6 +116,164 @@ fn is_package_name(name: &str) -> bool {
         && name
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '+' | '-' | '@'))
+}
+
+/// Whether a source's package is the thing the user typed for. Both the pacman
+/// sync database and the AUR answer case-insensitively, so matching has to as
+/// well: a case-sensitive substring test drops `MyHtop` from an `htop` search.
+fn name_matches(name: &str, target: &str) -> bool {
+    name.eq_ignore_ascii_case(target) || name.to_lowercase().contains(&target.to_lowercase())
+}
+
+/// Largest version ordering this function will attempt. alpm reads whole digit
+/// runs as numbers; comparing them by shape keeps a 200-digit response from
+/// becoming an overflow, and a run longer than a real version is data.
+const MAX_VERSION_BYTES: usize = 256;
+
+/// alpm/RPM version ordering: alternating numeric and alphabetic chunks, where a
+/// numeric chunk outranks an alphabetic one, `~` sorts before anything (including
+/// the end of the string), a leading `epoch:` wins over everything else, and a
+/// longer version breaks a tie. This is what separates `1.10` from `1.9` —
+/// lexicographic text order puts `1.9` first, and a review that ranks the older
+/// release higher recommends the wrong package.
+pub fn compare_versions(left: &str, right: &str) -> Ordering {
+    let (left_epoch, left_rest) = split_version_epoch(left);
+    let (right_epoch, right_rest) = split_version_epoch(right);
+    match left_epoch.cmp(&right_epoch) {
+        Ordering::Equal => {}
+        order => return order,
+    }
+    compare_chunks(&version_chunks(left_rest), &version_chunks(right_rest))
+}
+
+fn split_version_epoch(raw: &str) -> (u64, &str) {
+    match raw.split_once(':') {
+        Some((prefix, rest))
+            if !prefix.is_empty()
+                && prefix.len() <= 16
+                && prefix.bytes().all(|b| b.is_ascii_digit()) =>
+        {
+            (prefix.parse().unwrap_or(0), rest)
+        }
+        _ => (0, raw),
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum VersionChunk<'a> {
+    Numeric(&'a str),
+    Alpha(&'a str),
+    Tilde,
+}
+
+fn version_chunks(raw: &str) -> Vec<VersionChunk<'_>> {
+    let raw = if raw.len() > MAX_VERSION_BYTES {
+        // A ceiling on the work a response can cause, never a cut through the
+        // middle of a character.
+        let mut end = MAX_VERSION_BYTES;
+        while end > 0 && !raw.is_char_boundary(end) {
+            end -= 1;
+        }
+        &raw[..end]
+    } else {
+        raw
+    };
+    let bytes = raw.as_bytes();
+    let mut chunks = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let start = i;
+        match bytes[i] {
+            b'0'..=b'9' => {
+                while i < bytes.len() && bytes[i].is_ascii_digit() {
+                    i += 1;
+                }
+                chunks.push(VersionChunk::Numeric(&raw[start..i]));
+            }
+            b'a'..=b'z' | b'A'..=b'Z' => {
+                while i < bytes.len() && bytes[i].is_ascii_alphabetic() {
+                    i += 1;
+                }
+                chunks.push(VersionChunk::Alpha(&raw[start..i]));
+            }
+            b'~' => {
+                i += 1;
+                chunks.push(VersionChunk::Tilde);
+            }
+            // Any other byte is a separator: `1.0-2` and `1.0_2` both chunk as
+            // 1, 0, 2, which is how a pkgrel participates in the ordering.
+            _ => i += 1,
+        }
+    }
+    chunks
+}
+
+fn compare_chunks(left: &[VersionChunk<'_>], right: &[VersionChunk<'_>]) -> Ordering {
+    for pair in left.iter().zip(right.iter()) {
+        let order = match pair {
+            (VersionChunk::Tilde, VersionChunk::Tilde) => Ordering::Equal,
+            (VersionChunk::Tilde, _) => Ordering::Less,
+            (_, VersionChunk::Tilde) => Ordering::Greater,
+            (VersionChunk::Numeric(a), VersionChunk::Numeric(b)) => compare_digit_runs(a, b),
+            (VersionChunk::Numeric(_), VersionChunk::Alpha(_)) => Ordering::Greater,
+            (VersionChunk::Alpha(_), VersionChunk::Numeric(_)) => Ordering::Less,
+            (VersionChunk::Alpha(a), VersionChunk::Alpha(b)) => a.cmp(b),
+        };
+        if order != Ordering::Equal {
+            return order;
+        }
+    }
+    // A tie over every shared chunk: the version that continues is the newer
+    // one, unless what continues is a pre-release marker, which sorts before the
+    // version it is a preview of.
+    match (left.get(right.len()), right.get(left.len())) {
+        (Some(VersionChunk::Tilde), None) => Ordering::Less,
+        (None, Some(VersionChunk::Tilde)) => Ordering::Greater,
+        (Some(_), None) => Ordering::Greater,
+        (None, Some(_)) => Ordering::Less,
+        _ => Ordering::Equal,
+    }
+}
+
+fn compare_digit_runs(left: &str, right: &str) -> Ordering {
+    let left = left.trim_start_matches('0');
+    let right = right.trim_start_matches('0');
+    left.len().cmp(&right.len()).then_with(|| left.cmp(right))
+}
+
+/// A stated version is worth more than none, and a newer one is worth more than
+/// an older one — which is the whole of choosing between two records for the
+/// same package.
+fn version_is_newer(candidate: Option<&str>, current: Option<&str>) -> bool {
+    match (candidate, current) {
+        (Some(newer), Some(current)) => compare_versions(newer, current) == Ordering::Greater,
+        (Some(_), None) => true,
+        _ => false,
+    }
+}
+
+/// One source can report the same package twice: a mirror repeats a record, a
+/// custom repository lists the same name in two databases, and a release can
+/// carry an asset under the same name twice. A review of duplicates reads as
+/// choice where there is none, so each name/repository pair is kept once — the
+/// newest version of it.
+fn dedupe_candidates(candidates: &mut Vec<Candidate>) {
+    let mut kept: Vec<Candidate> = Vec::with_capacity(candidates.len());
+    for candidate in candidates.drain(..) {
+        match kept.iter_mut().find(|existing| {
+            existing.name.eq_ignore_ascii_case(&candidate.name)
+                && existing.repository == candidate.repository
+        }) {
+            None => kept.push(candidate),
+            Some(existing)
+                if version_is_newer(candidate.version.as_deref(), existing.version.as_deref()) =>
+            {
+                *existing = candidate;
+            }
+            Some(_) => {}
+        }
+    }
+    *candidates = kept;
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -175,8 +359,11 @@ pub fn search_with(
     }
     let target = target.trim();
 
-    let is_deb_file = target.ends_with(".deb") && Path::new(target).exists();
-    let is_rpm_file = target.ends_with(".rpm") && Path::new(target).exists();
+    // The inspector and the importer both decide by lower-cased suffix, so this
+    // has to as well — and a directory called `tool.deb` is not a package.
+    let folded = target.to_ascii_lowercase();
+    let is_deb_file = folded.ends_with(".deb") && Path::new(target).is_file();
+    let is_rpm_file = folded.ends_with(".rpm") && Path::new(target).is_file();
 
     // Determine repository URL if available
     let repo_url = explicit_repo
@@ -382,7 +569,7 @@ fn parse_pacman_ss(output: &str, target: &str) -> Vec<Candidate> {
                         }
                         _ => None,
                     };
-                    if pkg_name.eq_ignore_ascii_case(target) || pkg_name.contains(target) {
+                    if name_matches(pkg_name, target) {
                         candidates.push(Candidate {
                             name: pkg_name.to_string(),
                             version: sanitize_opt(Some(version)),
@@ -401,6 +588,7 @@ fn parse_pacman_ss(output: &str, target: &str) -> Vec<Candidate> {
         }
         i += 1;
     }
+    dedupe_candidates(&mut candidates);
     rank_candidates(&mut candidates, target);
     candidates
 }
@@ -552,7 +740,7 @@ fn parse_aur_results(body: &str, target: &str) -> Option<Vec<Candidate>> {
         if !is_package_name(name) {
             continue;
         }
-        if !(name.eq_ignore_ascii_case(target) || name.contains(target)) {
+        if !name_matches(name, target) {
             continue;
         }
         // `URLPath` is the AUR git snapshot holding the PKGBUILD — the actual
@@ -579,6 +767,7 @@ fn parse_aur_results(body: &str, target: &str) -> Option<Vec<Candidate>> {
             break;
         }
     }
+    dedupe_candidates(&mut candidates);
     rank_candidates(&mut candidates, target);
     Some(candidates)
 }
@@ -605,12 +794,7 @@ fn query_aur(target: &str, probe: &dyn Probe) -> DecisionRow {
         "https://aur.archlinux.org/rpc/v5/search/{}",
         encode_url_segment(target)
     );
-    let step = Step::new(
-        "curl",
-        vec!["-fsSL", "-m", "10", &url],
-        "Query AUR RPC v5",
-        10,
-    );
+    let step = curl_step("-fsSL", &[], &url, "Query AUR RPC v5", 10);
     match probe.query(&step) {
         Ok(out) if out.exit_code == 0 && !out.stdout.trim().is_empty() => {
             match parse_aur_results(&out.stdout, target) {
@@ -651,6 +835,74 @@ fn query_aur(target: &str, probe: &dyn Probe) -> DecisionRow {
             reason: format!("Failed to reach AUR RPC API: {}", e),
             candidates: vec![],
         },
+    }
+}
+
+/// Whether a release asset name ends in this extension, whatever case the
+/// uploader used: the same payload is published as `.AppImage`, `.appimage` and
+/// `.APPIMAGE`, and matching one spelling silently loses the candidate.
+fn ends_extension(name: &str, extension: &str) -> bool {
+    name.to_ascii_lowercase().ends_with(extension)
+}
+
+/// The architecture a release asset is built for, as far as its name says.
+/// Names are free text, so "the name says nothing" is a different answer from
+/// "the name says arm64", and only the second one rules the asset out.
+fn asset_architecture(name: &str) -> Option<&'static str> {
+    // Splitting on every non-alphanumeric character folds `x86_64`, `x86-64` and
+    // `x86.64` to the same token sequence, which is then matched as whole
+    // tokens so `arm` inside `charmel` cannot decide anything.
+    let flat = name
+        .to_ascii_lowercase()
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+    let padded = format!("-{flat}-");
+    let names_any_of = |aliases: &[&str]| {
+        aliases
+            .iter()
+            .any(|alias| padded.contains(&format!("-{alias}-")))
+    };
+    if names_any_of(&["x86-64", "x86_64", "amd64", "x64"]) {
+        Some("x86_64")
+    } else if names_any_of(&["aarch64", "arm64"]) {
+        Some("aarch64")
+    } else if names_any_of(&[
+        "i386", "i486", "i586", "i686", "386", "586", "686", "x86-32", "x86", "ia32", "win32",
+    ]) {
+        Some("i686")
+    } else if names_any_of(&[
+        "arm", "armhf", "armel", "armv5", "armv6", "armv7", "armv7l", "armv8",
+    ]) {
+        // Arch has no 32-bit ARM repository, so these are named, wrong, and not
+        // the same as being silent about the architecture.
+        Some("armv7")
+    } else if names_any_of(&[
+        "riscv64",
+        "ppc64le",
+        "ppc64",
+        "powerpc",
+        "s390x",
+        "mips64",
+        "mips",
+        "loongarch64",
+        "sparc64",
+    ]) {
+        Some("other")
+    } else {
+        None
+    }
+}
+
+/// What an asset has to be built for to run here. The compiled target, not a
+/// string a response can talk its way into.
+fn host_architecture() -> &'static str {
+    match std::env::consts::ARCH {
+        "x86_64" => "x86_64",
+        "aarch64" => "aarch64",
+        "x86" => "i686",
+        other => other,
     }
 }
 
@@ -695,16 +947,10 @@ fn query_release_asset(
         }
     };
 
-    let step = Step::new(
-        "curl",
-        vec![
-            "-fsSL",
-            "-m",
-            "10",
-            "-H",
-            "User-Agent: archbridge",
-            &api_url,
-        ],
+    let step = curl_step(
+        "-fsSL",
+        &["-H", "User-Agent: archbridge"],
+        &api_url,
         "Query GitHub release assets",
         10,
     );
@@ -731,13 +977,21 @@ fn query_release_asset(
                             None => continue,
                         };
 
+                        // A release asset is a prebuilt binary for one machine.
+                        // An asset whose name states an architecture states which
+                        // machine it runs on, and offering one built for another
+                        // architecture promises a program that cannot start.
+                        let architecture = asset_architecture(&name);
+                        if architecture.is_some_and(|arch| arch != host_architecture()) {
+                            continue;
+                        }
+
                         let matches = match asset_type {
                             "flatpak" => {
-                                name.ends_with(".flatpakref") || name.ends_with(".flatpak")
+                                ends_extension(&name, ".flatpakref")
+                                    || ends_extension(&name, ".flatpak")
                             }
-                            "appimage" => {
-                                name.ends_with(".AppImage") || name.ends_with(".appimage")
-                            }
+                            "appimage" => ends_extension(&name, ".appimage"),
                             _ => false,
                         };
 
@@ -748,6 +1002,7 @@ fn query_release_asset(
                                 url: Some(download_url),
                                 source_url: Some(repo_url_str.to_string()),
                                 description: Some(format!("Release asset from {}", repo_url_str)),
+                                architecture: architecture.map(str::to_string),
                                 ..Default::default()
                             });
                             if candidates.len() >= MAX_CANDIDATES {
@@ -756,6 +1011,7 @@ fn query_release_asset(
                         }
                     }
 
+                    dedupe_candidates(&mut candidates);
                     if !candidates.is_empty() {
                         return DecisionRow {
                             source: asset_type.to_string(),
@@ -997,9 +1253,10 @@ fn upstream_unavailable(repo_url: &str, notes: Vec<String>) -> DecisionRow {
 /// caller: `curl -f` discards the body that explains a 403 rate limit.
 fn github_api_json(path: &str, probe: &dyn Probe) -> Result<serde_json::Value, String> {
     let api_url = format!("https://api.github.com{}", path);
-    let step = Step::new(
-        "curl",
-        vec!["-sSL", "-m", "10", "-H", "User-Agent: archbridge", &api_url],
+    let step = curl_step(
+        "-sSL",
+        &["-H", "User-Agent: archbridge"],
+        &api_url,
         "Query GitHub API",
         10,
     );
@@ -1027,18 +1284,15 @@ fn github_api_json(path: &str, probe: &dyn Probe) -> Result<serde_json::Value, S
 /// resolves to. A release listing can name an asset that is gone, and a 404 page
 /// would otherwise reach the archive parser.
 fn probe_source_archive(url: &str, probe: &dyn Probe) -> Option<String> {
-    let step = Step::new(
-        "curl",
-        vec![
-            "-sSIL",
-            "-m",
-            "15",
+    let step = curl_step(
+        "-sSIL",
+        &[
             "-o",
             "/dev/null",
             "-w",
             "%{http_code} %{content_type} %{url_effective}",
-            url,
         ],
+        url,
         "Verify upstream source archive",
         15,
     );
@@ -1049,12 +1303,19 @@ fn probe_source_archive(url: &str, probe: &dyn Probe) -> Option<String> {
                 let is_archive = fields.next() == Some("200")
                     && !fields.next().unwrap_or("text/html").starts_with("text/");
                 if is_archive {
-                    // The address curl ended up at is what a build would fetch,
-                    // so it has to be a URL that can actually be fetched.
-                    fields
-                        .next()
-                        .and_then(|final_url| sanitize_url(Some(final_url)))
-                        .or_else(|| Some(url.to_string()))
+                    // The address curl ended up at is what a build would fetch.
+                    // A redirect that left https means the bytes are not the ones
+                    // the release page described, and a plain-HTTP answer can be
+                    // replaced by anyone on the path, so an effective URL that is
+                    // not fetchable over TLS disqualifies the archive instead of
+                    // falling back to the address it was redirected away from.
+                    match fields.next() {
+                        Some(final_url) => sanitize_url(Some(final_url))
+                            .filter(|resolved| resolved.starts_with("https://")),
+                        // Nothing was printed to name the destination, so the
+                        // request URL is the only address worth reporting.
+                        None => Some(url.to_string()),
+                    }
                 } else {
                     None
                 }
@@ -1084,7 +1345,14 @@ pub fn parse_gitlab_repo(url: &str) -> Option<String> {
         .unwrap_or("")
         .trim_end_matches('/')
         .trim_end_matches(".git");
-    let after_scheme = trimmed.split_once("://").map_or(trimmed, |rest| rest.1);
+    let after_scheme = match trimmed.split_once("://") {
+        // Same rule as GitHub: a project address names where the bytes come
+        // from, and a plain-HTTP or credential-bearing one is not an address
+        // this engine will fetch from.
+        Some((scheme, rest)) if scheme.eq_ignore_ascii_case("https") => rest,
+        Some((_, _)) => return None,
+        None => trimmed,
+    };
     let segments: Vec<&str> = after_scheme.split('/').filter(|s| !s.is_empty()).collect();
     if segments.first().map(|h| h.to_lowercase()) != Some("gitlab.com".to_string()) {
         return None;
@@ -1123,16 +1391,10 @@ fn query_github_repositories(target: &str, probe: &dyn Probe) -> DecisionRow {
         "https://api.github.com/search/repositories?q={}&per_page=5",
         query
     );
-    let step = Step::new(
-        "curl",
-        vec![
-            "-fsSL",
-            "-m",
-            "10",
-            "-H",
-            "User-Agent: archbridge",
-            &api_url,
-        ],
+    let step = curl_step(
+        "-fsSL",
+        &["-H", "User-Agent: archbridge"],
+        &api_url,
         "Search GitHub repositories",
         10,
     );
@@ -1244,7 +1506,11 @@ pub fn parse_github_repo(url: &str) -> Option<(String, String)> {
         .trim_end_matches(".git");
     let (host_part, path_part) = match trimmed.split_once("://") {
         Some((scheme, rest)) => {
-            if !matches!(scheme.to_ascii_lowercase().as_str(), "http" | "https") {
+            // A repository address is where a build's bytes come from, and a
+            // plain-HTTP one can be answered by anyone. Credentials in the URL
+            // are refused by the host check below, which compares the whole
+            // authority against a fixed name.
+            if !scheme.eq_ignore_ascii_case("https") {
                 return None;
             }
             let mut parts = rest.splitn(2, '/');
@@ -1365,5 +1631,150 @@ mod tests {
         assert!(!encoded.contains('&'));
         assert!(!encoded.contains('/'));
         assert_eq!(encoded, "..%2F..%2Frpc%3Fv%3D1%23x%26y%3D%28%29");
+    }
+
+    /// `1.10` is newer than `1.9` and `1:0.1` is newer than `99.0`: text order
+    /// says the opposite for both, and ranking by text order recommends the older
+    /// release.
+    #[test]
+    fn versions_order_the_way_alpm_does() {
+        for (older, newer) in [
+            ("1.9", "1.10"),
+            ("1.0", "1.0.1"),
+            ("2.0-1", "2.0-2"),
+            ("99.0", "1:0.1"),
+            ("0:1.0", "1:0.1"),
+            ("1.0~rc1", "1.0"),
+            ("1.0~rc1", "1.0~rc2"),
+            ("v1.0", "1.0"),
+            ("1.9.5", "1.10.0"),
+            ("1.0.beta", "1.0-2"),
+            ("9", "10"),
+            ("1.0.0", "1.0.0.1"),
+            ("", "1"),
+        ] {
+            assert_eq!(
+                compare_versions(older, newer),
+                Ordering::Less,
+                "{older} should sort below {newer}"
+            );
+            assert_eq!(
+                compare_versions(newer, older),
+                Ordering::Greater,
+                "{newer} should sort above {older}"
+            );
+        }
+        for (same, other) in [
+            ("1.10-1", "1.10-1"),
+            ("1:2.0", "1:2.0"),
+            ("1.0", "1.0-"),
+            ("1_0", "1.0"),
+            ("01.02", "1.2"),
+        ] {
+            assert_eq!(
+                compare_versions(same, other),
+                Ordering::Equal,
+                "{same} and {other} are the same version"
+            );
+        }
+        // Hostile shapes must be ordered, not panicked on or wrapped.
+        assert_ne!(
+            compare_versions(&"9".repeat(400), &"1".repeat(401)),
+            Ordering::Equal
+        );
+        assert_eq!(compare_versions("", ""), Ordering::Equal);
+        assert_eq!(compare_versions(":::", "==="), Ordering::Equal);
+        // Multi-byte text over the chunking ceiling must be cut at a character
+        // boundary, or the ordering itself becomes the panic.
+        for hostile in [&"…".repeat(200), &"🐍".repeat(200), &"é".repeat(300)] {
+            let _ = compare_versions(hostile, "1.0");
+            let _ = compare_versions("1.0", hostile);
+        }
+    }
+
+    #[test]
+    fn a_duplicate_record_keeps_the_newest_version_only() {
+        let mut candidates = vec![
+            Candidate {
+                name: "htop".to_string(),
+                version: Some("1.9-1".to_string()),
+                repository: Some("extra".to_string()),
+                ..Default::default()
+            },
+            Candidate {
+                name: "htop".to_string(),
+                version: Some("1.10-1".to_string()),
+                repository: Some("extra".to_string()),
+                ..Default::default()
+            },
+            Candidate {
+                name: "HTOP".to_string(),
+                version: None,
+                repository: Some("extra".to_string()),
+                ..Default::default()
+            },
+            Candidate {
+                name: "htop".to_string(),
+                version: Some("0.1".to_string()),
+                repository: Some("testing".to_string()),
+                ..Default::default()
+            },
+        ];
+        dedupe_candidates(&mut candidates);
+        assert_eq!(candidates.len(), 2, "{candidates:?}");
+        assert_eq!(candidates[0].version.as_deref(), Some("1.10-1"));
+        assert_eq!(candidates[0].name, "htop");
+        // A different repository is a different choice, not a duplicate.
+        assert_eq!(candidates[1].repository.as_deref(), Some("testing"));
+    }
+
+    #[test]
+    fn name_matching_folds_case_the_way_the_databases_do() {
+        assert!(name_matches("MyHtop", "htop"));
+        assert!(name_matches("htop", "HTOP"));
+        assert!(name_matches("htop-qt", "htop"));
+        assert!(!name_matches("vim", "htop"));
+    }
+
+    #[test]
+    fn an_asset_name_states_the_machine_it_runs_on() {
+        assert_eq!(
+            asset_architecture("Tool-1.0-x86_64.AppImage"),
+            Some("x86_64")
+        );
+        assert_eq!(asset_architecture("tool.amd64.flatpak"), Some("x86_64"));
+        assert_eq!(asset_architecture("tool-aarch64.AppImage"), Some("aarch64"));
+        assert_eq!(asset_architecture("Tool-ARM64.app"), Some("aarch64"));
+        assert_eq!(asset_architecture("tool-i386.deb"), Some("i686"));
+        assert_eq!(asset_architecture("tool-armhf.bin"), Some("armv7"));
+        // Saying nothing is not the same as saying the wrong thing.
+        assert_eq!(asset_architecture("tool.AppImage"), None);
+        assert_eq!(asset_architecture("charmel-1.0.AppImage"), None);
+        assert_eq!(asset_architecture("x86_64-suse-toolbox"), Some("x86_64"));
+        assert!(ends_extension("Tool.APPIMAGE", ".appimage"));
+        assert!(ends_extension("tool.Flatpakref", ".flatpakref"));
+        assert!(!ends_extension("tool.AppImage.sig", ".appimage"));
+    }
+
+    #[test]
+    fn a_repo_address_must_be_https_and_free_of_credentials() {
+        // The bare and host-first forms carry no transport to negotiate.
+        assert_eq!(
+            parse_github_repo("owner/repo"),
+            Some(("owner".to_string(), "repo".to_string()))
+        );
+        assert_eq!(
+            parse_github_repo("https://github.com/owner/repo"),
+            Some(("owner".to_string(), "repo".to_string()))
+        );
+        assert_eq!(parse_github_repo("http://github.com/owner/repo"), None);
+        assert_eq!(parse_github_repo("HTTP://github.com/owner/repo"), None);
+        assert_eq!(parse_github_repo("https://user:pass@github.com/a/b"), None);
+        assert_eq!(parse_gitlab_repo("http://gitlab.com/o/r"), None);
+        assert_eq!(parse_gitlab_repo("ssh://git@gitlab.com/o/r"), None);
+        assert_eq!(
+            parse_gitlab_repo("https://gitlab.com/o/r"),
+            Some("o/r".to_string())
+        );
     }
 }
