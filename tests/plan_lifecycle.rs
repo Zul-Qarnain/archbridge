@@ -847,3 +847,41 @@ fn odd_strings_never_panic_and_never_stage_an_unreviewable_argument() {
         "the sweep was not entirely refused: at least the clean shapes staged"
     );
 }
+
+#[test]
+fn an_uninstall_rejection_says_what_is_wrong_with_the_name() {
+    let temp = TempDir::new().unwrap();
+    let mut engine = engine_in(&temp);
+    for (name, reason) in [
+        ("-Rns", "pacman option"),
+        (".hidden", "cannot start with '.'"),
+        ("a/b", "path or file"),
+        ("héllo", "ASCII letters"),
+        ("hello world", "ASCII letters"),
+        ("", "empty"),
+    ] {
+        let error = engine.prepare_uninstall(name).unwrap_err();
+        assert!(error.contains(reason), "{name:?}: {error}");
+    }
+    assert!(engine.prepare_uninstall("lib32-foo_bar+baz@1.2").is_ok());
+}
+
+#[test]
+fn a_search_plan_summary_names_the_source_without_debug_noise() {
+    let temp = TempDir::new().unwrap();
+    // Every source off, so nothing can be recommended and no network is used.
+    let mut engine = engine_in(&temp);
+    for key in [
+        "official", "aur", "flatpak", "appimage", "upstream", "deb", "rpm",
+    ] {
+        engine.config.set(key, "false").unwrap();
+    }
+    let plan = engine.prepare_search("htop", None).unwrap();
+    assert!(
+        plan.summary.contains("recommended source is none"),
+        "{}",
+        plan.summary
+    );
+    assert!(!plan.summary.contains("Some("), "{}", plan.summary);
+    assert!(!plan.summary.contains("None"), "{}", plan.summary);
+}

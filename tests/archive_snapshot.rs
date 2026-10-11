@@ -472,3 +472,118 @@ impl<T> Rejected for Result<T, String> {
         }
     }
 }
+
+// ------------------------------------------------- directory snapshot selection
+
+fn tar_names_and_links(tarball: &[u8]) -> Vec<(String, Option<String>)> {
+    let decoder = flate2::read::GzDecoder::new(tarball);
+    let mut archive = tar::Archive::new(decoder);
+    archive
+        .entries()
+        .unwrap()
+        .map(|entry| {
+            let entry = entry.unwrap();
+            let path = entry.path().unwrap().to_string_lossy().to_string();
+            let link = entry
+                .link_name()
+                .unwrap()
+                .map(|l| l.to_string_lossy().to_string());
+            (path, link)
+        })
+        .collect()
+}
+
+#[test]
+fn only_top_level_vcs_and_build_output_are_left_out_of_a_directory_snapshot() {
+    // Regression: `starts_with(".git")` / `contains("target/")` matched on the
+    // whole relative path, so `.github/`, `.gitignore` and any `…/target/…`
+    // source directory vanished from the review and the tarball.
+    let dir = tempfile::tempdir().unwrap();
+    for (path, body) in [
+        ("main.c", "int main(){}"),
+        (".gitignore", "build/\n"),
+        (".github/workflows/ci.yml", "on: push\n"),
+        ("src/target/backend.c", "void b(){}"),
+        ("include/mytarget/x.h", "#pragma once"),
+        ("notes..txt", "two dots in a name"),
+        (".git/config", "[core]"),
+        ("target/debug/out", "binary"),
+        (".archbridge/jobs/x/log", "log"),
+    ] {
+        let full = dir.path().join(path);
+        std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+        std::fs::write(full, body).unwrap();
+    }
+    let snapshot = archbridge::archive::snapshot_directory(dir.path()).unwrap();
+    let reviewed: Vec<&str> = snapshot.reviews.iter().map(|r| r.path.as_str()).collect();
+    for kept in [
+        "main.c",
+        ".gitignore",
+        ".github/workflows/ci.yml",
+        "src/target/backend.c",
+        "include/mytarget/x.h",
+        "notes..txt",
+    ] {
+        assert!(reviewed.contains(&kept), "{kept} was dropped: {reviewed:?}");
+    }
+    for skipped in [".git/config", "target/debug/out", ".archbridge/jobs/x/log"] {
+        assert!(!reviewed.contains(&skipped), "{skipped} must stay out");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn symlinks_that_stay_inside_the_tree_are_archived_and_reviewed() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("lib/sub")).unwrap();
+    std::fs::write(dir.path().join("lib/libx.so.1"), "elf").unwrap();
+    std::fs::write(dir.path().join("lib/data.txt"), "d").unwrap();
+    std::os::unix::fs::symlink("libx.so.1", dir.path().join("lib/libx.so")).unwrap();
+    std::os::unix::fs::symlink("../data.txt", dir.path().join("lib/sub/data")).unwrap();
+    std::os::unix::fs::symlink("libx..so.1", dir.path().join("lib/odd")).unwrap();
+
+    let snapshot = archbridge::archive::snapshot_directory(dir.path()).unwrap();
+    let entries = tar_names_and_links(&snapshot.tarball_bytes);
+    assert!(
+        entries.contains(&("lib/libx.so".to_string(), Some("libx.so.1".to_string()))),
+        "the link was silently dropped from the archive: {entries:?}"
+    );
+    assert!(entries
+        .iter()
+        .any(|(p, l)| p == "lib/sub/data" && l.as_deref() == Some("../data.txt")));
+    let review = snapshot
+        .reviews
+        .iter()
+        .find(|r| r.path == "lib/libx.so")
+        .expect("the link is part of the review");
+    assert_eq!(review.content.as_deref(), Some("symlink -> libx.so.1"));
+}
+
+#[cfg(unix)]
+#[test]
+fn symlinks_that_leave_the_tree_are_still_refused_with_a_readable_message() {
+    for (name, target) in [
+        ("up", "../outside"),
+        ("deep", "../../etc/passwd"),
+        ("abs", "/etc/passwd"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(target, dir.path().join(name)).unwrap();
+        let Err(error) = archbridge::archive::snapshot_directory(dir.path()) else {
+            panic!("{target} must be refused");
+        };
+        assert!(error.contains("Unsafe symlink"), "{target}: {error}");
+        assert!(error.contains("source directory"), "{error}");
+        assert!(!error.contains("'\""), "no Debug-quoted target: {error}");
+    }
+}
+
+#[test]
+fn a_missing_directory_error_does_not_double_quote_the_path() {
+    let Err(error) =
+        archbridge::archive::snapshot_directory(std::path::Path::new("/nonexistent/x"))
+    else {
+        panic!("a missing directory must be refused");
+    };
+    assert!(error.contains("'/nonexistent/x'"), "{error}");
+}

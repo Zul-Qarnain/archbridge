@@ -211,8 +211,13 @@ pub fn walk_tree(root: &Path) -> Result<Vec<FileReview>, String> {
     let mut stack = vec![root.to_path_buf()];
     let mut total_bytes: u64 = 0;
     while let Some(current_dir) = stack.pop() {
-        let entries = fs::read_dir(&current_dir)
-            .map_err(|e| format!("Failed to read directory '{:?}': {}", current_dir, e))?;
+        let entries = fs::read_dir(&current_dir).map_err(|e| {
+            format!(
+                "Failed to read directory '{}': {}",
+                current_dir.display(),
+                e
+            )
+        })?;
         for entry in entries {
             let entry = entry.map_err(|e| format!("Failed to read a directory entry: {e}"))?;
             let path = entry.path();
@@ -292,8 +297,8 @@ fn push_review(reviews: &[FileReview], path: &str) -> Result<(), String> {
 pub fn snapshot_directory(dir_path: &Path) -> Result<SourceSnapshot, String> {
     if !dir_path.exists() || !dir_path.is_dir() {
         return Err(format!(
-            "Directory does not exist or is not a directory: '{:?}'",
-            dir_path
+            "Directory does not exist or is not a directory: '{}'",
+            dir_path.display()
         ));
     }
 
@@ -303,8 +308,13 @@ pub fn snapshot_directory(dir_path: &Path) -> Result<SourceSnapshot, String> {
 
     let mut stack = vec![dir_path.to_path_buf()];
     while let Some(current_dir) = stack.pop() {
-        let entries = fs::read_dir(&current_dir)
-            .map_err(|e| format!("Failed to read directory '{:?}': {}", current_dir, e))?;
+        let entries = fs::read_dir(&current_dir).map_err(|e| {
+            format!(
+                "Failed to read directory '{}': {}",
+                current_dir.display(),
+                e
+            )
+        })?;
 
         for entry in entries {
             let entry = entry.map_err(|e| format!("Failed to read a directory entry: {e}"))?;
@@ -312,15 +322,26 @@ pub fn snapshot_directory(dir_path: &Path) -> Result<SourceSnapshot, String> {
             let rel_path = path.strip_prefix(dir_path).map_err(|e| e.to_string())?;
             let rel_str = rel_path.to_string_lossy().to_string();
 
-            if rel_str.starts_with(".git")
-                || rel_str.starts_with(".archbridge")
-                || rel_str.contains("target/")
-            {
+            // Version-control and build-output directories at the top of the
+            // tree are not source. Matching on the whole relative path used to
+            // drop every file below any directory merely *named* like them
+            // (`src/target/x.c`, `.github/`, `.gitignore`) without a word.
+            let top = rel_path
+                .components()
+                .next()
+                .map(|c| c.as_os_str().to_string_lossy().to_string())
+                .unwrap_or_default();
+            if matches!(top.as_str(), ".git" | ".archbridge" | "target") {
                 continue;
             }
 
-            // Path safety check
-            if rel_str.contains("..") || rel_path.is_absolute() {
+            // Path safety check: a `..` *component*, not a name that merely
+            // contains two dots (`libfoo..so`, `notes..txt`).
+            if rel_path
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+                || rel_path.is_absolute()
+            {
                 return Err(format!(
                     "Unsafe path detected in source directory: '{}'",
                     rel_str
@@ -331,12 +352,27 @@ pub fn snapshot_directory(dir_path: &Path) -> Result<SourceSnapshot, String> {
                 .map_err(|e| format!("Failed to inspect '{rel_str}': {e}"))?;
             if meta.file_type().is_symlink() {
                 let target = fs::read_link(&path).map_err(|e| e.to_string())?;
-                if target.is_absolute() || target.to_string_lossy().contains("..") {
-                    return Err(format!(
-                        "Unsafe symlink in source directory: '{}' -> '{:?}'",
-                        rel_str, target
-                    ));
-                }
+                let target_str = target.to_string_lossy().to_string();
+                reject_unsafe_link("symlink", &rel_str, &target_str)
+                    .map_err(|e| e.replace("in source archive", "in source directory"))?;
+                // A link that stays inside the tree is part of the source: the
+                // build may need `libx.so -> libx.so.1`. It used to be checked
+                // and then silently left out of the archive and the review.
+                let mut header = tar::Header::new_gnu();
+                header.set_entry_type(tar::EntryType::Symlink);
+                header.set_size(0);
+                header.set_mode(0o777);
+                tar_builder
+                    .append_link(&mut header, &rel_str, &target)
+                    .map_err(|e| format!("Failed to archive symlink '{}': {}", rel_str, e))?;
+                push_review(&reviews, &rel_str)?;
+                reviews.push(FileReview {
+                    path: rel_str.clone(),
+                    sha256: format!("{:x}", Sha256::digest(target_str.as_bytes())),
+                    bytes: 0,
+                    executable: false,
+                    content: Some(format!("symlink -> {target_str}")),
+                });
             } else if meta.is_dir() {
                 stack.push(path);
             } else if meta.is_file() {

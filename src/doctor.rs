@@ -425,18 +425,18 @@ pub fn check_disk_space(workspace: &Path) -> CheckResult {
             name: "disk_space".to_string(),
             status: "pass".to_string(),
             message: format!(
-                "{:.1} GiB free in {:?}",
+                "{:.1} GiB free in {}",
                 kib as f64 / 1024.0 / 1024.0,
-                workspace
+                workspace.display()
             ),
         },
         Some(kib) => CheckResult {
             name: "disk_space".to_string(),
             status: "fail".to_string(),
             message: format!(
-                "Only {:.1} GiB free in {:?}; clean chroot builds need at least 2 GiB",
+                "Only {:.1} GiB free in {}; clean chroot builds need at least 2 GiB",
                 kib as f64 / 1024.0 / 1024.0,
-                workspace
+                workspace.display()
             ),
         },
         None => CheckResult {

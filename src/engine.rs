@@ -456,8 +456,12 @@ impl Engine {
         );
 
         let summary = format!(
-            "Search target '{}': recommended source is '{:?}'",
-            target, report.recommended_source
+            "Search target '{}': recommended source is {}",
+            target,
+            report
+                .recommended_source
+                .as_deref()
+                .map_or("none".to_string(), |source| format!("'{source}'"))
         );
 
         let plan = Plan {
@@ -1113,22 +1117,31 @@ impl Engine {
 
     pub fn prepare_uninstall(&mut self, target: &str) -> Result<Plan, String> {
         let package = target.trim();
-        if package.is_empty()
-            || package == "."
-            || package == ".."
+        let rejection = if package.is_empty() {
+            Some("the name is empty")
+        } else if package.starts_with('-') {
             // A leading '-' is not an odd package name: it is the shape of a
             // pacman flag, and `-Rns --config=/tmp/x` lets the caller choose the
             // configuration (and therefore the hook directory) this root run reads.
-            || package.starts_with('-')
-            || package.len() > 128
-            || !package
-                .bytes()
-                .all(|c| c.is_ascii_alphanumeric() || b"@._+-".contains(&c))
+            Some("a name cannot start with '-' (that is a pacman option, not a package)")
+        } else if package.starts_with('.') {
+            Some("a name cannot start with '.'")
+        } else if package.len() > 128 {
+            Some("the name is longer than 128 characters")
+        } else if package.contains('/') {
+            Some("it looks like a path or file; give the installed package's name")
+        } else if !package
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || b"@._+-".contains(&c))
         {
-            return Err(
-                "Uninstall requires an installed Arch package name, not a path or file."
-                    .to_string(),
-            );
+            Some("package names use only ASCII letters, digits and '@ . _ + -'")
+        } else {
+            None
+        };
+        if let Some(reason) = rejection {
+            return Err(format!(
+                "Uninstall requires an installed Arch package name: {reason}."
+            ));
         }
 
         let plan_id = generate_plan_id("uninstall", package);
