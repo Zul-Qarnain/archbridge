@@ -1048,6 +1048,7 @@ impl Engine {
                     "Package file '{target}' does not exist. Pass the path of a built .pkg.tar.* package."
                 ));
             }
+            verify_native_package(target)?;
             let plan_id = generate_plan_id("install", target);
             let steps = vec![Step::new(
                 "sudo",
@@ -1826,6 +1827,39 @@ pub fn publish_artifact(artifact: &Path, output_dir: &str) -> Result<PathBuf, St
 fn sha256_file(path: &Path) -> Result<String, String> {
     let bytes = fs::read(path).map_err(|e| format!("Cannot read '{}': {}", path.display(), e))?;
     Ok(format!("{:x}", Sha256::digest(&bytes)))
+}
+
+/// Consent to `pacman -U` has to be about a package: an empty file, a
+/// signature or a download that is really an error page used to be staged as
+/// "Install native Arch package" and only failed after the password prompt.
+/// Without `bsdtar` there is nothing to check with, so the plan is not blocked.
+fn verify_native_package(target: &str) -> Result<(), String> {
+    let list = Step::new(
+        "bsdtar",
+        vec!["-tf", target],
+        "Check the package is a readable archive",
+        30,
+    );
+    let Ok(out) = run_step(&list, None) else {
+        return Ok(());
+    };
+    if out.exit_code != 0 {
+        let reason = out.stderr.lines().next().unwrap_or("unreadable").trim();
+        return Err(format!(
+            "'{target}' is not a readable Arch package: {reason}"
+        ));
+    }
+    if out.stdout.trim().is_empty() {
+        return Err(format!(
+            "'{target}' is not a readable Arch package: the archive is empty"
+        ));
+    }
+    if !out.stdout.lines().any(|line| line.trim() == ".PKGINFO") {
+        return Err(format!(
+            "'{target}' is an archive but has no .PKGINFO, so pacman would not accept it as a package"
+        ));
+    }
+    Ok(())
 }
 
 /// The package name a build target implies when `--name` is not given: the

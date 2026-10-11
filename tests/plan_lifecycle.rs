@@ -468,11 +468,7 @@ fn an_install_names_only_a_package_file_that_actually_exists() {
     assert!(error.contains("does not exist"), "{error}");
 
     let artifact = temp.path().join("demo-1.0.0-1-x86_64.pkg.tar.zst");
-    fs::write(
-        &artifact,
-        b"not really a package, but it is the bytes on disk",
-    )
-    .unwrap();
+    write_minimal_package(temp.path(), &artifact);
     let plan = engine
         .prepare_install(artifact.to_str().unwrap())
         .expect("an existing package file stages an install");
@@ -920,4 +916,95 @@ fn a_build_named_by_dot_or_trailing_slash_uses_the_directory_name() {
             pkgbuild_review(&plan).content.as_deref().unwrap()
         );
     }
+}
+
+fn bsdtar_exists() -> bool {
+    std::process::Command::new("bsdtar")
+        .arg("--version")
+        .output()
+        .is_ok()
+}
+
+#[test]
+fn installing_a_file_that_is_not_an_arch_package_is_refused_at_prepare_time() {
+    if !bsdtar_exists() {
+        eprintln!("skipping: bsdtar not installed");
+        return;
+    }
+    let temp = TempDir::new().unwrap();
+    let mut engine = engine_in(&temp);
+
+    for (name, bytes) in [
+        ("empty.pkg.tar.zst", Vec::new()),
+        (
+            "noise.pkg.tar.zst",
+            (0..4000u32).map(|i| (i * 7 % 253) as u8).collect(),
+        ),
+        ("html.pkg.tar.zst", b"<html>404 Not Found</html>".to_vec()),
+    ] {
+        let path = temp.path().join(name);
+        fs::write(&path, bytes).unwrap();
+        let error = engine
+            .prepare_install(path.to_str().unwrap())
+            .expect_err(name);
+        assert!(
+            error.contains("not a readable Arch package"),
+            "{name}: {error}"
+        );
+    }
+
+    // A real archive that is not a package: no .PKGINFO.
+    let src = temp.path().join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("hello.txt"), "hi").unwrap();
+    let not_pkg = temp.path().join("plain.pkg.tar.gz");
+    assert!(std::process::Command::new("bsdtar")
+        .args(["-czf"])
+        .arg(&not_pkg)
+        .args(["-C"])
+        .arg(&src)
+        .arg(".")
+        .status()
+        .unwrap()
+        .success());
+    let error = engine
+        .prepare_install(not_pkg.to_str().unwrap())
+        .unwrap_err();
+    assert!(error.contains("no .PKGINFO"), "{error}");
+
+    // And one with a .PKGINFO stages normally.
+    fs::write(src.join(".PKGINFO"), "pkgname = hello\npkgver = 1-1\n").unwrap();
+    let good = temp.path().join("hello-1-1-x86_64.pkg.tar.gz");
+    assert!(std::process::Command::new("bsdtar")
+        .args(["-czf"])
+        .arg(&good)
+        .args(["-C"])
+        .arg(&src)
+        .args([".PKGINFO", "hello.txt"])
+        .status()
+        .unwrap()
+        .success());
+    let plan = engine.prepare_install(good.to_str().unwrap()).unwrap();
+    assert_eq!(plan.action, "install");
+}
+
+/// A package pacman would at least open: a gzip tar holding a `.PKGINFO`. With
+/// no `bsdtar` on the box the install check is skipped, so any bytes do.
+fn write_minimal_package(scratch: &std::path::Path, artifact: &std::path::Path) {
+    if !bsdtar_exists() {
+        fs::write(artifact, b"no bsdtar here to check it with").unwrap();
+        return;
+    }
+    let src = scratch.join("minimal-pkg-src");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join(".PKGINFO"), "pkgname = demo\npkgver = 1.0.0-1\n").unwrap();
+    assert!(std::process::Command::new("bsdtar")
+        .arg("-czf")
+        .arg(artifact)
+        .arg("-C")
+        .arg(&src)
+        .arg(".PKGINFO")
+        .status()
+        .unwrap()
+        .success());
 }
