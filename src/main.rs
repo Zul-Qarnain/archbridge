@@ -263,13 +263,15 @@ EXIT CODES:
             "\
 archbridge doctor
 
-Check the packaging prerequisites ArchBridge needs: pacman, base-devel,
-devtools, compiler toolchain, keyring, user namespaces, workspace disk space
-and an HTTPS reachability probe.
+Check the packaging prerequisites ArchBridge needs: whether this is an Arch
+Linux host at all, then pacman, base-devel, devtools, compiler toolchain,
+keyring, user namespaces, workspace disk space and an HTTPS reachability probe.
 
-'ready: false' is reported with the failing check and its message; an offline
-network probe reads 'unavailable' and does NOT by itself make the system
-unready, because local builds and foreign-package inspection work offline.
+'ready: false' is reported with the failing check and its message; on a host
+without pacman and the Arch build tools the first reason is that this is not Arch
+Linux. An offline network probe reads 'unavailable' and does NOT by itself make
+the system unready, because local builds and foreign-package inspection work
+offline.
 
 FLAGS:
   -h, --help     show this help and exit 0
@@ -590,25 +592,40 @@ fn handle_doctor(client: &mut DirectRpcClient, args: &[String]) -> Result<i32, S
     let val = client.call("v1.doctor", json!({}))?;
     println!("{}", serde_json::to_string_pretty(&val).unwrap());
     if val.get("ready").and_then(|r| r.as_bool()).unwrap_or(false) {
-        Ok(0)
-    } else {
-        for check in val
-            .get("checks")
-            .and_then(|c| c.as_array())
-            .map(|a| a.iter())
-            .unwrap_or_default()
-        {
-            let blocking = matches!(check.get("status").and_then(|s| s.as_str()), Some("fail"));
-            if blocking {
-                eprintln!(
-                    "blocking: {}: {}",
-                    check.get("name").and_then(|n| n.as_str()).unwrap_or("?"),
-                    check.get("message").and_then(|m| m.as_str()).unwrap_or("")
-                );
-            }
-        }
-        Ok(1)
+        return Ok(0);
     }
+    // Exiting 1 without naming the reason is the least useful answer a
+    // diagnostic can give, so every check that holds readiness back is
+    // listed — the host itself first.
+    let checks: Vec<serde_json::Value> = val
+        .get("checks")
+        .and_then(|c| c.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let blocking: Vec<String> = checks
+        .iter()
+        .filter_map(|check| {
+            let name = check.get("name").and_then(|n| n.as_str()).unwrap_or("?");
+            let status = check.get("status").and_then(|s| s.as_str()).unwrap_or("");
+            let message = check
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("")
+                .to_string();
+            let essential = archbridge::doctor::ESSENTIAL_CHECKS.contains(&name);
+            ((essential && status != "pass") || status == "fail")
+                .then(|| format!("{name} ({status}): {message}"))
+        })
+        .collect();
+    eprintln!("Not ready: ArchBridge could not confirm this system for building or installing.");
+    if blocking.is_empty() {
+        eprintln!("  no check failed outright; see the report above for what did not pass.");
+    } else {
+        for reason in blocking {
+            eprintln!("  blocking: {reason}");
+        }
+    }
+    Ok(1)
 }
 
 /// The JSON-RPC daemon takes no options. `serve --help` used to swallow the
