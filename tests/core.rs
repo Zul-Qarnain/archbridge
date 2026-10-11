@@ -111,6 +111,7 @@ fn test_recipe_cmake_detection() {
         dependencies: vec!["glibc".to_string()],
         entry_binary: Some("testpkg".to_string()),
         src_subdir: None,
+        architecture: None,
     };
 
     let pkgbuild = generate_pkgbuild(&sys, &params).unwrap();
@@ -153,10 +154,31 @@ fn imported_pkgbuild_extracts_payload_without_running_scripts() {
         dependencies: vec![],
         entry_binary: None,
         src_subdir: None,
+        // DEB spells the x86_64 architecture `amd64`.
+        architecture: Some("amd64".to_string()),
     };
     let pkgbuild = generate_pkgbuild(&BuildSystem::Imported, &params).unwrap();
     assert!(pkgbuild.contains("tar -xzf \"$srcdir/src.tar.gz\""));
+    assert!(
+        pkgbuild.contains("arch=('x86_64')"),
+        "the copied payload's own architecture has to be what the package claims: {pkgbuild}"
+    );
     assert!(!pkgbuild.contains("preinst"));
+    // Repackaging copies the files; nothing that could run a maintainer script
+    // is ever emitted into the script makepkg executes.
+    for forbidden in [
+        "install=",
+        "pkginstall",
+        "preinst",
+        "postinst",
+        "postrm",
+        "prerm",
+    ] {
+        assert!(
+            !pkgbuild.contains(forbidden),
+            "a generated PKGBUILD must not carry {forbidden}:\n{pkgbuild}"
+        );
+    }
 }
 
 fn archive_review(path: &str, content: Option<&str>) -> FileReview {
@@ -178,6 +200,7 @@ fn params_for(name: &str, version: &str) -> PkgbuildParams {
         dependencies: vec![],
         entry_binary: None,
         src_subdir: None,
+        architecture: None,
     }
 }
 
@@ -748,7 +771,7 @@ fn a_test_plan_refuses_an_artifact_that_is_not_there() {
     let err = engine
         .prepare_test(missing.to_str().unwrap(), None, &[])
         .expect_err("there is nothing to test");
-    assert!(err.contains("no package artifact"), "{err}");
+    assert!(err.contains("is not a file"), "{err}");
     assert!(
         !engine
             .pending_plans

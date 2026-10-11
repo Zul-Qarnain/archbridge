@@ -113,20 +113,32 @@ fn archive_root_dir(paths: &[&str]) -> Option<String> {
 /// carries its top-level directory inside every path, so the tree has to be
 /// peeled virtually. Returns the detected system and the directory a generated
 /// PKGBUILD must enter before building.
+/// A tar made from inside the directory it packs (`tar -czf x.tar.gz .`, which
+/// is what `make dist` and most hand-rolled release scripts do) stores every
+/// path under `./`. That prefix is tar bookkeeping, not a directory a build
+/// enters, so measuring the tree with it still attached loses the project root.
+fn strip_tar_current_dir(path: &str) -> &str {
+    path.strip_prefix("./").unwrap_or(path)
+}
+
 pub fn detect_build_system_in_archive(reviews: &[FileReview]) -> (BuildSystem, Option<String>) {
-    let paths: Vec<&str> = reviews.iter().map(|r| r.path.as_str()).collect();
+    let paths: Vec<&str> = reviews
+        .iter()
+        .map(|review| strip_tar_current_dir(&review.path))
+        .collect();
     let root = archive_root_dir(&paths);
-    let prefix = root.as_ref().map(|d| format!("{}/", d));
+    let prefix = root.as_ref().map(|d| format!("{d}/"));
 
     let mut files: HashMap<&str, &FileReview> = HashMap::new();
     let mut nested: HashSet<&str> = HashSet::new();
     for review in reviews {
+        let path = strip_tar_current_dir(&review.path);
         let rel = match &prefix {
-            Some(p) => match review.path.strip_prefix(p.as_str()) {
+            Some(p) => match path.strip_prefix(p.as_str()) {
                 Some(x) => x,
                 None => continue,
             },
-            None => review.path.as_str(),
+            None => path,
         };
         if rel.is_empty() {
             continue;
@@ -215,6 +227,42 @@ pub struct PkgbuildParams {
     /// archives nest everything under `<repo>-<ref>/`; locally snapshot
     /// directories are flat, so this is `None`.
     pub src_subdir: Option<String>,
+    /// Architecture the source states for itself, in the source's own spelling
+    /// (`amd64`, `arm64`, `all`, `noarch`). Only a re-packaged foreign payload
+    /// needs it: a source build produces a package for the machine that built it,
+    /// while a copied payload runs on exactly the machine it was built for.
+    pub architecture: Option<String>,
+}
+
+/// Which Arch architecture a foreign package's payload belongs to. `amd64`,
+/// `x86-64` and `x64` name the same machine as `x86_64`, and DEB `all` / RPM
+/// `noarch` are the one answer that is not machine-specific. Anything else is
+/// refused rather than defaulted, because `arch=('x86_64')` written over an
+/// arm64 payload produces a package `pacman -U` accepts onto a machine that
+/// cannot execute a byte of it.
+pub fn map_foreign_arch(raw: &str) -> Result<String, String> {
+    let folded = raw.trim().to_ascii_lowercase();
+    let arch = match folded.as_str() {
+        "x86_64" | "amd64" | "x64" | "x86-64" => "x86_64",
+        "aarch64" | "arm64" => "aarch64",
+        "i386" | "i486" | "i586" | "i686" => "i686",
+        "any" | "all" | "noarch" => "any",
+        "" | "unknown" => {
+            return Err(
+                "A foreign payload whose architecture was never read cannot be re-packaged as \
+                 an Arch package: the result would claim to be a machine it may not run on."
+                    .to_string(),
+            )
+        }
+        _ => {
+            return Err(format!(
+                "Architecture '{raw}' has no Arch equivalent, so this payload cannot be \
+                 re-packaged honestly (Arch ships x86_64, aarch64 and i686 packages, plus 'any' \
+                 for architecture-independent ones)"
+            ))
+        }
+    };
+    Ok(arch.to_string())
 }
 
 /// makepkg accepts only `[A-Za-z0-9._@+-]` in `pkgver`, never as the first
@@ -307,6 +355,143 @@ pub fn sanitize_entry_name(raw: &str) -> String {
     name
 }
 
+/// A `pkgname`/dependency name as makepkg understands it: it is written into a
+/// shell array makepkg sources, so anything outside this set is refused rather
+/// than quoted, because a single quote is not escapable from inside `'...'`.
+fn is_package_token(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 128
+        && name
+            .chars()
+            .next()
+            .map_or(false, |c| c.is_ascii_alphanumeric())
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '+' | '-' | '@'))
+}
+
+/// DEB records a constraint as `libc6 (>= 2.17)`; pacman writes the same fact as
+/// `libc6>=2.17`. Converting here is what lets an inspected foreign package
+/// contribute dependencies a generated PKGBUILD can actually use.
+fn normalize_deb_constraint(dep: &str) -> String {
+    let Some((head, rest)) = dep.split_once('(') else {
+        return dep.to_string();
+    };
+    let body = rest.trim().trim_end_matches(')').trim();
+    let Some(operator) = [">=", "<=", "=", ">", "<"]
+        .iter()
+        .find(|op| body.starts_with(**op))
+    else {
+        // `name (some version)` and anything unparseable keep their original
+        // bytes so the validator rejects them with the text the user wrote.
+        return dep.to_string();
+    };
+    let version = body[operator.len()..]
+        .trim()
+        .split_whitespace()
+        .next()
+        .unwrap_or_default();
+    format!("{}{}{}", head.trim(), operator, version)
+}
+
+/// `depends=('a' 'b')` plus pacman's version constraints (`a=1.2`, `a>=1.2`).
+fn validate_dependency(raw: &str) -> Result<String, String> {
+    let dep = normalize_deb_constraint(raw.trim());
+    if dep.is_empty() {
+        return Err("A dependency cannot be empty".to_string());
+    }
+    if dep.chars().any(|c| c.is_control()) {
+        return Err(format!(
+            "Dependency '{raw}' contains control characters, which a generated PKGBUILD cannot hold"
+        ));
+    }
+    let (name, version) = match dep.split_once(['=', '<', '>']) {
+        Some((name, rest)) => (name, Some(rest.trim_start_matches(['=', '<', '>']))),
+        None => (dep.as_str(), None),
+    };
+    if !is_package_token(name) {
+        return Err(format!(
+            "Dependency '{raw}' is not a package name makepkg can install; pass 'name' or 'name=version'"
+        ));
+    }
+    if let Some(version) = version {
+        let ok = !version.is_empty()
+            && version.len() <= 64
+            && version.chars().all(|c| {
+                c.is_ascii_alphanumeric() || matches!(c, '.' | '+' | '~' | '_' | '-' | ':')
+            });
+        if !ok {
+            return Err(format!(
+                "Dependency '{raw}' carries a version makepkg cannot compare"
+            ));
+        }
+    }
+    Ok(dep.to_string())
+}
+
+/// The archive name is interpolated inside `"$srcdir/..."` and a `source=()`
+/// entry, so it is a plain file name: no directory, no traversal, no quote.
+fn validate_source_name(raw: &str) -> Result<String, String> {
+    let name = raw.trim();
+    if name.is_empty() || name.len() > 200 {
+        return Err(format!(
+            "Source archive name '{raw}' must be between 1 and 200 characters"
+        ));
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '+' | '-'))
+    {
+        return Err(format!(
+            "Source archive name '{raw}' may only contain letters, digits, '.', '_', '+' or '-'"
+        ));
+    }
+    if name.starts_with('.') || name.contains("..") {
+        return Err(format!(
+            "Source archive name '{raw}' must be a plain file name inside \\$srcdir"
+        ));
+    }
+    Ok(name.to_string())
+}
+
+/// A digest is what pins the bytes a build consumes; a short or non-hex value
+/// would let makepkg verify nothing.
+fn validate_checksum(raw: &str) -> Result<String, String> {
+    let value = raw.trim();
+    if value == "SKIP" {
+        return Ok(value.to_string());
+    }
+    if value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Ok(value.to_ascii_lowercase());
+    }
+    Err(format!(
+        "Checksum '{raw}' is not a 64-character SHA-256 digest, so the build could not verify the bytes it downloads"
+    ))
+}
+
+/// The directory the archive unpacks into, as it appears inside `$srcdir`.
+fn validate_src_subdir(raw: &str) -> Result<String, String> {
+    if raw.is_empty() || raw.len() > 200 || raw.starts_with('/') || raw.contains("//") {
+        return Err(format!(
+            "Source subdirectory '{raw}' is not a usable directory name inside \\$srcdir"
+        ));
+    }
+    for segment in raw.split('/') {
+        if segment.is_empty()
+            || segment == "."
+            || segment == ".."
+            || !segment
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '+' | '-' | '@'))
+        {
+            return Err(format!(
+                "Source subdirectory '{raw}' contains a segment that cannot name a directory"
+            ));
+        }
+    }
+    Ok(raw.to_string())
+}
+
 pub fn generate_pkgbuild(system: &BuildSystem, params: &PkgbuildParams) -> Result<String, String> {
     let pkgname = normalize_name(&params.name.replace('_', "-"));
     let (pkgver, epoch_line) = normalize_version(if params.version.is_empty() {
@@ -314,8 +499,12 @@ pub fn generate_pkgbuild(system: &BuildSystem, params: &PkgbuildParams) -> Resul
     } else {
         &params.version
     });
-    let sha256 = &params.sha256_hash;
-    let source_tar = &params.source_tarball;
+    // Everything below is interpolated into a file makepkg `source`s. The
+    // generated text quotes each value with `'`, and a single quote cannot be
+    // escaped inside POSIX single quotes, so hostile values are refused here
+    // instead of being rewritten.
+    let sha256 = validate_checksum(&params.sha256_hash)?;
+    let source_tar = validate_source_name(&params.source_tarball)?;
     let entry = params.entry_binary.as_deref().unwrap_or(&pkgname);
     // The entry name is spliced into shell commands makepkg runs, so anything a
     // quoting layer could reinterpret has to be refused rather than escaped.
@@ -323,7 +512,7 @@ pub fn generate_pkgbuild(system: &BuildSystem, params: &PkgbuildParams) -> Resul
         || entry.starts_with('-')
         || !entry
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '+'))
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '+' | '@'))
     {
         return Err(format!(
             "Entry binary name '{}' is not usable in a generated PKGBUILD; pass a plain file name.",
@@ -331,17 +520,21 @@ pub fn generate_pkgbuild(system: &BuildSystem, params: &PkgbuildParams) -> Resul
         ));
     }
     let src_dir = match &params.src_subdir {
-        Some(sub) => format!("\"$srcdir/{}\"", sub),
+        Some(sub) => format!("\"$srcdir/{}\"", validate_src_subdir(sub)?),
         None => "\"$srcdir\"".to_string(),
     };
 
-    let depends_str = if params.dependencies.is_empty() {
+    let depends: Vec<String> = params
+        .dependencies
+        .iter()
+        .map(|dep| validate_dependency(dep))
+        .collect::<Result<Vec<_>, _>>()?;
+    let depends_str = if depends.is_empty() {
         "()".to_string()
     } else {
         format!(
             "({})",
-            params
-                .dependencies
+            depends
                 .iter()
                 .map(|d| format!("'{}'", d))
                 .collect::<Vec<_>>()
@@ -351,19 +544,23 @@ pub fn generate_pkgbuild(system: &BuildSystem, params: &PkgbuildParams) -> Resul
 
     let generated = match system {
         BuildSystem::Imported => {
-            let extract_cmd = if params.source_tarball.ends_with(".tar.xz")
-                || params.source_tarball.ends_with(".tar.zst")
-                || params.source_tarball.ends_with(".tar")
+            // A re-packaged payload is copied, not compiled, so the package it
+            // produces may only claim the architecture those files run on.
+            let payload_arch = match params.architecture.as_deref() {
+                Some(raw) => map_foreign_arch(raw)?,
+                None => return Err(
+                    "A foreign payload has to state which architecture its files run on, and \
+                     none was read from this package."
+                        .to_string(),
+                ),
+            };
+            let extract_cmd = if source_tar.ends_with(".tar.xz")
+                || source_tar.ends_with(".tar.zst")
+                || source_tar.ends_with(".tar")
             {
-                format!(
-                    "bsdtar -xf \"$srcdir/{}\" -C \"$pkgdir\"",
-                    params.source_tarball
-                )
+                format!("bsdtar -xf \"$srcdir/{source_tar}\" -C \"$pkgdir\"")
             } else {
-                format!(
-                    "tar -xzf \"$srcdir/{}\" -C \"$pkgdir\"",
-                    params.source_tarball
-                )
+                format!("tar -xzf \"$srcdir/{source_tar}\" -C \"$pkgdir\"")
             };
             Ok(format!(
                 "# Maintainer: ArchBridge generated from a foreign package\n\
@@ -371,7 +568,7 @@ pkgname='{pkgname}'\n\
 pkgver='{pkgver}'\n\
 pkgrel=1\n\
 pkgdesc='Imported foreign package payload for {pkgname}'\n\
-arch=('x86_64')\n\
+arch=('{payload_arch}')\n\
 license=('custom')\n\
 depends={depends_str}\n\
 options=('!strip')\n\
