@@ -26,6 +26,8 @@ fn params_with(
         dependencies,
         entry_binary: entry.map(str::to_string),
         src_subdir: subdir.map(str::to_string),
+        // The payloads these fixtures stand for are x86_64 machines'.
+        architecture: Some("amd64".to_string()),
     }
 }
 

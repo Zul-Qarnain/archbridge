@@ -113,20 +113,32 @@ fn archive_root_dir(paths: &[&str]) -> Option<String> {
 /// carries its top-level directory inside every path, so the tree has to be
 /// peeled virtually. Returns the detected system and the directory a generated
 /// PKGBUILD must enter before building.
+/// A tar made from inside the directory it packs (`tar -czf x.tar.gz .`, which
+/// is what `make dist` and most hand-rolled release scripts do) stores every
+/// path under `./`. That prefix is tar bookkeeping, not a directory a build
+/// enters, so measuring the tree with it still attached loses the project root.
+fn strip_tar_current_dir(path: &str) -> &str {
+    path.strip_prefix("./").unwrap_or(path)
+}
+
 pub fn detect_build_system_in_archive(reviews: &[FileReview]) -> (BuildSystem, Option<String>) {
-    let paths: Vec<&str> = reviews.iter().map(|r| r.path.as_str()).collect();
+    let paths: Vec<&str> = reviews
+        .iter()
+        .map(|review| strip_tar_current_dir(&review.path))
+        .collect();
     let root = archive_root_dir(&paths);
-    let prefix = root.as_ref().map(|d| format!("{}/", d));
+    let prefix = root.as_ref().map(|d| format!("{d}/"));
 
     let mut files: HashMap<&str, &FileReview> = HashMap::new();
     let mut nested: HashSet<&str> = HashSet::new();
     for review in reviews {
+        let path = strip_tar_current_dir(&review.path);
         let rel = match &prefix {
-            Some(p) => match review.path.strip_prefix(p.as_str()) {
+            Some(p) => match path.strip_prefix(p.as_str()) {
                 Some(x) => x,
                 None => continue,
             },
-            None => review.path.as_str(),
+            None => path,
         };
         if rel.is_empty() {
             continue;
@@ -215,6 +227,42 @@ pub struct PkgbuildParams {
     /// archives nest everything under `<repo>-<ref>/`; locally snapshot
     /// directories are flat, so this is `None`.
     pub src_subdir: Option<String>,
+    /// Architecture the source states for itself, in the source's own spelling
+    /// (`amd64`, `arm64`, `all`, `noarch`). Only a re-packaged foreign payload
+    /// needs it: a source build produces a package for the machine that built it,
+    /// while a copied payload runs on exactly the machine it was built for.
+    pub architecture: Option<String>,
+}
+
+/// Which Arch architecture a foreign package's payload belongs to. `amd64`,
+/// `x86-64` and `x64` name the same machine as `x86_64`, and DEB `all` / RPM
+/// `noarch` are the one answer that is not machine-specific. Anything else is
+/// refused rather than defaulted, because `arch=('x86_64')` written over an
+/// arm64 payload produces a package `pacman -U` accepts onto a machine that
+/// cannot execute a byte of it.
+pub fn map_foreign_arch(raw: &str) -> Result<String, String> {
+    let folded = raw.trim().to_ascii_lowercase();
+    let arch = match folded.as_str() {
+        "x86_64" | "amd64" | "x64" | "x86-64" => "x86_64",
+        "aarch64" | "arm64" => "aarch64",
+        "i386" | "i486" | "i586" | "i686" => "i686",
+        "any" | "all" | "noarch" => "any",
+        "" | "unknown" => {
+            return Err(
+                "A foreign payload whose architecture was never read cannot be re-packaged as \
+                 an Arch package: the result would claim to be a machine it may not run on."
+                    .to_string(),
+            )
+        }
+        _ => {
+            return Err(format!(
+                "Architecture '{raw}' has no Arch equivalent, so this payload cannot be \
+                 re-packaged honestly (Arch ships x86_64, aarch64 and i686 packages, plus 'any' \
+                 for architecture-independent ones)"
+            ))
+        }
+    };
+    Ok(arch.to_string())
 }
 
 /// makepkg accepts only `[A-Za-z0-9._@+-]` in `pkgver`, never as the first
@@ -496,6 +544,16 @@ pub fn generate_pkgbuild(system: &BuildSystem, params: &PkgbuildParams) -> Resul
 
     let generated = match system {
         BuildSystem::Imported => {
+            // A re-packaged payload is copied, not compiled, so the package it
+            // produces may only claim the architecture those files run on.
+            let payload_arch = match params.architecture.as_deref() {
+                Some(raw) => map_foreign_arch(raw)?,
+                None => return Err(
+                    "A foreign payload has to state which architecture its files run on, and \
+                     none was read from this package."
+                        .to_string(),
+                ),
+            };
             let extract_cmd = if source_tar.ends_with(".tar.xz")
                 || source_tar.ends_with(".tar.zst")
                 || source_tar.ends_with(".tar")
@@ -510,7 +568,7 @@ pkgname='{pkgname}'\n\
 pkgver='{pkgver}'\n\
 pkgrel=1\n\
 pkgdesc='Imported foreign package payload for {pkgname}'\n\
-arch=('x86_64')\n\
+arch=('{payload_arch}')\n\
 license=('custom')\n\
 depends={depends_str}\n\
 options=('!strip')\n\

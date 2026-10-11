@@ -12,6 +12,7 @@ fn params(src_subdir: Option<&str>) -> PkgbuildParams {
         dependencies: vec!["glibc".to_string(), "openssl".to_string()],
         entry_binary: Some("demo-tool".to_string()),
         src_subdir: src_subdir.map(str::to_string),
+        architecture: Some("amd64".to_string()),
     }
 }
 
@@ -127,6 +128,7 @@ fn imported_package_does_not_relink_an_existing_usr_bin_entry() {
             dependencies: vec![],
             entry_binary: Some("qoder".to_string()),
             src_subdir: None,
+            architecture: Some("amd64".to_string()),
         },
     )
     .unwrap();

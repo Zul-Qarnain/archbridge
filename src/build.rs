@@ -6,6 +6,46 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
+/// The file name a payload has to be staged under so that the extractor a
+/// generated PKGBUILD chooses actually reads it. The extension is a claim about
+/// compression, so it comes from the bytes and not from the container: a DEB can
+/// carry an uncompressed `data.tar`, a bzip2 one, or zstd, and naming any of
+/// those `src.tar.gz` points `tar -xzf` at a stream it cannot decode.
+pub fn source_tarball_name(bytes: &[u8]) -> String {
+    if bytes.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]) {
+        return "src.tar.zst".to_string();
+    }
+    if bytes.starts_with(&[0xFD, b'7', b'z', b'X', b'Z', 0x00]) {
+        return "src.tar.xz".to_string();
+    }
+    if bytes.starts_with(&[0x1F, 0x8B]) {
+        return "src.tar.gz".to_string();
+    }
+    // Everything else — plain tar, bzip2, lzma — goes to the extension-less
+    // name, which the generated PKGBUILD hands to `bsdtar -xf` for libarchive to
+    // recognise.
+    "src.tar".to_string()
+}
+
+/// The local file name the reviewed PKGBUILD expects its first source at. The
+/// staged bytes have to land exactly there, or `sha256sums` verifies a file
+/// makepkg never opens: the script the user confirmed is the authority on the
+/// name, not a fixed list of possibilities.
+fn staged_source_name(pkgbuild: &str) -> Option<String> {
+    let list = pkgbuild.split_once("source=(")?.1.split_once(')')?.0;
+    let element = list.split_whitespace().next()?;
+    let element = element.trim_matches(|c| c == '\'' || c == '"');
+    // makepkg's `URL::name` form names the file `name`; a bare entry is itself.
+    let local = element.rsplit("::").next().unwrap_or(element);
+    let usable = !local.is_empty()
+        && local.len() <= 200
+        && !local.starts_with('.')
+        && local
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '+' | '-'));
+    usable.then(|| local.to_string())
+}
+
 /// Extract only the payload of a foreign package into a reviewable snapshot.
 /// Package maintainer scripts are never executed. The snapshot is later packed
 /// by an Arch PKGBUILD inside the clean chroot.
@@ -201,7 +241,22 @@ pub fn package_files(bytes: &[u8]) -> Result<Vec<FileReview>, String> {
 
 /// Map the entry binary a plan names onto the path the container will exec.
 pub fn resolve_entry(reviews: &[FileReview], entry: &str) -> Result<String, String> {
-    let mut paths: Vec<&String> = reviews
+    // The entry names one file, not a location. `../demo` and `/usr/bin/demo`
+    // both have a file name, and matching on it would run — and then report as
+    // tested — a program the plan never named.
+    if entry.is_empty()
+        || entry.contains('/')
+        || entry == "."
+        || entry == ".."
+        || entry.len() > 256
+        || entry.contains(char::is_control)
+    {
+        return Err(format!(
+            "Entry binary '{entry}' is not a single file name; pass 'demo', not a path."
+        ));
+    }
+
+    let mut matches: Vec<&FileReview> = reviews
         .iter()
         .filter(|review| {
             Path::new(&review.path)
@@ -209,24 +264,48 @@ pub fn resolve_entry(reviews: &[FileReview], entry: &str) -> Result<String, Stri
                 .map(|name| name == entry)
                 .unwrap_or(false)
         })
-        .map(|review| &review.path)
         .collect();
-    paths.sort_by_key(|path| (!path.starts_with("usr/bin/"), path.split('/').count()));
-    paths
-        .first()
-        .map(|path| format!("/{}", path))
-        .ok_or_else(|| {
-            let shipped: Vec<&str> = reviews
-                .iter()
-                .filter(|review| review.path.starts_with("usr/bin/"))
-                .map(|review| review.path.as_str())
-                .take(8)
-                .collect();
-            format!(
-                "Entry binary '{}' is not part of the built package (it ships {:?})",
-                entry, shipped
-            )
-        })
+    matches.sort_by_key(|review| {
+        (
+            !review.path.starts_with("usr/bin/"),
+            review.path.split('/').count(),
+        )
+    });
+    let chosen = matches.first().ok_or_else(|| {
+        let shipped: Vec<&str> = reviews
+            .iter()
+            .filter(|review| review.path.starts_with("usr/bin/"))
+            .map(|review| review.path.as_str())
+            .take(8)
+            .collect();
+        format!(
+            "Entry binary '{}' is not part of the built package (it ships {:?})",
+            entry, shipped
+        )
+    })?;
+
+    // A launcher shipped as a link is normal, and fine while what it points at
+    // came with the package. A link out to a host path resolves to nothing in a
+    // container root that holds this package alone, and the run would report a
+    // failure that says nothing about the package.
+    if let Some(target) = chosen
+        .content
+        .as_deref()
+        .and_then(|text| text.strip_prefix("symlink -> "))
+    {
+        if target.starts_with('/') {
+            let inside = target.trim_start_matches('/');
+            if !reviews.iter().any(|review| review.path == inside) {
+                return Err(format!(
+                    "Entry binary '{}' links to '{target}', which the built package does not \
+                     contain, so the isolated test root has nothing to execute.",
+                    chosen.path
+                ));
+            }
+        }
+    }
+
+    Ok(format!("/{}", chosen.path))
 }
 
 /// The staged source payload lives in the same directory as the build output and
@@ -274,14 +353,9 @@ pub fn execute_chroot_build(
     fs::write(&pkgbuild_path, pkgbuild_content)
         .map_err(|e| format!("Failed to write PKGBUILD: {}", e))?;
 
-    let source_name = if pkgbuild_content.contains("source=('src.tar.xz')") {
-        "src.tar.xz"
-    } else if pkgbuild_content.contains("source=('src.tar.zst')") {
-        "src.tar.zst"
-    } else {
-        "src.tar.gz"
-    };
-    let src_tar_path = job_dir.join(source_name);
+    let source_name =
+        staged_source_name(pkgbuild_content).unwrap_or_else(|| "src.tar.gz".to_string());
+    let src_tar_path = job_dir.join(&source_name);
     fs::write(&src_tar_path, source_tarball)
         .map_err(|e| format!("Failed to write source tarball: {}", e))?;
 

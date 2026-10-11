@@ -599,16 +599,7 @@ impl Engine {
             || target.ends_with(".rpm")
         {
             let snap = snapshot_foreign_package(Path::new(target))?;
-            let source_tar = if snap
-                .tarball_bytes
-                .starts_with(&[0xFD, b'7', b'z', b'X', b'Z', 0x00])
-            {
-                "src.tar.xz".to_string()
-            } else if snap.tarball_bytes.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]) {
-                "src.tar.zst".to_string()
-            } else {
-                "src.tar.gz".to_string()
-            };
+            let source_tar = crate::build::source_tarball_name(&snap.tarball_bytes);
 
             let inspected = inspect_package(target).ok();
             let effective_name = if let Some(ref rep) = inspected {
@@ -650,6 +641,9 @@ impl Engine {
                 dependencies: deps.to_vec(),
                 entry_binary: Some(entry.to_string()),
                 src_subdir: None,
+                // The payload is copied, not compiled: what the package says it
+                // runs on is what the produced `arch` array may claim.
+                architecture: inspected.as_ref().map(|report| report.architecture.clone()),
             };
             let pkgb = generate_pkgbuild(&BuildSystem::Imported, &params)?;
             (snap, BuildSystem::Imported, pkgb, sanitized_name)
@@ -679,6 +673,7 @@ impl Engine {
                 dependencies: deps.to_vec(),
                 entry_binary: Some(entry.to_string()),
                 src_subdir: None,
+                architecture: None,
             };
 
             let pkgb = match generate_pkgbuild(&bsys, &params) {
@@ -722,6 +717,13 @@ impl Engine {
                     "120",
                     "--max-filesize",
                     &MAX_SOURCE_ARCHIVE_BYTES.to_string(),
+                    // `--max-filesize` only bounds a response that declares its
+                    // length, and a redirect can step off TLS on the way to the
+                    // bytes, so both are stated here and the result is checked.
+                    "--max-redirs",
+                    "8",
+                    "--proto-redir",
+                    "=https",
                     &url,
                 ],
                 "Download upstream source archive",
@@ -734,6 +736,14 @@ impl Engine {
                     url,
                     download.exit_code,
                     download.stderr.trim()
+                ));
+            }
+            if download.bytes.len() as u64 > MAX_SOURCE_ARCHIVE_BYTES {
+                return Err(format!(
+                    "'{url}' answered with {} bytes, over the {} byte ceiling an upstream \
+                     source archive is fetched within",
+                    download.bytes.len(),
+                    MAX_SOURCE_ARCHIVE_BYTES
                 ));
             }
             if !download.bytes.starts_with(&[0x1F, 0x8B]) {
@@ -764,6 +774,7 @@ impl Engine {
                 dependencies: deps.to_vec(),
                 entry_binary: Some(entry.to_string()),
                 src_subdir,
+                architecture: None,
             };
             let pkgb = match generate_pkgbuild(&bsys, &params) {
                 Ok(p) => p,
