@@ -57,14 +57,55 @@ Whatever it recommends, nothing happens until a **plan** is staged, displayed, a
 <a id="see-it-working"></a>
 ## 👀 See it working
 
-No screenshots are committed yet — this section is a placeholder with the shots it needs.
+Everything below is a real capture of the built `0.5.0-dev` binary (no mock-ups). The GUI shots come from a software-rendered X session; the CLI shots were run on a Debian 13 machine, which is **not** Arch — so `pacman`-dependent results show up as *unknown* or *fail*, exactly as the tool reports them.
+
+<div align="center">
+<img src="docs/screenshots/gui-views.gif" alt="The ArchBridge desktop app cycling through its Discover, Inspect, Build and Doctor views" width="100%">
+<br><sub>The desktop app (<code>archbridge gui</code>) walking through its views.</sub>
+</div>
+
+### Desktop app
 
 <table>
-  <tr><td width="50%"><b>📷 Discover</b> — screenshot coming.<br><br>Seven sources, safest first, one row per source with its reason.<br><code>&lt;!-- TODO: add docs/screenshots/gui-discover.png --&gt;</code></td><td width="50%"><b>📷 Inspect</b> — screenshot coming.<br><br>A <code>.deb</code> opened as data: control fields, dependencies, and every maintainer script badged <code>NOT EXECUTED</code>.<br><code>&lt;!-- TODO: add docs/screenshots/gui-inspect.png --&gt;</code></td></tr>
-  <tr><td width="50%"><b>📷 Build plan review</b> — screenshot coming.<br><br>The exact steps with timeouts, and the generated PKGBUILD in full, before any byte is written.<br><code>&lt;!-- TODO: add docs/screenshots/gui-build-plan.png --&gt;</code></td><td width="50%"><b>📷 Doctor</b> — screenshot coming.<br><br>Eight checks; an offline network reads <em>unavailable</em>, not <em>fail</em>.<br><code>&lt;!-- TODO: add docs/screenshots/gui-doctor.png --&gt;</code></td></tr>
+  <tr>
+    <td width="50%"><img src="docs/screenshots/gui-discover.png" alt="Discover view listing AUR candidates for a search, with a Recommended Path card"><br><b>Discover</b> — a search lists only the sources that returned candidates (here, AUR), with the recommended path called out. Sources that returned nothing are not drawn as rows.</td>
+    <td width="50%"><img src="docs/screenshots/gui-inspect.png" alt="Inspect view showing a tiny sample .deb opened as data with its postinst badged NOT EXECUTED"><br><b>Inspect</b> — a small sample <code>.deb</code> opened as data: control fields, dependencies, and each maintainer script (here <code>postinst</code>) badged <code>NOT EXECUTED</code>.</td>
+  </tr>
+  <tr>
+    <td width="50%"><img src="docs/screenshots/gui-build-plan.png" alt="Build view showing a prepared plan with its steps and the generated PKGBUILD"><br><b>Build plan review</b> — the prepared plan: its steps and the generated PKGBUILD are shown before anything is executed.</td>
+    <td width="50%"><img src="docs/screenshots/gui-doctor.png" alt="Doctor view with four failing checks on a non-Arch machine"><br><b>Doctor</b> — captured on a non-Arch box, so <code>pacman</code>, <code>base-devel</code>, <code>devtools</code> and <code>keyring</code> correctly report <em>fail</em>; the kernel, disk, compiler and network checks pass.</td>
+  </tr>
 </table>
 
-Until then, a real CLI answer is one command away:
+### Command line
+
+Raw terminal output, unedited (the text files are kept next to the images in [`docs/screenshots/captures/`](docs/screenshots/captures)).
+
+<div align="center">
+<img src="docs/screenshots/cli-help.png" alt="archbridge --help output" width="90%">
+<br><sub><code>archbridge --help</code></sub>
+</div>
+
+<table>
+  <tr>
+    <td width="50%"><img src="docs/screenshots/cli-search.png" alt="archbridge search htop output"><br><b>Search</b> — <code>archbridge search htop</code> (first 43 lines). With no <code>pacman</code> on this machine the <code>official</code> source reports <code>unknown</code> with the reason, and AUR is recommended.</td>
+    <td width="50%"><img src="docs/screenshots/cli-doctor.png" alt="archbridge doctor output"><br><b>Doctor</b> — <code>archbridge doctor</code> on Debian 13: <code>"ready": false</code>, because the Arch tooling is missing. It exits with status 1.</td>
+  </tr>
+</table>
+
+<div align="center">
+<img src="docs/screenshots/cli-inspect.png" alt="archbridge inspect on a Debian package, every maintainer script reporting executed false" width="55%">
+<br><sub><code>archbridge inspect cron_3.0pl1-197_amd64.deb</code> (lines cut at 132 columns): four maintainer scripts read, each with <code>"executed": false</code>.</sub>
+</div>
+
+### Launch clip
+
+<div align="center">
+<img src="docs/screenshots/brag-demo.gif" alt="A 24-second launch clip: the problem, the banner, Discover, Inspect, the reviewed plan, and the closing line" width="80%">
+<br><sub>A short launch clip built from the real app and CLI captures above (planned features are not shown as working).</sub>
+</div>
+
+Try it yourself:
 
 ```bash
 cargo run -- search hello

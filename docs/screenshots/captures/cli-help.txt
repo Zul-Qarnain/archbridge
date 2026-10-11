@@ -1,0 +1,14 @@
+ArchBridge — software discovery and packaging assistant for Arch Linux
+
+USAGE:
+  archbridge search <name> [--repo <url>]
+  archbridge info <name>
+  archbridge inspect <file.deb|file.rpm>
+  archbridge build <url|directory|PKGBUILD> [--name <name>] [--version <ver>] [--entry <bin>] [--dependency <pkg>...] [--smoke-arg <arg>...] [--dry-run] [--yes]
+  archbridge install <name|file> [--dry-run] [--yes]
+  archbridge uninstall <installed-package-name> [--dry-run] [--yes]
+  archbridge test <package.pkg.tar.zst> [--entry <bin>] [--smoke-arg <arg>...] [--dry-run] [--yes]
+  archbridge config <get|set> <key> [value] [--yes]
+  archbridge doctor
+  archbridge serve
+

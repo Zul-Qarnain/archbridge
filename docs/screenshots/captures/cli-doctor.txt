@@ -1,0 +1,45 @@
+{
+  "ready": false,
+  "checks": [
+    {
+      "name": "pacman",
+      "status": "fail",
+      "message": "pacman executable not found in PATH"
+    },
+    {
+      "name": "base-devel",
+      "status": "fail",
+      "message": "Failed to query base-devel status: Failed to spawn process 'pacman': No such file or directory (os error 2)"
+    },
+    {
+      "name": "devtools",
+      "status": "fail",
+      "message": "devtools missing: install with `sudo pacman -S --needed devtools`"
+    },
+    {
+      "name": "namespaces",
+      "status": "pass",
+      "message": "Kernel user namespaces support detected"
+    },
+    {
+      "name": "disk_space",
+      "status": "pass",
+      "message": "89.4 GiB free in \".\""
+    },
+    {
+      "name": "compiler",
+      "status": "pass",
+      "message": "GCC compiler toolchain is available"
+    },
+    {
+      "name": "network",
+      "status": "pass",
+      "message": "HTTPS network connectivity verified (https://archlinux.org)"
+    },
+    {
+      "name": "keyring",
+      "status": "fail",
+      "message": "Failed to check pacman keyring status"
+    }
+  ]
+}

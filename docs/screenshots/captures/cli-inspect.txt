@@ -1,0 +1,52 @@
+{
+  "target_file": "cron_3.0pl1-197_amd64.deb",
+  "format": "deb",
+  "package_name": "cron",
+  "version": "3.0pl1-197",
+  "architecture": "amd64",
+  "description": "process scheduling daemon",
+  "maintainer": "Georges Khaznadar <georgesk@debian.org>",
+  "dependencies": [
+    "init-system-helpers (>= 1.54~)",
+    "cron-daemon-common",
+    "libc6 (>= 2.34)",
+    "libpam0g (>= 0.99.7.1)",
+    "libselinux1 (>= 3.1~)",
+    "sensible-utils",
+    "libpam-runtime"
+  ],
+  "maintainer_scripts": [
+    {
+      "name": "preinst",
+      "content": "#!/bin/sh\nset -e\n# Automatically added by dh_installinit/13.24.2\nif [ \"$1\" = \"install\" ] && [ -n \"$2\" ] &
+      "executed": false,
+      "status": "readable_shell"
+    },
+    {
+      "name": "postinst",
+      "content": "#!/bin/sh\nset -e\n\naction=\"$1\"\n\nif [ \"$action\" = configure ]; then\n    # Fixup crontab binary for new gro
+      "executed": false,
+      "status": "readable_shell"
+    },
+    {
+      "name": "prerm",
+      "content": "#!/bin/sh\nset -e\n# Automatically added by dh_installsystemd/13.24.2\nif [ -z \"$DPKG_ROOT\" ] && [ \"$1\" = remo
+      "executed": false,
+      "status": "readable_shell"
+    },
+    {
+      "name": "postrm",
+      "content": "#!/bin/sh\nset -e\n\nif [ \"$1\" = \"purge\" ] && \\\n       dpkg-statoverride --list /usr/bin/crontab > /dev/null
+      "executed": false,
+      "status": "readable_shell"
+    }
+  ],
+  "desktop_files": [],
+  "systemd_units": [
+    "cron.service"
+  ],
+  "needed_libraries": [],
+  "compatibility_note": "Inspected DEB package 'cron' (3.0pl1-197 amd64). 4 maintainer scripts parsed but unexecuted. 7 dependencies
+  "size_bytes": 87416,
+  "sha256": "32d7fc3e00dc504401c61682ac31c4a60068721b4e267e8439a04754af914c5b"
+}
