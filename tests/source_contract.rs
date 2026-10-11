@@ -96,16 +96,39 @@ fn cli_is_rpc_client_not_packaging_engine() {
 fn no_foreign_script_executor() {
     let inspect = source("inspect.rs");
     assert_contains(&inspect, "executed: false", "inspect.rs");
-    let squeezed = squeezed(&inspect);
+    let folded = squeezed(&inspect);
     for shell in ["sh", "bash", "ldd"] {
-        assert_absent(
-            &squeezed,
-            &format!("Step :: new (\"{shell}\""),
-            "inspect.rs",
-        );
-        assert_absent(&squeezed, &format!("Step::new(\"{shell}\""), "inspect.rs");
+        assert_absent(&folded, &format!("Step :: new (\"{shell}\""), "inspect.rs");
+        assert_absent(&folded, &format!("Step::new(\"{shell}\""), "inspect.rs");
     }
     assert_absent(&inspect, "Command::new", "inspect.rs");
+
+    // The header readers are the two places a hostile package gets closest to
+    // code: RPM scriptlets are shell source, and an ELF object is the thing an
+    // `ldd`-style probe would run. Neither module may launch anything at all —
+    // the answers come from bytes that were already read into memory.
+    for module in ["inspect.rs", "rpm.rs", "elf.rs"] {
+        let text = source(module);
+        let folded = squeezed(&text);
+        assert_absent(&text, "Command::new", module);
+        for program in ["sh", "bash", "ldd", "readelf", "objdump", "nm", "python"] {
+            assert_absent(&folded, &format!("Step :: new (\"{program}\""), module);
+            assert_absent(&folded, &format!("Step::new(\"{program}\""), module);
+        }
+    }
+
+    // Parsing an untrusted object is arithmetic on offsets, so it must be total:
+    // a truncated or hostile file is refused, never a panic on the way.
+    for module in ["rpm.rs", "elf.rs"] {
+        let text = source(module);
+        let production = text
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap_or_else(|| panic!("{module} has no test module to split on"));
+        for forbidden in [".unwrap()", ".expect(", "panic!(", "unreachable!("] {
+            assert_absent(production, forbidden, module);
+        }
+    }
 }
 
 #[test]
