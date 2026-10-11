@@ -248,9 +248,14 @@ impl RpcServer {
                         )))
                     }
                 };
+                // An unreadable preferences file is the server's problem, not the
+                // caller's parameter: -32602 would send them editing a request
+                // that was already correct.
+                if let Some(error) = self.engine.config_error() {
+                    return Err(JsonRpcError::server(error.to_string()));
+                }
                 self.engine
-                    .config
-                    .get(key)
+                    .config_get(key)
                     .map_err(JsonRpcError::invalid_params)
             }
             "v1.prepare" => self.prepare_plan(params).and_then(|p| {
@@ -280,8 +285,7 @@ impl RpcServer {
     fn prepare_plan(&mut self, params: &Value) -> Result<crate::engine::Plan, JsonRpcError> {
         let action = require_str(params, "action", "the plan action")?;
         let mut carriers: Vec<&Value> = Vec::new();
-        if let Some(Value::Object(_)) = params.get("request") {
-            let request = params.get("request").expect("checked");
+        if let Some(request @ Value::Object(_)) = params.get("request") {
             carriers.push(request);
             push_options(&mut carriers, request)?;
         } else if let Some(other) = params.get("request") {
@@ -373,8 +377,13 @@ impl RpcServer {
                         )))
                     }
                 };
-                // The only way this fails is a key or value the store rejects,
-                // which is the caller's parameter to fix, not an engine fault.
+                // With a readable store the only way this fails is a key or value
+                // the store rejects, which is the caller's parameter to fix, not an
+                // engine fault. A store nobody can read is the other case, and that
+                // is -32000.
+                if let Some(error) = engine.config_error() {
+                    return Err(JsonRpcError::server(error.to_string()));
+                }
                 engine
                     .prepare_config_set(&key, &value)
                     .map_err(JsonRpcError::invalid_params)

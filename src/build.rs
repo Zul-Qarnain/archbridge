@@ -320,8 +320,19 @@ pub fn execute_chroot_build(
             job_dir.display()
         )
     })?;
+    // These paths go into an argument vector, and a working directory is only
+    // required to be valid OS bytes: a non-UTF-8 directory name is somebody's
+    // home directory, not a reason to panic the build.
     let chroot_dir_abs = job_dir_abs.join("chroot");
     let chroot_root_abs = chroot_dir_abs.join("root");
+    let chroot_dir_arg = chroot_dir_abs
+        .to_str()
+        .ok_or_else(|| "The resolved chroot directory is not valid UTF-8".to_string())?
+        .to_string();
+    let chroot_root_arg = chroot_root_abs
+        .to_str()
+        .ok_or_else(|| "The resolved chroot root is not valid UTF-8".to_string())?
+        .to_string();
 
     // Create clean chroot with mkarchroot
     let mkchroot_step = Step::new(
@@ -331,7 +342,7 @@ pub fn execute_chroot_build(
             "mkarchroot".to_string(),
             "-C".to_string(),
             "/etc/pacman.conf".to_string(),
-            chroot_root_abs.to_str().unwrap().to_string(),
+            chroot_root_arg,
             "base".to_string(),
             "base-devel".to_string(),
             "sudo".to_string(),
@@ -366,7 +377,7 @@ pub fn execute_chroot_build(
             "-n".to_string(),
             "makechrootpkg".to_string(),
             "-r".to_string(),
-            chroot_dir_abs.to_str().unwrap().to_string(),
+            chroot_dir_arg,
             "--".to_string(),
             "--syncdeps".to_string(),
             "--noconfirm".to_string(),
@@ -448,13 +459,19 @@ pub fn run_runtime_smoke_test(
     let mut smoke = SmokeConfig { timeout_seconds: 0 };
     smoke.timeout_seconds = 30;
 
+    // The root is `TMPDIR`-derived, so its bytes are only guaranteed to be a
+    // path; naming it in an argument vector needs UTF-8 or a plain refusal.
+    let test_root_arg = test_root
+        .to_str()
+        .ok_or_else(|| "The isolated test root is not at a UTF-8 path".to_string())?;
+
     let mut args = vec![
         "--private-users=pick".to_string(),
         "--private-network".to_string(),
         "--user".to_string(),
         "65534".to_string(),
         "-D".to_string(),
-        test_root.to_str().unwrap().to_string(),
+        test_root_arg.to_string(),
         program.clone(),
     ];
 

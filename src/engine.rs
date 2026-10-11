@@ -31,6 +31,11 @@ const MAX_SOURCE_ARCHIVE_BYTES: u64 = 128 * 1024 * 1024;
 /// expires with the review.
 const PLAN_TTL: Duration = Duration::from_secs(10 * 60);
 
+/// How many plans stay reviewable at once. The review window alone does not
+/// bound the store: inside ten minutes a client can stage as many plans as it
+/// likes, and each one carries the file-review text of everything it looked at.
+const MAX_PENDING_PLANS: usize = 32;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct FilesystemChange {
     pub path: String,
@@ -76,6 +81,9 @@ pub struct StagedBuild {
 pub struct Engine {
     pub config: Config,
     pub pending_plans: HashMap<String, (Plan, Instant, Option<StagedBuild>)>,
+    /// Why the preferences file could not be read. Kept so every method that
+    /// would otherwise plan against guessed defaults says so instead.
+    config_error: Option<String>,
 }
 
 impl Default for Engine {
@@ -333,25 +341,63 @@ impl Engine {
     }
 
     pub fn new() -> Self {
-        let config = Config::load().unwrap_or_default();
-        Self {
-            config,
-            pending_plans: HashMap::new(),
-        }
+        Self::from_load(Config::load(), None)
     }
 
     /// An engine whose preferences live at `config_path` instead of the user's
     /// real config file. Tests and sandboxed runs must be able to exercise
     /// `config.set` without rewriting someone's discovery settings.
     pub fn with_config_path(config_path: &Path) -> Self {
-        let config = Config::load_from(config_path).unwrap_or_else(|_| Config {
-            path: config_path.to_path_buf(),
-            ..Config::default()
-        });
+        Self::from_load(Config::load_from(config_path), Some(config_path))
+    }
+
+    /// Building an engine never fails: an unreadable preferences file is remembered
+    /// and reported by every method that would have planned against it, instead of
+    /// being silently replaced by defaults the user never chose.
+    fn from_load(loaded: Result<Config, String>, config_path: Option<&Path>) -> Self {
+        let (config, config_error) = match loaded {
+            Ok(config) => (config, None),
+            Err(error) => {
+                // Keep the file this engine was pointed at: a fallback that
+                // carried the default path could later be saved into the real
+                // user configuration.
+                let fallback = match config_path {
+                    Some(path) => Config {
+                        path: path.to_path_buf(),
+                        ..Config::default()
+                    },
+                    None => Config::default(),
+                };
+                (fallback, Some(error))
+            }
+        };
         Self {
             config,
             pending_plans: HashMap::new(),
+            config_error,
         }
+    }
+
+    /// The preference-store error this engine was constructed with, if any.
+    pub fn config_error(&self) -> Option<&str> {
+        self.config_error.as_deref()
+    }
+
+    /// Refuse to stage a review whose outcome depends on preferences that could
+    /// not be read: which sources are enabled, and where the artifact goes.
+    fn require_config(&self) -> Result<(), String> {
+        match &self.config_error {
+            Some(error) => Err(format!(
+                "Preferences could not be read, so nothing can be planned against them: {error}"
+            )),
+            None => Ok(()),
+        }
+    }
+
+    /// Read one preference, or report why the whole store is unusable.
+    pub fn config_get(&self, key: &str) -> Result<serde_json::Value, String> {
+        self.require_config()?;
+        self.config.get(key)
     }
 
     /// Stage a plan so it becomes executable, dropping any plan whose review
@@ -359,6 +405,20 @@ impl Engine {
     /// this the pending store grows without bound and keeps stale consent alive.
     fn stage_plan(&mut self, plan: Plan, staged: Option<StagedBuild>) -> Plan {
         self.purge_expired();
+        // Ageing out is not a bound: every plan staged inside one review window
+        // would be kept. The oldest review is withdrawn first, exactly as if its
+        // window had closed on its own.
+        while self.pending_plans.len() >= MAX_PENDING_PLANS {
+            let Some(oldest) = self
+                .pending_plans
+                .iter()
+                .max_by_key(|(_, entry)| entry.1.elapsed())
+                .map(|(plan_id, _)| plan_id.clone())
+            else {
+                break;
+            };
+            self.pending_plans.remove(&oldest);
+        }
         self.pending_plans
             .insert(plan.plan_id.clone(), (plan.clone(), Instant::now(), staged));
         plan
@@ -371,8 +431,12 @@ impl Engine {
     }
 
     pub fn prepare_search(&mut self, target: &str, repo: Option<&str>) -> Result<Plan, String> {
+        self.require_config()?;
         let report = search(target, repo, &self.config);
-        let plan_id = generate_plan_id("search", target);
+        let plan_id = generate_plan_id(
+            "search",
+            &review_binding(&[("target", target), ("repo", repo.unwrap_or(""))]),
+        );
 
         let summary = format!(
             "Search target '{}': recommended source is '{:?}'",
@@ -442,10 +506,16 @@ impl Engine {
     }
 
     pub fn prepare_config_set(&mut self, key: &str, value: &str) -> Result<Plan, String> {
+        // Saving over an unreadable file would replace preferences the user still
+        // has on disk with the defaults plus one key, so refuse until it is fixed.
+        self.require_config()?;
         let mut test_config = self.config.clone();
         test_config.set(key, value)?;
 
-        let plan_id = generate_plan_id("config.set", key);
+        let plan_id = generate_plan_id(
+            "config.set",
+            &review_binding(&[("key", key), ("value", value)]),
+        );
         let summary = format!("Set configuration key '{}' to '{}'", key, value);
 
         // The plan has to name the file execution will actually write.
@@ -469,7 +539,19 @@ impl Engine {
             blocked: None,
         };
 
-        let plan = self.stage_plan(plan, None);
+        // `target` and `pkgbuild` carry the change itself: execution must write the
+        // key and value that were reviewed, not a re-reading of the plan's prose.
+        let staged = StagedBuild {
+            job_id: "config.set".to_string(),
+            target: key.to_string(),
+            pkgbuild: value.to_string(),
+            source_tarball: Vec::new(),
+            entry: String::new(),
+            smoke_args: Vec::new(),
+            run_smoke_test: false,
+            artifact_path: None,
+        };
+        let plan = self.stage_plan(plan, Some(staged));
         Ok(plan)
     }
 
@@ -482,6 +564,8 @@ impl Engine {
         deps: &[String],
         smoke_args: &[String],
     ) -> Result<Plan, String> {
+        self.require_config()?;
+        validate_target(target)?;
         let inferred_name = name_opt.map(str::to_string).unwrap_or_else(|| {
             if let Some(pos) = target.rfind('/') {
                 target[pos + 1..].to_string()
@@ -495,6 +579,17 @@ impl Engine {
             .unwrap_or(&inferred_name);
         let default_entry = sanitize_entry_name(name);
         let entry = entry_opt.unwrap_or(&default_entry);
+        // This value is an argument vector element of the container launch and a
+        // file name inside the PKGBUILD, so it can neither be empty nor read as an
+        // option of `systemd-nspawn` itself.
+        validate_token(entry, "Entry binary name")?;
+        if let Some(name) = name_opt {
+            validate_token(name, "Package name")?;
+        }
+        if let Some(version) = ver_opt {
+            validate_token(version, "Package version")?;
+        }
+        validate_args(smoke_args)?;
         let version = ver_opt.unwrap_or("1.0.0");
 
         let job_id = format!("job-{}", generate_plan_id("build", target));
@@ -565,7 +660,12 @@ impl Engine {
         } else if target.ends_with("PKGBUILD") {
             let pkgbuild_content = fs::read_to_string(target)
                 .map_err(|e| format!("Failed to read PKGBUILD at '{}': {}", target, e))?;
-            let parent_dir = Path::new(target).parent().unwrap_or_else(|| Path::new("."));
+            // `PKGBUILD` on its own has an empty parent, which is not a directory
+            // that exists: the file sits in the working directory it was named from.
+            let parent_dir = Path::new(target)
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
             let snap = snapshot_directory(parent_dir)?;
             (snap, BuildSystem::Make, pkgbuild_content, name.to_string())
         } else if Path::new(target).exists() && Path::new(target).is_dir() {
@@ -673,13 +773,34 @@ impl Engine {
             };
             (snap, bsys, pkgb, name.to_string())
         } else {
-            return Err(format!(
-                "Build target '{}' is not a valid local path, PKGBUILD, or HTTPS URL",
-                target
-            ));
+            // An HTTPS URL from a host that is not queried is a different answer
+            // than "this is not a URL": the caller has to learn which to change.
+            return Err(if target.starts_with("https://") {
+                format!(
+                    "Build source '{target}' is an HTTPS URL, but only github.com and gitlab.com \
+                     releases are fetched. Name a local directory or PKGBUILD, or pass the \
+                     repository with --repo."
+                )
+            } else {
+                format!(
+                    "Build target '{}' is not a valid local path, PKGBUILD, or HTTPS URL",
+                    target
+                )
+            });
         };
 
-        let plan_id = generate_plan_id("build", target);
+        let plan_id = generate_plan_id(
+            "build",
+            &review_binding(&build_binding(
+                target,
+                &package_name,
+                version,
+                entry,
+                deps,
+                smoke_args,
+                &pkgbuild,
+            )),
+        );
 
         // Mirrors src/build.rs: the unprivileged native pass runs first and the
         // privileged clean chroot is only reached if it produces no package.
@@ -726,17 +847,21 @@ impl Engine {
 
         let run_smoke_test = !matches!(&build_sys, BuildSystem::Imported) || entry_opt.is_some();
         if run_smoke_test {
+            let mut launch: Vec<String> = vec![
+                "--private-users=pick".to_string(),
+                "--private-network".to_string(),
+                "--user".to_string(),
+                "65534".to_string(),
+                "-D".to_string(),
+                job_dir.join("test_root").to_str().unwrap().to_string(),
+                entry.to_string(),
+            ];
+            // What the container hands the entry binary is part of what is being
+            // agreed to: a review that omits it describes a different run.
+            launch.extend(smoke_args.iter().cloned());
             steps.push(Step::new(
                 "systemd-nspawn",
-                vec![
-                    "--private-users=pick",
-                    "--private-network",
-                    "--user",
-                    "65534",
-                    "-D",
-                    job_dir.join("test_root").to_str().unwrap(),
-                    entry,
-                ],
+                launch,
                 "Runtime smoke test inside isolated container",
                 30,
             ));
@@ -812,6 +937,7 @@ impl Engine {
     }
 
     pub fn prepare_install(&mut self, target: &str) -> Result<Plan, String> {
+        validate_target(target)?;
         if target.ends_with(".deb") || target.ends_with(".rpm") {
             return self.prepare_build(target, None, None, None, &[], &[]);
         }
@@ -822,6 +948,14 @@ impl Engine {
         }
 
         if target.contains(".pkg.tar.") {
+            // Consent has to be about an action that can happen, and the path
+            // reaches `pacman -U` verbatim: a file that is not there installs
+            // nothing, and a value starting with '-' is a pacman option.
+            if !Path::new(target).is_file() {
+                return Err(format!(
+                    "Package file '{target}' does not exist. Pass the path of a built .pkg.tar.* package."
+                ));
+            }
             let plan_id = generate_plan_id("install", target);
             let steps = vec![Step::new(
                 "sudo",
@@ -850,6 +984,7 @@ impl Engine {
             return Ok(plan);
         }
 
+        self.require_config()?;
         let report = search(target, None, &self.config);
         let rec = report.recommended_source.clone();
 
@@ -887,6 +1022,10 @@ impl Engine {
         if package.is_empty()
             || package == "."
             || package == ".."
+            // A leading '-' is not an odd package name: it is the shape of a
+            // pacman flag, and `-Rns --config=/tmp/x` lets the caller choose the
+            // configuration (and therefore the hook directory) this root run reads.
+            || package.starts_with('-')
             || package.len() > 128
             || !package
                 .bytes()
@@ -932,28 +1071,48 @@ impl Engine {
         &mut self,
         pkg_path: &str,
         entry_opt: Option<&str>,
-        _smoke_args: &[String],
+        smoke_args: &[String],
     ) -> Result<Plan, String> {
-        let entry = entry_opt.unwrap_or_else(|| {
-            if let Some(pos) = pkg_path.rfind('/') {
-                &pkg_path[pos + 1..]
-            } else {
-                pkg_path
-            }
-        });
+        validate_target(pkg_path)?;
+        // This plan is the one that claims a runtime result, so it can only be
+        // staged over bytes that exist right now: a test over a missing or
+        // ununpackable file is a plan that can only report what it never checked.
+        let artifact = Path::new(pkg_path);
+        if !artifact.is_file() {
+            return Err(format!(
+                "Test target '{pkg_path}' is not a file. Pass the path of a built .pkg.tar.* package."
+            ));
+        }
+        if !pkg_path.contains(".pkg.tar.") {
+            return Err(format!(
+                "Test target '{pkg_path}' is not an Arch package archive (.pkg.tar.*), so there is no payload to unpack into a test root."
+            ));
+        }
+        let default_entry = artifact
+            .file_name()
+            .map(|name| sanitize_entry_name(&name.to_string_lossy()))
+            .unwrap_or_else(|| sanitize_entry_name(pkg_path));
+        let entry = entry_opt.unwrap_or(default_entry.as_str());
+        validate_token(entry, "Entry binary name")?;
+        validate_args(smoke_args)?;
 
-        let plan_id = generate_plan_id("test", pkg_path);
+        let plan_id = generate_plan_id(
+            "test",
+            &review_binding(&[("target", pkg_path), ("entry", entry)]),
+        );
+        let mut launch: Vec<String> = vec![
+            "--private-users=pick".to_string(),
+            "--private-network".to_string(),
+            "--user".to_string(),
+            "65534".to_string(),
+            "-D".to_string(),
+            ISOLATED_TEST_ROOT.to_string(),
+            entry.to_string(),
+        ];
+        launch.extend(smoke_args.iter().cloned());
         let steps = vec![Step::new(
             "systemd-nspawn",
-            vec![
-                "--private-users=pick",
-                "--private-network",
-                "--user",
-                "65534",
-                "-D",
-                "/tmp/disposable_test_root",
-                entry,
-            ],
+            launch,
             "Execute runtime smoke test",
             30,
         )];
@@ -967,15 +1126,34 @@ impl Engine {
                 pkg_path, entry
             ),
             steps,
-            filesystem_changes: vec![],
+            filesystem_changes: vec![FilesystemChange {
+                path: std::env::temp_dir().to_string_lossy().to_string(),
+                action: "create".to_string(),
+                description: "Unpack the package into a fresh temporary test root".to_string(),
+            }],
             reviews: vec![],
-            warnings: vec!["Runs package binary in isolated container".to_string()],
+            warnings: vec![
+                "Runs package binary in isolated container".to_string(),
+                "The container root is a fresh directory created when the plan runs, holding only this package's files".to_string(),
+            ],
             decision: None,
             downstream: None,
             blocked: None,
         };
 
-        let plan = self.stage_plan(plan, None);
+        // The bytes and the entry to run are staged with the plan, so execution
+        // tests exactly what was reviewed rather than whatever is at the path now.
+        let staged = StagedBuild {
+            job_id: String::new(),
+            target: pkg_path.to_string(),
+            pkgbuild: String::new(),
+            source_tarball: Vec::new(),
+            entry: entry.to_string(),
+            smoke_args: smoke_args.to_vec(),
+            run_smoke_test: true,
+            artifact_path: Some(artifact.to_path_buf()),
+        };
+        let plan = self.stage_plan(plan, Some(staged));
         Ok(plan)
     }
 
@@ -1015,7 +1193,7 @@ impl Engine {
         // count if the chroot fallback is needed.
         let total_steps = match plan.action.as_str() {
             "build" => 1,
-            "install" | "uninstall" => plan.steps.len(),
+            "install" | "uninstall" | "test" => plan.steps.len(),
             _ => 0,
         };
         let label = match plan.action.as_str() {
@@ -1059,17 +1237,12 @@ impl Engine {
                 next_plan: None,
             }),
             "config.set" => {
-                let change = plan
-                    .filesystem_changes
-                    .first()
-                    .ok_or("config.set plan carries no recorded change")?;
-                let (k, v) = change
-                    .description
-                    .strip_prefix("Update configuration key '")
-                    .and_then(|s| s.split_once("' = '"))
-                    .ok_or("config.set plan recorded an unreadable change")?;
-                let val = v.trim_end_matches('\'');
-                self.config.set(k, val)?;
+                // The key and value are executed from the staged data, not parsed
+                // back out of the sentence the user reads: a value containing
+                // "' = '" was cut short there, so the file ended up holding
+                // something other than what was reviewed.
+                let staged = staged_opt.ok_or("config.set plan carries no staged change")?;
+                self.config.set(&staged.target, &staged.pkgbuild)?;
                 self.config.save()?;
                 // Every other staged plan was reviewed under the old preferences:
                 // its recommendation, pinned sources and step list can all change
@@ -1078,7 +1251,7 @@ impl Engine {
                 Ok(ExecutionResult {
                     ok: true,
                     plan_id: plan_id.to_string(),
-                    message: format!("Configuration key '{k}' updated and saved"),
+                    message: format!("Configuration key '{}' updated and saved", staged.target),
                     output: None,
                     next_plan: None,
                 })
@@ -1204,13 +1377,35 @@ impl Engine {
                     next_plan: None,
                 })
             }
-            "test" => Ok(ExecutionResult {
-                ok: true,
-                plan_id: plan_id.to_string(),
-                message: "Test execution completed".to_string(),
-                output: None,
-                next_plan: None,
-            }),
+            "test" => {
+                // A test plan is the surface that claims the package ran, so it
+                // runs the container and reports what the container said.
+                let staged = staged_opt.ok_or("Test plan carries no staged artifact")?;
+                let artifact = staged
+                    .artifact_path
+                    .ok_or("Test plan carries no staged artifact path")?;
+                let report = run_runtime_smoke_test(&artifact, &staged.entry, &staged.smoke_args)?;
+                Ok(ExecutionResult {
+                    ok: report.passed,
+                    plan_id: plan_id.to_string(),
+                    message: if report.passed {
+                        format!(
+                            "Runtime smoke test passed for entry '{}'",
+                            report.entry_point
+                        )
+                    } else {
+                        format!(
+                            "Runtime smoke test failed for entry '{}': {}",
+                            report.entry_point, report.stderr
+                        )
+                    },
+                    output: Some(format!(
+                        "Exit code: {}\nStdout: {}\nStderr: {}",
+                        report.exit_code, report.stdout, report.stderr
+                    )),
+                    next_plan: None,
+                })
+            }
             _ => Err(format!("Unknown action '{}'", plan.action)),
         }
     }
@@ -1247,6 +1442,132 @@ fn blocked_build_plan(target: &str, reviews: Vec<FileReview>, reason: String) ->
         downstream: None,
         blocked: Some(reason),
     }
+}
+
+/// The `-D` value shown in a runtime-test review. The container root is created
+/// when the plan runs, so no path written at review time could name it honestly.
+const ISOLATED_TEST_ROOT: &str = "<temporary isolated test root>";
+
+/// Longest target the engine will stat, read, fetch, or print in a review.
+const MAX_TARGET_BYTES: usize = 4096;
+
+/// A build or test target becomes an argument to `pacman`, `curl` and `bsdtar`,
+/// and a line in the review someone consents to. One printable argument, no more.
+fn validate_target(target: &str) -> Result<(), String> {
+    if target.trim().is_empty() {
+        return Err("Target cannot be empty".to_string());
+    }
+    if target.len() > MAX_TARGET_BYTES {
+        return Err(format!(
+            "Target is {} bytes; no path or URL this engine reads is longer than {MAX_TARGET_BYTES}",
+            target.len()
+        ));
+    }
+    if target.contains('\0') {
+        return Err(
+            "Target contains a NUL byte, which ends a path at the operating-system boundary"
+                .to_string(),
+        );
+    }
+    if target.contains(char::is_control) {
+        return Err(
+            "Target contains control characters; one argument cannot hold a newline or escape"
+                .to_string(),
+        );
+    }
+    if target.starts_with('-') {
+        return Err(format!(
+            "Target '{target}' starts with '-': the tool that runs it would read it as one of \
+             its own options rather than as something to act on."
+        ));
+    }
+    Ok(())
+}
+
+/// A package name, version or entry binary the engine hands to an argument vector
+/// and interpolates into the generated PKGBUILD.
+fn validate_token(value: &str, what: &str) -> Result<(), String> {
+    if value.is_empty() {
+        return Err(format!("{what} cannot be empty"));
+    }
+    if value.len() > 128 {
+        return Err(format!("{what} is longer than 128 characters"));
+    }
+    if value.contains(char::is_control) {
+        return Err(format!("{what} contains control characters"));
+    }
+    if value.chars().any(char::is_whitespace) {
+        return Err(format!(
+            "{what} contains whitespace; a generated PKGBUILD could not hold it"
+        ));
+    }
+    if value.contains('/') {
+        return Err(format!(
+            "{what} must be a plain file name, not a path: pass 'demo', not 'usr/bin/demo'"
+        ));
+    }
+    if value.starts_with('-') {
+        return Err(format!(
+            "{what} cannot start with '-': it would be read as an option, not a name"
+        ));
+    }
+    Ok(())
+}
+
+/// Arguments the smoke test passes to the entry binary. These legitimately begin
+/// with '-' — that is how `--version` is asked for — so only what cannot be one
+/// argv element is refused here.
+fn validate_args(args: &[String]) -> Result<(), String> {
+    if args.len() > 32 {
+        return Err(format!(
+            "A smoke test takes at most 32 arguments, got {}",
+            args.len()
+        ));
+    }
+    for arg in args {
+        if arg.len() > 512 {
+            return Err(format!(
+                "Smoke-test argument is {} bytes, longer than the 512 an argument can be",
+                arg.len()
+            ));
+        }
+        if arg.contains(char::is_control) {
+            return Err("Smoke-test arguments cannot contain control characters".to_string());
+        }
+    }
+    Ok(())
+}
+
+/// The fields a review covers, each labelled and length-prefixed so no two
+/// different reviews of the same target bind to the same string.
+fn review_binding(fields: &[(&str, &str)]) -> String {
+    fields
+        .iter()
+        .map(|(label, value)| format!("{label}:{}:{value}", value.len()))
+        .collect()
+}
+
+/// What a build consent is about: the target, the names and options that shaped
+/// the PKGBUILD, and the exact script the plan will stage.
+fn build_binding<'a>(
+    target: &'a str,
+    name: &'a str,
+    version: &'a str,
+    entry: &'a str,
+    deps: &'a [String],
+    smoke_args: &'a [String],
+    pkgbuild: &'a str,
+) -> Vec<(&'a str, &'a str)> {
+    let mut fields: Vec<(&str, &str)> = vec![
+        ("target", target),
+        ("name", name),
+        ("version", version),
+        ("entry", entry),
+    ];
+    fields.extend(deps.iter().map(|dep| ("dep", dep.as_str())));
+    fields.extend(smoke_args.iter().map(|arg| ("smoke", arg.as_str())));
+    fields.push(("pkgbuild", pkgbuild));
+    fields
 }
 
 /// Copy a finished artifact into the user's configured output directory.
@@ -1295,4 +1616,103 @@ fn generate_plan_id(action: &str, target: &str) -> String {
     hasher.update(format!("{:?}", Instant::now()).as_bytes());
     let hash = format!("{:x}", hasher.finalize());
     format!("{}-{}", action, &hash[..12])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn binding(
+        version: &str,
+        entry: &str,
+        deps: &[&str],
+        smoke: &[&str],
+        pkgbuild: &str,
+    ) -> String {
+        review_binding(&build_binding(
+            "https://github.com/owner/tool",
+            "tool",
+            version,
+            entry,
+            &deps.iter().map(|d| d.to_string()).collect::<Vec<_>>(),
+            &smoke.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            pkgbuild,
+        ))
+    }
+
+    #[test]
+    fn every_option_a_review_holds_is_part_of_what_its_id_is_made_from() {
+        let base = binding("1.0.0", "tool", &[], &[], "pkgver='1.0.0'");
+        // Two builds of one target that differ only in what they were asked to
+        // build are different consents, and must not share a review binding.
+        assert_ne!(base, binding("2.0.0", "tool", &[], &[], "pkgver='2.0.0'"));
+        assert_ne!(base, binding("1.0.0", "other", &[], &[], "pkgver='1.0.0'"));
+        assert_ne!(
+            base,
+            binding("1.0.0", "tool", &["glibc"], &[], "pkgver='1.0.0'")
+        );
+        assert_ne!(
+            base,
+            binding("1.0.0", "tool", &[], &["--help"], "pkgver='1.0.0'")
+        );
+        assert_ne!(base, binding("1.0.0", "tool", &[], &[], "pkgver='9.9.9'"));
+    }
+
+    #[test]
+    fn a_binding_cannot_be_read_two_ways() {
+        // Concatenating fields without a length lets ("ab", "c") and ("a", "bc")
+        // look identical, which is how one review could be re-bound as another.
+        let first = review_binding(&[("a", "ab"), ("b", "c")]);
+        let second = review_binding(&[("a", "a"), ("b", "bc")]);
+        assert_ne!(first, second);
+        assert_eq!(
+            first,
+            review_binding(&[("a", "ab"), ("b", "c")]),
+            "the same fields must bind the same, or a review cannot be recognised"
+        );
+    }
+
+    #[test]
+    fn a_target_or_token_that_is_not_one_clean_argument_is_refused() {
+        for target in [
+            "",
+            "   ",
+            "-rf",
+            "--config=/tmp/evil.pkg.tar.zst",
+            "a\u{0}b",
+            "line1\nline2",
+            &format!("/tmp/{}", "deep/".repeat(2000)),
+        ] {
+            assert!(
+                validate_target(target).is_err(),
+                "target {target:?} should be refused"
+            );
+        }
+        for token in [
+            "",
+            " ",
+            "-n",
+            "usr/bin/tool",
+            "two words",
+            "new\nline",
+            &"x".repeat(200),
+        ] {
+            assert!(
+                validate_token(token, "Entry binary name").is_err(),
+                "token {token:?} should be refused"
+            );
+        }
+        assert!(validate_token("tool", "Entry binary name").is_ok());
+        assert!(validate_token("WeChat", "Entry binary name").is_ok());
+        assert!(validate_token("1:0.3.4-1", "Package version").is_ok());
+    }
+
+    #[test]
+    fn smoke_arguments_are_the_programs_own_but_still_one_each() {
+        assert!(validate_args(&["--version".to_string(), "-v".to_string()]).is_ok());
+        assert!(validate_args(&["two words".to_string()]).is_ok());
+        assert!(validate_args(&["bad\nnewline".to_string()]).is_err());
+        assert!(validate_args(&vec!["x".to_string(); 33]).is_err());
+        assert!(validate_args(&vec!["y".repeat(513); 1]).is_err());
+    }
 }
