@@ -1,6 +1,9 @@
 use crate::gui::state::{
-    rpc_call, ActiveTab, AppState, AppTheme, HealthCheck, InputField, InstalledPackage, MsgLevel,
-    PathPrompt, SearchResult, SharedEngine, StatusMsg,
+    availability_label, compact_top_bar, cycle_source_filter, parse_decision_table,
+    parse_health_checks, recommendation_line, rpc_call, show_discover_inspector, show_quick_try,
+    source_filter_label, source_matches_filter, status_label, step_pick, visible_picks, ActiveTab,
+    AppState, AppTheme, InputField, InstalledPackage, MsgLevel, PathPrompt, SearchResult,
+    SharedEngine, StatusMsg, DOCTOR_STATUS_COLUMN_PX, NOT_REPORTED,
 };
 use crate::gui::theme::*;
 use crate::process::{format_elapsed, progress_snapshot, run_step, Step};
@@ -73,6 +76,9 @@ impl ArchBridgeApp {
         }
 
         app.refresh_sudo_advice(cx);
+        // Measure disk and keyring for the status bar. The defaults are
+        // "not measured" until this report lands.
+        app.run_doctor(cx);
 
         // Developer aid: run a real search at startup so the Discover tab can be
         // reviewed without typing. Invented result rows here used to be
@@ -145,6 +151,65 @@ impl ArchBridgeApp {
             self.state.focused_input = None;
             cx.notify();
         }
+    }
+
+    fn consume_tab_shortcut(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(tab) = crate::gui::state::tab_for_shortcut(
+            &event.keystroke.key,
+            event.keystroke.modifiers.control,
+        ) else {
+            return false;
+        };
+        if self.state.active_tab != tab {
+            self.state.active_tab = tab;
+            self.state.focused_input = None;
+            window.focus(&self.focus_handle);
+            cx.notify();
+        }
+        true
+    }
+
+    /// Ctrl+1..6 switches sidebar pages from anywhere. Up and down move the
+    /// Discover selection when no text field is consuming the keys.
+    fn handle_nav_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.consume_tab_shortcut(event, window, cx) {
+            return;
+        }
+        if self.state.focused_input.is_some() || self.state.active_tab != ActiveTab::Discover {
+            return;
+        }
+        let keystroke = &event.keystroke;
+        let delta = match keystroke.key.as_str() {
+            "up" => -1,
+            "down" => 1,
+            _ => return,
+        };
+        self.move_discover_selection(delta, cx);
+    }
+
+    fn move_discover_selection(&mut self, delta: i32, cx: &mut Context<Self>) {
+        let picks = visible_picks(&self.state.source_decisions, &self.state.source_filter);
+        let Some(next) = step_pick(
+            &picks,
+            self.state.selected_source,
+            self.state.selected_candidate,
+            delta,
+        ) else {
+            return;
+        };
+        self.state.selected_source = Some(next.source_index);
+        self.state.selected_candidate = next.candidate_index;
+        cx.notify();
     }
 
     fn focus_field(&mut self, field: InputField, window: &mut Window, cx: &mut Context<Self>) {
@@ -506,64 +571,8 @@ impl ArchBridgeApp {
                     Ok(val) => {
                         // A missing `ready` must not read as healthy.
                         let ready = val.get("ready").and_then(|r| r.as_bool()).unwrap_or(false);
-                        app.state.doctor_ready = ready;
-                        let checks: Vec<HealthCheck> = val
-                            .get("checks")
-                            .and_then(|c| c.as_array())
-                            .map(|arr| {
-                                arr.iter()
-                                    .map(|item| {
-                                        let status = item
-                                            .get("status")
-                                            .and_then(|s| s.as_str())
-                                            .unwrap_or("fail")
-                                            .to_string();
-                                        HealthCheck {
-                                            name: item
-                                                .get("name")
-                                                .and_then(|n| n.as_str())
-                                                .unwrap_or("Unknown")
-                                                .to_string(),
-                                            message: item
-                                                .get("message")
-                                                .and_then(|m| m.as_str())
-                                                .unwrap_or("")
-                                                .to_string(),
-                                            status,
-                                        }
-                                    })
-                                    .collect()
-                            })
-                            .unwrap_or_default();
-
-                        let failed = checks.iter().filter(|c| c.status == "fail").count();
-                        let unavailable =
-                            checks.iter().filter(|c| c.status == "unavailable").count();
-                        app.state.health_checks = checks;
-                        app.state.doctor_msg = Some(StatusMsg {
-                            level: if failed > 0 || !ready {
-                                MsgLevel::Warning
-                            } else if unavailable > 0 {
-                                MsgLevel::Info
-                            } else {
-                                MsgLevel::Success
-                            },
-                            text: if failed > 0 {
-                                format!(
-                                    "{failed} diagnostic check(s) failed; the system is not ready \
-                                     for privileged packaging."
-                                )
-                            } else if !ready {
-                                "The engine reported this system as not ready.".to_string()
-                            } else if unavailable > 0 {
-                                format!(
-                                    "{unavailable} check(s) are unavailable on this host. Local \
-                                     builds and offline inspection can still proceed."
-                                )
-                            } else {
-                                "All diagnostic checks passed.".to_string()
-                            },
-                        });
+                        let checks = parse_health_checks(&val);
+                        app.state.apply_doctor_report(checks, ready);
                     }
                     Err(e) => {
                         app.state.doctor_msg = Some(StatusMsg {
@@ -581,9 +590,7 @@ impl ArchBridgeApp {
     pub fn run_search(&mut self, cx: &mut Context<Self>) {
         let query = self.state.search_query.trim().to_string();
         if query.is_empty() {
-            self.state.search_results.clear();
-            self.state.recommended_item = None;
-            self.state.selected_result = None;
+            self.state.clear_search_hits();
             self.state.search_msg = None;
             cx.notify();
             return;
@@ -605,39 +612,10 @@ impl ArchBridgeApp {
 
                 match result {
                     Ok(val) => {
-                        let parsed = parse_search_results(&val);
-                        if parsed.is_empty() {
-                            app.state.search_results.clear();
-                            app.state.selected_result = None;
-                            app.state.recommended_item = None;
-                            app.state.search_msg = Some(StatusMsg {
-                                level: MsgLevel::Warning,
-                                text: format!(
-                                    "No packages or upstream repositories found matching '{}'",
-                                    query
-                                ),
-                            });
-                        } else {
-                            let n = parsed.len();
-                            app.state.recommended_item = parsed
-                                .iter()
-                                .find(|r| r.is_recommended)
-                                .cloned()
-                                .or_else(|| parsed.first().cloned());
-                            app.state.search_results = parsed;
-                            app.state.selected_result = Some(0);
-                            app.state.search_msg = Some(StatusMsg {
-                                level: MsgLevel::Info,
-                                text: format!("Found {} source candidate(s) for '{}'", n, query),
-                            });
-                        }
+                        app.state
+                            .apply_search_success(parse_decision_table(&val), &query);
                     }
-                    Err(e) => {
-                        app.state.search_msg = Some(StatusMsg {
-                            level: MsgLevel::Error,
-                            text: e,
-                        });
-                    }
+                    Err(e) => app.state.apply_search_error(e),
                 }
                 cx.notify();
             },
@@ -1389,76 +1367,6 @@ pub fn app_icon_for_name(name: &str) -> &'static str {
     }
 }
 
-/// Optional text a source genuinely did not report, shown instead of invented
-/// metadata.
-const NOT_REPORTED: &str = "not reported by this source";
-
-fn opt_str(item: &serde_json::Value, key: &str) -> Option<String> {
-    item.get(key)
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-}
-
-fn parse_search_results(val: &serde_json::Value) -> Vec<SearchResult> {
-    let mut out = Vec::new();
-
-    let Some(table) = val.get("decision_table").and_then(|t| t.as_array()) else {
-        return out;
-    };
-    for row in table {
-        let source = row
-            .get("source")
-            .and_then(|s| s.as_str())
-            .unwrap_or("unknown")
-            .to_string();
-        let is_row_rec = row
-            .get("recommended")
-            .and_then(|r| r.as_bool())
-            .unwrap_or(false);
-
-        if let Some(candidates) = row.get("candidates").and_then(|c| c.as_array()) {
-            for (cand_idx, item) in candidates.iter().enumerate() {
-                let name = opt_str(item, "name").unwrap_or_else(|| "unknown".to_string());
-                // A missing version stays missing: "latest" is a claim, not a fact.
-                let version = opt_str(item, "version").unwrap_or_else(|| NOT_REPORTED.to_string());
-                let description =
-                    opt_str(item, "description").unwrap_or_else(|| "No description".to_string());
-                let repository = opt_str(item, "repository");
-
-                let repo = repository.clone().unwrap_or_else(|| match source.as_str() {
-                    "official" => "Arch official repository".to_string(),
-                    "aur" => "AUR".to_string(),
-                    "flatpak" => "Flathub".to_string(),
-                    "appimage" => "AppImage release".to_string(),
-                    "upstream" => "Upstream source".to_string(),
-                    "deb" => "DEB foreign package".to_string(),
-                    "rpm" => "RPM foreign package".to_string(),
-                    _ => source.clone(),
-                });
-
-                out.push(SearchResult {
-                    name,
-                    version,
-                    description,
-                    source: source.clone(),
-                    repo,
-                    is_recommended: is_row_rec && cand_idx == 0 && out.is_empty(),
-                    url: opt_str(item, "url"),
-                    source_url: opt_str(item, "source_url"),
-                    license: opt_str(item, "license"),
-                    arch: opt_str(item, "architecture"),
-                    size: opt_str(item, "size"),
-                    maintainer: opt_str(item, "maintainer"),
-                    out_of_date: opt_str(item, "out_of_date"),
-                });
-            }
-        }
-    }
-
-    out
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
 // UI Primitives
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1470,8 +1378,8 @@ fn lighten(color: u32, t: f32) -> u32 {
 }
 
 fn action_button<F>(
-    id: &'static str,
-    label: &'static str,
+    id: impl Into<SharedString>,
+    label: impl Into<SharedString>,
     bg: u32,
     text: u32,
     handler: F,
@@ -1480,9 +1388,10 @@ where
     F: Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 {
     div()
-        .id(SharedString::from(id))
+        .id(id.into())
         .h(px(34.0))
         .px_4()
+        .flex_none()
         .bg(rgb(bg))
         .rounded_lg()
         .flex()
@@ -1492,10 +1401,11 @@ where
         .text_color(rgb(text))
         .text_size(px(12.0))
         .font_weight(FontWeight::BOLD)
+        .whitespace_nowrap()
         .hover(move |this| this.bg(rgb(lighten(bg, 0.22))))
         .active(move |this| this.bg(rgb(lighten(bg, 0.45))))
         .on_click(handler)
-        .child(label)
+        .child(label.into())
 }
 
 fn small_button(
@@ -1546,6 +1456,7 @@ fn status_msg_bar(msg: &StatusMsg, pal: &ThemePalette) -> impl IntoElement {
         .rounded_md()
         .text_color(rgb(text))
         .text_size(px(12.0))
+        .whitespace_normal()
         .child(msg.text.clone())
 }
 
@@ -1719,6 +1630,7 @@ impl Render for ArchBridgeApp {
             .collect::<Vec<_>>();
             self.focus_subs = subs;
         }
+        self.state.viewport_width = f32::from(window.viewport_size().width);
         self.ensure_ticker(cx);
         if self.state.auth_dialog_open && self.state.auth_needs_focus {
             self.state.auth_needs_focus = false;
@@ -1727,6 +1639,9 @@ impl Render for ArchBridgeApp {
         div()
             .id("root")
             .track_focus(&self.focus_handle)
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                this.handle_nav_key(event, window, cx);
+            }))
             .flex()
             .flex_row()
             .bg(rgb(pal.bg_darkest))
@@ -1766,8 +1681,7 @@ impl Render for ArchBridgeApp {
                     .child(
                         div()
                             .w_full()
-                            .h(px(24.0))
-                            .max_h(px(24.0))
+                            .h(px(28.0))
                             .flex_none()
                             .child(render_bottom_bar(self)),
                     ),
@@ -1775,7 +1689,7 @@ impl Render for ArchBridgeApp {
             .when(self.state.auth_dialog_open, |this| {
                 this.child(render_auth_dialog(self, cx))
             })
-            .when(self.state.engine_busy(), |this| {
+            .when(self.state.shows_progress_overlay(), |this| {
                 this.child(render_progress_overlay(self, &pal))
             })
     }
@@ -1783,7 +1697,7 @@ impl Render for ArchBridgeApp {
 
 fn render_progress_overlay(app: &ArchBridgeApp, pal: &ThemePalette) -> impl IntoElement {
     let p = app.state.progress.clone();
-    let blink = app.state.tick % 2 == 0;
+    let blink = app.state.tick.is_multiple_of(2);
     let phase = p
         .phase
         .clone()
@@ -1968,7 +1882,7 @@ fn render_auth_dialog(
     let busy = app.state.auth_busy;
     let masked = !app.state.auth_password_visible;
     let focused = app.state.focused_input == Some(InputField::Auth);
-    let blink = app.state.tick % 2 == 0;
+    let blink = app.state.tick.is_multiple_of(2);
     let has_text = !app.state.auth_password_input.is_empty();
     let shown_text = if app.state.auth_password_input.is_empty() {
         "Password (press Enter to authenticate)".to_string()
@@ -2106,7 +2020,10 @@ fn render_auth_dialog(
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.focus_field(InputField::Auth, window, cx);
                                     }))
-                                    .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                                    .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                                        if this.consume_tab_shortcut(event, window, cx) {
+                                            return;
+                                        }
                                         if this.state.auth_busy {
                                             return;
                                         }
@@ -2231,6 +2148,7 @@ fn render_auth_dialog(
 
 fn render_top_bar(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> impl IntoElement {
     let pal = get_palette(app.state.theme);
+    let compact = compact_top_bar(app.state.viewport_width);
     let theme_mode = app.state.theme;
     let (theme_icon, theme_name) = match theme_mode {
         AppTheme::Dark => ("🌙", "Dark"),
@@ -2315,45 +2233,42 @@ fn render_top_bar(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> i
                 .flex()
                 .items_center()
                 .gap_3()
-                // Engine Online Pill
-                .child(
-                    div()
-                        .px_3()
-                        .h(px(30.0))
-                        .rounded_lg()
-                        .bg(if pal.is_light() {
-                            rgb(0xecfdf5)
-                        } else {
-                            rgb(0x0a1f18)
-                        })
-                        .border_1()
-                        .border_color(if pal.is_light() {
-                            rgb(0xa7f3d0)
-                        } else {
-                            rgb(0x134e3a)
-                        })
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .child(
-                            div()
-                                .w(px(7.0))
-                                .h(px(7.0))
-                                .rounded_full()
-                                .bg(rgb(ACCENT_GREEN)),
-                        )
-                        .child(
-                            div()
-                                .text_color(if pal.is_light() {
-                                    rgb(0x065f46)
-                                } else {
-                                    rgb(0x34d399)
-                                })
-                                .text_size(px(11.5))
-                                .font_weight(FontWeight::MEDIUM)
-                                .child("Engine Online"),
-                        ),
-                )
+                .when(!compact, |this| {
+                    this.child(
+                        div()
+                            .px_3()
+                            .h(px(30.0))
+                            .rounded_lg()
+                            .bg(if pal.is_light() {
+                                rgb(0xecfdf5)
+                            } else {
+                                rgb(0x0a1f18)
+                            })
+                            .border_1()
+                            .border_color(if pal.is_light() {
+                                rgb(0xa7f3d0)
+                            } else {
+                                rgb(0x134e3a)
+                            })
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .w(px(7.0))
+                                    .h(px(7.0))
+                                    .rounded_full()
+                                    .bg(rgb(pal.accent_green)),
+                            )
+                            .child(
+                                div()
+                                    .text_color(rgb(pal.accent_green))
+                                    .text_size(px(11.5))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .child("Engine Online"),
+                            ),
+                    )
+                })
                 // Health Check Pill
                 .child(
                     div()
@@ -2385,11 +2300,7 @@ fn render_top_bar(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> i
                                 .text_color(rgb(pal.text_secondary))
                                 .text_size(px(11.5))
                                 .font_weight(FontWeight::MEDIUM)
-                                .child(if app.state.doctor_ready {
-                                    "System Ready"
-                                } else {
-                                    "Diagnostics"
-                                }),
+                                .child(app.state.doctor_pill_label()),
                         ),
                 )
                 // Sudo Toggle Pill
@@ -2513,13 +2424,15 @@ fn render_top_bar(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> i
                         .items_center()
                         .gap_2()
                         .child(div().text_size(px(12.0)).child(theme_icon))
-                        .child(
-                            div()
-                                .text_color(rgb(pal.text_primary))
-                                .text_size(px(11.5))
-                                .font_weight(FontWeight::BOLD)
-                                .child(theme_name),
-                        ),
+                        .when(!compact, |this| {
+                            this.child(
+                                div()
+                                    .text_color(rgb(pal.text_primary))
+                                    .text_size(px(11.5))
+                                    .font_weight(FontWeight::BOLD)
+                                    .child(theme_name),
+                            )
+                        }),
                 ),
         )
 }
@@ -2762,6 +2675,11 @@ fn sidebar_nav_btn(
         )
         .child(
             div()
+                .flex_1()
+                .min_w(px(0.0))
+                .overflow_hidden()
+                .text_ellipsis()
+                .whitespace_nowrap()
                 .text_color(if is_active {
                     rgb(pal.accent_cyan)
                 } else {
@@ -2801,7 +2719,9 @@ fn render_active_view(
 
 fn render_discover(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> impl IntoElement {
     let pal = get_palette(app.state.theme);
-    let has_results = !app.state.search_results.is_empty();
+    let has_results = !app.state.source_decisions.is_empty();
+    let recommended = app.state.recommended_source().cloned();
+    let show_inspector = show_discover_inspector(app.state.viewport_width);
 
     div()
         .flex()
@@ -2816,7 +2736,7 @@ fn render_discover(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> 
                 .overflow_y_scroll()
                 .flex()
                 .flex_col()
-                .gap_4()
+                .gap_2()
                 .min_w(px(0.0))
                 // View Header
                 .child(
@@ -2831,12 +2751,14 @@ fn render_discover(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> 
                                 .font_weight(FontWeight::BOLD)
                                 .child("Discover Software"),
                         )
-                        .child(
-                            div()
-                                .text_color(rgb(pal.text_muted))
-                                .text_size(px(13.0))
-                                .child("Find the best way to get your software on Arch Linux."),
-                        ),
+                        .when(!has_results, |this| {
+                            this.child(
+                                div()
+                                    .text_color(rgb(pal.text_muted))
+                                    .text_size(px(13.0))
+                                    .child("Find the best way to get your software on Arch Linux."),
+                            )
+                        }),
                 )
                 // Search Box Row
                 .child(
@@ -2847,6 +2769,7 @@ fn render_discover(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> 
                         .child(
                             div()
                                 .flex()
+                                .flex_wrap()
                                 .gap_2()
                                 // Input field
                                 .child(
@@ -2876,7 +2799,10 @@ fn render_discover(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> 
                                         .on_click(cx.listener(|this, _, window, cx| {
                                             this.focus_field(InputField::Search, window, cx);
                                         }))
-                                        .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                                        .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                                            if this.consume_tab_shortcut(event, window, cx) {
+                                                return;
+                                            }
                                             let keystroke = &event.keystroke;
                                             if keystroke.modifiers.control {
                                                 if keystroke.key == "v" {
@@ -2892,12 +2818,12 @@ fn render_discover(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> 
                                                 return;
                                             }
                                             match keystroke.key.as_str() {
+                                                "up" => this.move_discover_selection(-1, cx),
+                                                "down" => this.move_discover_selection(1, cx),
                                                 "backspace" => {
                                                     this.state.search_query.pop();
                                                     if this.state.search_query.is_empty() {
-                                                        this.state.search_results.clear();
-                                                        this.state.recommended_item = None;
-                                                        this.state.selected_result = None;
+                                                        this.state.clear_search_hits();
                                                     }
                                                     cx.notify();
                                                 }
@@ -2913,12 +2839,14 @@ fn render_discover(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> 
                                         .child(
                                             div()
                                                 .flex_1()
+                                                .min_w(px(0.0))
+                                                .overflow_hidden()
                                                 .flex()
                                                 .items_center()
                                                 .when(
                                                     app.state.focused_input
                                                         == Some(InputField::Search)
-                                                        && app.state.tick % 2 == 0,
+                                                        && app.state.tick.is_multiple_of(2),
                                                     |this| {
                                                         this.child(
                                                             div()
@@ -2943,6 +2871,11 @@ fn render_discover(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> 
                                                         .into_any_element()
                                                 } else {
                                                     div()
+                                                        .flex_1()
+                                                        .min_w(px(0.0))
+                                                        .overflow_hidden()
+                                                        .text_ellipsis()
+                                                        .whitespace_nowrap()
                                                         .text_color(rgb(pal.text_primary))
                                                         .text_size(px(13.0))
                                                         .child(app.state.search_query.clone())
@@ -2952,7 +2885,7 @@ fn render_discover(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> 
                                         .when(
                                             app.state.focused_input == Some(InputField::Search)
                                                 && !app.state.search_query.is_empty()
-                                                && app.state.tick % 2 == 0,
+                                                && app.state.tick.is_multiple_of(2),
                                             |this| {
                                                 this.child(
                                                     div()
@@ -2964,21 +2897,35 @@ fn render_discover(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> 
                                             },
                                         ),
                                 )
-                                // Source filter dropdown box
-                                .child(
-                                    div()
-                                        .bg(rgb(pal.bg_input))
-                                        .border_1()
-                                        .border_color(rgb(pal.border))
-                                        .rounded_lg()
-                                        .px_3()
-                                        .h(px(40.0))
-                                        .flex()
-                                        .items_center()
-                                        .text_color(rgb(pal.text_secondary))
-                                        .text_size(px(12.0))
-                                        .child("All Sources ▾"),
-                                )
+                                // Source filter. It used to be a static "All Sources ▾" label.
+                                .child(action_button(
+                                    "source-filter-btn",
+                                    format!("{} ▾", source_filter_label(&app.state.source_filter)),
+                                    if pal.is_light() { 0xe2e8f0 } else { 0x12233a },
+                                    pal.text_secondary,
+                                    cx.listener(|this, _, _, cx| {
+                                        this.state.source_filter =
+                                            cycle_source_filter(&this.state.source_filter).to_string();
+                                        let picks = visible_picks(
+                                            &this.state.source_decisions,
+                                            &this.state.source_filter,
+                                        );
+                                        let pick = picks.first().copied();
+                                        this.state.selected_source = pick.map(|p| p.source_index);
+                                        this.state.selected_candidate = pick.and_then(|p| p.candidate_index);
+                                        cx.notify();
+                                    }),
+                                ))
+                                .child(action_button(
+                                    "search-history-btn",
+                                    "Recent",
+                                    if pal.is_light() { 0xe2e8f0 } else { 0x12233a },
+                                    pal.text_secondary,
+                                    cx.listener(|this, _, _, cx| {
+                                        this.state.show_history_menu = !this.state.show_history_menu;
+                                        cx.notify();
+                                    }),
+                                ))
                                 // Primary Search Button
                                 .child(action_button(
                                     "search-exec-btn",
@@ -2988,51 +2935,111 @@ fn render_discover(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> 
                                     cx.listener(|this, _, _, cx| this.run_search(cx)),
                                 )),
                         )
-                        // Quick try suggestions
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap_1_5()
-                                .px_1()
-                                .child(
-                                    div()
-                                        .text_color(rgb(pal.text_muted))
-                                        .text_size(px(11.0))
-                                        .child("Try:"),
-                                )
-                                .child(quick_try_tag("vlc", app, cx))
-                                .child(quick_try_tag("brave", app, cx))
-                                .child(quick_try_tag("vscode", app, cx))
-                                .child(quick_try_tag("docker", app, cx))
-                                .child(quick_try_tag("steam", app, cx))
-                                .child(quick_try_tag("discord", app, cx)),
-                        ),
+                        // Quick try suggestions. Hidden once a report is on screen so
+                        // the seven source rows are not pushed below the window.
+                        .when(show_quick_try(has_results), |this| {
+                            this.child(
+                                div()
+                                    .flex()
+                                    .flex_wrap()
+                                    .items_center()
+                                    .gap_1_5()
+                                    .px_1()
+                                    .child(
+                                        div()
+                                            .text_color(rgb(pal.text_muted))
+                                            .text_size(px(11.0))
+                                            .child("Try:"),
+                                    )
+                                    .child(quick_try_tag("vlc", app, cx))
+                                    .child(quick_try_tag("brave", app, cx))
+                                    .child(quick_try_tag("vscode", app, cx))
+                                    .child(quick_try_tag("docker", app, cx))
+                                    .child(quick_try_tag("steam", app, cx))
+                                    .child(quick_try_tag("discord", app, cx)),
+                            )
+                        }),
                 )
                 // Status message
                 .when_some(app.state.search_msg.clone(), |this, msg| {
                     this.child(status_msg_bar(&msg, &pal))
                 })
-                // Recommended Path Safe Banner
-                .when_some(app.state.recommended_item.clone(), |this, item| {
+                // Recent searches. The menu flag existed but nothing ever opened it.
+                .when(app.state.show_history_menu, |this| {
+                    let history = app.state.search_history.clone();
                     this.child(
                         div()
                             .w_full()
-                            .p_4()
-                            .bg(if pal.is_light() { rgb(0xecfdf5) } else { rgb(0x072421) })
+                            .p_3()
+                            .bg(rgb(pal.bg_card))
                             .border_1()
-                            .border_color(rgb(0x10b981))
-                            .rounded_xl()
+                            .border_color(rgb(pal.border))
+                            .rounded_lg()
                             .flex()
-                            .items_center()
-                            .justify_between()
+                            .flex_col()
+                            .gap_1()
                             .child(
                                 div()
+                                    .text_color(rgb(pal.text_muted))
+                                    .text_size(px(11.0))
+                                    .child(if history.is_empty() {
+                                        "No recent searches in this session.".to_string()
+                                    } else {
+                                        "Recent searches".to_string()
+                                    }),
+                            )
+                            .children(history.iter().take(8).enumerate().map(|(idx, query)| {
+                                let query = query.clone();
+                                let label = query.clone();
+                                div()
+                                    .id(SharedString::from(format!("history-{idx}")))
+                                    .w_full()
+                                    .px_2()
+                                    .py_1()
+                                    .rounded_md()
+                                    .cursor_pointer()
+                                    .text_color(rgb(pal.text_primary))
+                                    .text_size(px(12.0))
+                                    .hover(|this| this.bg(rgb(pal.border_subtle)))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.state.search_query = query.clone();
+                                        this.state.show_history_menu = false;
+                                        this.run_search(cx);
+                                    }))
+                                    .child(label)
+                            })),
+                    )
+                })
+                // Recommended path. The sentence is the engine's reason, not a
+                // claim that every source is an official repository.
+                .when_some(recommended, |this, source| {
+                    let line = recommendation_line(&source);
+                    let plan_candidate = source.candidates.first().cloned();
+                    let source_name = source.source.clone();
+                    this.child(
+                        div()
+                            .w_full()
+                            .px_3()
+                            .py_2()
+                            .bg(if pal.is_light() { rgb(0xecfdf5) } else { rgb(0x072421) })
+                            .border_1()
+                            .border_color(rgb(pal.accent_green))
+                            .rounded_xl()
+                            .flex()
+                            .flex_wrap()
+                            .items_center()
+                            .justify_between()
+                            .gap_3()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.0))
                                     .flex()
                                     .items_center()
                                     .gap_4()
                                     .child(
                                         div()
+                                            .flex_none()
                                             .w(px(36.0))
                                             .h(px(36.0))
                                             .bg(rgb(0x064e3b))
@@ -3040,65 +3047,56 @@ fn render_discover(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> 
                                             .flex()
                                             .items_center()
                                             .justify_center()
-                                            .text_color(rgb(ACCENT_GREEN))
+                                            .text_color(rgb(pal.accent_green))
                                             .text_size(px(18.0))
                                             .child("★"),
                                     )
                                     .child(
                                         div()
+                                            .flex_1()
+                                            .min_w(px(0.0))
                                             .flex()
                                             .flex_col()
                                             .gap_1()
                                             .child(
                                                 div()
                                                     .flex()
+                                                    .flex_wrap()
                                                     .items_center()
                                                     .gap_2()
                                                     .child(
                                                         div()
-                                                            .text_color(rgb(ACCENT_GREEN))
+                                                            .text_color(rgb(pal.accent_green))
                                                             .text_size(px(14.0))
                                                             .font_weight(FontWeight::BOLD)
                                                             .child("Recommended Path"),
                                                     )
-                                                    .child(
-                                                        div()
-                                                            .bg(rgb(PILL_OK))
-                                                            .border_1()
-                                                            .border_color(rgb(ACCENT_GREEN))
-                                                            .rounded_md()
-                                                            .px_2()
-                                                            .text_color(rgb(ACCENT_GREEN))
-                                                            .text_size(px(10.0))
-                                                            .font_weight(FontWeight::BOLD)
-                                                            .child("SAFE"),
-                                                    ),
+                                                    .child(source_badge(&source_name)),
                                             )
                                             .child(
                                                 div()
                                                     .text_color(rgb(pal.text_secondary))
                                                     .text_size(px(12.0))
-                                                    .child(format!(
-                                                        "{} is available in the official {} path. Safest choice.",
-                                                        item.name, item.source
-                                                    )),
+                                                    .whitespace_normal()
+                                                    .child(line),
                                             ),
                                     ),
                             )
-                            .child(action_button(
-                                "rec-install-action-btn",
-                                if item.source == "official" {
-                                    "Prepare Install Plan →"
-                                } else {
-                                    "Prepare Build Plan →"
-                                },
-                                ACCENT_BLUE,
-                                0xffffff,
-                                cx.listener({
-                                    let item = item.clone();
-                                    move |this, _, _, cx| this.prepare_plan_for_result(&item, cx)
-                                }),
-                            )),
+                            .when_some(plan_candidate, |this, item| {
+                                this.child(action_button(
+                                    "rec-install-action-btn",
+                                    if item.source == "official" {
+                                        "Prepare Install Plan →".to_string()
+                                    } else {
+                                        "Prepare Build Plan →".to_string()
+                                    },
+                                    ACCENT_BLUE,
+                                    0xffffff,
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.prepare_plan_for_result(&item, cx)
+                                    }),
+                                ))
+                            }),
                     )
                 })
                 // Available Sources List
@@ -3118,7 +3116,11 @@ fn render_discover(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> 
                                         .text_color(rgb(pal.text_primary))
                                         .text_size(px(14.0))
                                         .font_weight(FontWeight::BOLD)
-                                        .child("Available Sources"),
+                                        .child(if has_results {
+                                            "Sources"
+                                        } else {
+                                            "Available Sources"
+                                        }),
                                 )
                                 .child(
                                     div()
@@ -3129,10 +3131,23 @@ fn render_discover(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> 
                                         .border_color(rgb(pal.border_subtle))
                                         .text_color(rgb(pal.text_muted))
                                         .text_size(px(12.0))
-                                        .child("Recommended"),
+                                        .child(source_filter_label(&app.state.source_filter)),
                                 ),
                         )
                         .when(has_results, |this| {
+                            let cards = app
+                                .state
+                                .source_decisions
+                                .iter()
+                                .enumerate()
+                                .filter(|(_, source)| {
+                                    source_matches_filter(&app.state.source_filter, &source.source)
+                                })
+                                .map(|(i, source)| {
+                                    let selected = app.state.selected_source == Some(i);
+                                    source_decision_card(i, source, selected, &pal, cx)
+                                })
+                                .collect::<Vec<_>>();
                             this.child(
                                 div()
                                     .id("sources-cards-container")
@@ -3140,23 +3155,13 @@ fn render_discover(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> 
                                     .flex()
                                     .flex_col()
                                     .gap_1()
-                                    .children(
-                                        app.state
-                                            .search_results
-                                            .iter()
-                                            .enumerate()
-                                            .map(|(i, result)| {
-                                                let selected = app.state.selected_result == Some(i);
-                                                source_candidate_card(i, result, selected, &pal, cx)
-                                            })
-                                            .collect::<Vec<_>>(),
-                                    ),
+                                    .children(cards),
                             )
+                            .child(selected_source_candidates(app, &pal, cx))
                         }),
                 ),
         )
-        // Right Detail Inspector Panel
-        .child(render_right_inspector(app, cx))
+        .when(show_inspector, |this| this.child(render_right_inspector(app, cx)))
 }
 
 fn quick_try_tag(
@@ -3167,34 +3172,44 @@ fn quick_try_tag(
     div()
         .id(SharedString::from(format!("tag-{}", name)))
         .cursor_pointer()
-        .text_color(rgb(ACCENT_CYAN))
+        .text_color(rgb(get_palette(_app.state.theme).accent_cyan))
         .text_size(px(11.0))
         .on_click(cx.listener(move |this, _, _, cx| {
             this.state.search_query = name.to_string();
             this.run_search(cx);
         }))
-        .child(format!("{}", name))
+        .child(name)
 }
 
-fn source_candidate_card(
+fn availability_color(availability: &str, pal: &ThemePalette) -> u32 {
+    match availability {
+        "available" => pal.accent_green,
+        "disabled" => pal.text_muted,
+        _ => pal.accent_amber,
+    }
+}
+
+fn source_decision_card(
     idx: usize,
-    result: &SearchResult,
+    source: &crate::gui::state::SourceDecision,
     selected: bool,
     pal: &ThemePalette,
     cx: &mut Context<ArchBridgeApp>,
 ) -> impl IntoElement {
-    let (border_glow, bg_card) = match result.source.as_str() {
+    let (border_glow, bg_card) = match source.source.as_str() {
         "official" => (BORDER_GLOW_OFFICIAL, pal.bg_card),
         "aur" => (BORDER_GLOW_AUR, pal.bg_card_alt),
         "flatpak" => (BORDER_GLOW_FLATPAK, pal.bg_card_alt),
         "appimage" => (BORDER_GLOW_APPIMAGE, pal.bg_card_alt),
         _ => (BORDER_GLOW_UPSTREAM, pal.bg_card_alt),
     };
+    let availability_color = availability_color(&source.availability, pal);
 
     div()
-        .id(SharedString::from(format!("card-{}", idx)))
+        .id(SharedString::from(format!("card-{idx}")))
         .w_full()
-        .p_3()
+        .px_3()
+        .py_2()
         .bg(if selected {
             if pal.is_light() {
                 rgb(0xdbeafe)
@@ -3211,45 +3226,103 @@ fn source_candidate_card(
             rgb(border_glow)
         })
         .rounded_xl()
-        .cursor_pointer()
-        .on_click(cx.listener(move |this, _, _, cx| {
-            this.state.selected_result = Some(idx);
-            cx.notify();
-        }))
         .flex()
-        .items_center()
-        .justify_between()
-        // Left info block with app icon
+        .flex_col()
+        .gap_2()
         .child(
             div()
-                .flex_1()
-                .overflow_hidden()
+                .id(SharedString::from(format!("source-head-{idx}")))
                 .flex()
+                .flex_wrap()
                 .items_center()
-                .gap_3()
+                .gap_2()
+                .cursor_pointer()
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.state.selected_source = Some(idx);
+                    this.state.selected_candidate = None;
+                    cx.notify();
+                }))
+                .child(source_badge(&source.source))
                 .child(
                     div()
-                        .flex_none()
-                        .w(px(34.0))
-                        .h(px(34.0))
-                        .rounded_lg()
-                        .bg(if pal.is_light() {
-                            rgb(0xe2e8f0)
-                        } else {
-                            rgb(0x13233a)
-                        })
-                        .border_1()
-                        .border_color(rgb(pal.border_subtle))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .text_size(px(16.0))
-                        .child(app_icon_for_name(&result.name)),
+                        .text_color(rgb(availability_color))
+                        .text_size(px(11.0))
+                        .font_weight(FontWeight::BOLD)
+                        .child(availability_label(&source.availability)),
                 )
-                .child(source_badge(&result.source))
+                .when(source.recommended, |this| {
+                    this.child(
+                        div()
+                            .text_color(rgb(pal.accent_green))
+                            .text_size(px(11.0))
+                            .font_weight(FontWeight::BOLD)
+                            .child("RECOMMENDED"),
+                    )
+                }),
+        )
+        .child(
+            div()
+                .text_color(rgb(pal.text_secondary))
+                .text_size(px(12.0))
+                .whitespace_normal()
+                .child(source.reason.clone()),
+        )
+}
+
+/// Packages belonging to the source the user is looking at. They scroll on
+/// their own so a long AUR hit list cannot push the other six sources off screen.
+fn selected_source_candidates(
+    app: &ArchBridgeApp,
+    pal: &ThemePalette,
+    cx: &mut Context<ArchBridgeApp>,
+) -> impl IntoElement {
+    let Some(idx) = app.state.selected_source else {
+        return div().into_any_element();
+    };
+    let Some(source) = app.state.source_decisions.get(idx) else {
+        return div().into_any_element();
+    };
+    if source.candidates.is_empty() {
+        return div()
+            .text_color(rgb(pal.text_muted))
+            .text_size(px(12.0))
+            .child("This source has no installable package. The reason is on its row above.")
+            .into_any_element();
+    }
+    let source_name = source.source.clone();
+    let total = source.candidates.len();
+    let rows = source
+        .candidates
+        .iter()
+        .enumerate()
+        .map(|(cand_idx, result)| {
+            let result = result.clone();
+            let selected = app.state.selected_candidate == Some(cand_idx);
+            div()
+                .id(SharedString::from(format!("cand-{idx}-{cand_idx}")))
+                .w_full()
+                .p_2()
+                .rounded_lg()
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .justify_between()
+                .gap_2()
+                .cursor_pointer()
+                .bg(if selected {
+                    rgb(pal.bg_card)
+                } else {
+                    rgb(0x00000000)
+                })
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.state.selected_source = Some(idx);
+                    this.state.selected_candidate = Some(cand_idx);
+                    cx.notify();
+                }))
                 .child(
                     div()
                         .flex_1()
+                        .min_w(px(0.0))
                         .overflow_hidden()
                         .flex()
                         .flex_col()
@@ -3257,12 +3330,13 @@ fn source_candidate_card(
                         .child(
                             div()
                                 .flex()
+                                .flex_wrap()
                                 .items_center()
                                 .gap_2()
                                 .child(
                                     div()
                                         .text_color(rgb(pal.text_primary))
-                                        .text_size(px(14.0))
+                                        .text_size(px(13.0))
                                         .font_weight(FontWeight::BOLD)
                                         .child(result.name.clone()),
                                 )
@@ -3277,60 +3351,50 @@ fn source_candidate_card(
                             div()
                                 .text_color(rgb(pal.text_secondary))
                                 .text_size(px(12.0))
+                                .whitespace_normal()
                                 .child(result.description.clone()),
                         ),
-                ),
-        )
-        // Right status & plan action
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .gap_4()
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_1_5()
-                        .child(
-                            div()
-                                .w(px(8.0))
-                                .h(px(8.0))
-                                .rounded_full()
-                                .bg(rgb(ACCENT_GREEN)),
-                        )
-                        .child(
-                            div()
-                                .text_color(rgb(ACCENT_GREEN))
-                                .text_size(px(12.0))
-                                .font_weight(FontWeight::MEDIUM)
-                                .child("Available"),
-                        ),
-                )
-                .child(
-                    div()
-                        .text_color(rgb(pal.text_muted))
-                        .text_size(px(11.0))
-                        .child(result.repo.clone()),
                 )
                 .child(action_button(
-                    "plan-btn",
+                    format!("plan-btn-{idx}-{cand_idx}"),
                     if result.source == "official" {
-                        "Install Plan"
+                        "Install Plan".to_string()
                     } else {
-                        "Build Plan"
+                        "Build Plan".to_string()
                     },
                     ACCENT_BLUE,
                     0xffffff,
-                    cx.listener({
-                        let result = result.clone();
-                        move |this, _, _, cx| {
-                            this.state.selected_result = Some(idx);
-                            this.prepare_plan_for_result(&result, cx);
-                        }
+                    cx.listener(move |this, _, _, cx| {
+                        this.state.selected_source = Some(idx);
+                        this.state.selected_candidate = Some(cand_idx);
+                        this.prepare_plan_for_result(&result, cx);
                     }),
-                )),
+                ))
+        })
+        .collect::<Vec<_>>();
+    div()
+        .w_full()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .child(
+            div()
+                .text_color(rgb(pal.text_muted))
+                .text_size(px(12.0))
+                .child(format!("{total} package(s) in {source_name}")),
         )
+        .child(
+            div()
+                .id("selected-source-candidates")
+                .w_full()
+                .max_h(px(240.0))
+                .overflow_y_scroll()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .children(rows),
+        )
+        .into_any_element()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -3342,11 +3406,12 @@ fn render_right_inspector(
     _cx: &mut Context<ArchBridgeApp>,
 ) -> impl IntoElement {
     let pal = get_palette(app.state.theme);
-    let item = app
-        .state
-        .selected_result
-        .and_then(|i| app.state.search_results.get(i))
-        .cloned();
+    let item = app.state.selected_search_result().cloned();
+    let source_only = if item.is_none() {
+        app.state.selected_decision().cloned()
+    } else {
+        None
+    };
 
     div()
         .w(px(340.0))
@@ -3360,15 +3425,40 @@ fn render_right_inspector(
         .flex()
         .flex_col()
         .gap_4()
-        .child(match item {
-            None => div()
+        .child(match (item, source_only) {
+            (None, Some(source)) => div()
+                .flex()
+                .flex_col()
+                .gap_3()
+                .child(source_badge(&source.source))
+                .child(
+                    div()
+                        .text_color(rgb(availability_color(&source.availability, &pal)))
+                        .text_size(px(12.0))
+                        .font_weight(FontWeight::BOLD)
+                        .child(availability_label(&source.availability)),
+                )
+                .child(
+                    div()
+                        .text_color(rgb(pal.text_secondary))
+                        .text_size(px(12.0))
+                        .whitespace_normal()
+                        .child(source.reason),
+                )
+                .into_any_element(),
+            (None, None) => div()
                 .flex()
                 .flex_col()
                 .items_center()
                 .justify_center()
                 .h_full()
                 .gap_2()
-                .child(div().text_size(px(20.0)).text_color(rgb(pal.accent_cyan)).child("✦"))
+                .child(
+                    div()
+                        .text_size(px(20.0))
+                        .text_color(rgb(pal.accent_cyan))
+                        .child("✦"),
+                )
                 .child(
                     div()
                         .text_color(rgb(pal.text_primary))
@@ -3381,11 +3471,14 @@ fn render_right_inspector(
                         .text_color(rgb(pal.text_muted))
                         .text_size(px(11.5))
                         .text_center()
-                        .child("Choose a verified result from the source list to\ninspect its details."),
+                        .whitespace_normal()
+                        .child(
+                            "Choose a source from the list to read why it is or is not available.",
+                        ),
                 )
                 .into_any_element(),
 
-            Some(item) => div()
+            (Some(item), _) => div()
                 .flex()
                 .flex_col()
                 .gap_4()
@@ -3399,7 +3492,11 @@ fn render_right_inspector(
                             div()
                                 .w(px(42.0))
                                 .h(px(42.0))
-                                .bg(if pal.is_light() { rgb(0xdbeafe) } else { rgb(0x143454) })
+                                .bg(if pal.is_light() {
+                                    rgb(0xdbeafe)
+                                } else {
+                                    rgb(0x143454)
+                                })
                                 .border_1()
                                 .border_color(rgb(pal.border_subtle))
                                 .rounded_xl()
@@ -3480,26 +3577,23 @@ fn render_right_inspector(
                         }),
                 )
                 // Links the source actually publishes, in place of fixed URLs.
-                .when(
-                    item.url.is_some() || item.source_url.is_some(),
-                    |this| {
-                        this.child(
-                            div()
-                                .flex()
-                                .flex_col()
-                                .gap_2()
-                                .pt_2()
-                                .border_t_1()
-                                .border_color(rgb(pal.border_subtle))
-                                .when_some(item.url.clone(), |this, url| {
-                                    this.child(link_row(&pal, "Upstream", url))
-                                })
-                                .when_some(item.source_url.clone(), |this, url| {
-                                    this.child(link_row(&pal, "Package source", url))
-                                }),
-                        )
-                    },
-                )
+                .when(item.url.is_some() || item.source_url.is_some(), |this| {
+                    this.child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .pt_2()
+                            .border_t_1()
+                            .border_color(rgb(pal.border_subtle))
+                            .when_some(item.url.clone(), |this, url| {
+                                this.child(link_row(&pal, "Upstream", url))
+                            })
+                            .when_some(item.source_url.clone(), |this, url| {
+                                this.child(link_row(&pal, "Package source", url))
+                            }),
+                    )
+                })
                 .into_any_element(),
         })
 }
@@ -3583,7 +3677,10 @@ fn render_inspect(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> i
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.focus_field(InputField::Inspect, window, cx);
                         }))
-                        .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                        .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                            if this.consume_tab_shortcut(event, window, cx) {
+                                return;
+                            }
                             let keystroke = &event.keystroke;
                             if keystroke.modifiers.control {
                                 if keystroke.key == "v" {
@@ -3620,7 +3717,7 @@ fn render_inspect(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> i
                                 .when(
                                     app.state.focused_input == Some(InputField::Inspect)
                                         && app.state.inspect_path.is_empty()
-                                        && app.state.tick % 2 == 0,
+                                        && app.state.tick.is_multiple_of(2),
                                     |this| {
                                         this.child(
                                             div()
@@ -3648,7 +3745,7 @@ fn render_inspect(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> i
                         .when(
                             app.state.focused_input == Some(InputField::Inspect)
                                 && !app.state.inspect_path.is_empty()
-                                && app.state.tick % 2 == 0,
+                                && app.state.tick.is_multiple_of(2),
                             |this| {
                                 this.child(
                                     div()
@@ -4268,7 +4365,10 @@ fn render_build(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> imp
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.focus_field(InputField::Build, window, cx);
                         }))
-                        .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                        .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                            if this.consume_tab_shortcut(event, window, cx) {
+                                return;
+                            }
                             let keystroke = &event.keystroke;
                             if keystroke.modifiers.control {
                                 if keystroke.key == "v" {
@@ -4305,7 +4405,7 @@ fn render_build(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> imp
                                 .when(
                                     app.state.focused_input == Some(InputField::Build)
                                         && app.state.build_target_input.is_empty()
-                                        && app.state.tick % 2 == 0,
+                                        && app.state.tick.is_multiple_of(2),
                                     |this| {
                                         this.child(
                                             div()
@@ -4333,7 +4433,7 @@ fn render_build(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> imp
                         .when(
                             app.state.focused_input == Some(InputField::Build)
                                 && !app.state.build_target_input.is_empty()
-                                && app.state.tick % 2 == 0,
+                                && app.state.tick.is_multiple_of(2),
                             |this| {
                                 this.child(
                                     div()
@@ -4544,7 +4644,7 @@ fn render_build(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> imp
                             |this| {
                                 this.child(
                                     div()
-                                        .text_color(rgb(ACCENT_GREEN))
+                                        .text_color(rgb(pal.accent_green))
                                         .text_size(px(12.0))
                                         .child(if app.state.build_busy {
                                             "⏳ Engine work in progress — chroot setup, makepkg, and smoke test output will appear here when the plan finishes…"
@@ -4560,12 +4660,12 @@ fn render_build(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> imp
                                 this.children(text_lines(
                                     app.state.build_log.clone(),
                                     12.0,
-                                    ACCENT_GREEN,
+                                    pal.accent_green,
                                 ))
                             },
                         ),
                 )
-                .when(app.state.build_busy && app.state.tick % 2 == 0, |this| {
+                .when(app.state.build_busy && app.state.tick.is_multiple_of(2), |this| {
                     this.child(
                         div()
                             .w(px(2.0))
@@ -4678,7 +4778,10 @@ fn render_uninstall(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) ->
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.focus_field(InputField::Uninstall, window, cx);
                         }))
-                        .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                        .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                            if this.consume_tab_shortcut(event, window, cx) {
+                                return;
+                            }
                             let keystroke = &event.keystroke;
                             if keystroke.modifiers.control {
                                 if keystroke.key == "v" {
@@ -4714,7 +4817,7 @@ fn render_uninstall(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) ->
                                 .when(
                                     app.state.focused_input == Some(InputField::Uninstall)
                                         && app.state.uninstall_query.is_empty()
-                                        && app.state.tick % 2 == 0,
+                                        && app.state.tick.is_multiple_of(2),
                                     |this| {
                                         this.child(
                                             div()
@@ -4748,7 +4851,7 @@ fn render_uninstall(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) ->
                         .when(
                             app.state.focused_input == Some(InputField::Uninstall)
                                 && !app.state.uninstall_query.is_empty()
-                                && app.state.tick % 2 == 0,
+                                && app.state.tick.is_multiple_of(2),
                             |this| {
                                 this.child(
                                     div()
@@ -5102,6 +5205,7 @@ fn render_uninstall(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) ->
 
 fn render_doctor(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> impl IntoElement {
     let pal = get_palette(app.state.theme);
+    let theme = app.state.theme;
     div()
         .flex()
         .flex_col()
@@ -5111,10 +5215,14 @@ fn render_doctor(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> im
         .child(
             div()
                 .flex()
+                .flex_wrap()
                 .items_center()
                 .justify_between()
+                .gap_2()
                 .child(
                     div()
+                        .flex_1()
+                        .min_w(px(0.0))
                         .flex()
                         .flex_col()
                         .gap_1()
@@ -5123,12 +5231,14 @@ fn render_doctor(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> im
                                 .text_color(rgb(pal.text_primary))
                                 .text_size(px(22.0))
                                 .font_weight(FontWeight::BOLD)
+                                .whitespace_normal()
                                 .child("System Prerequisites & Health"),
                         )
                         .child(
                             div()
                                 .text_color(rgb(pal.text_muted))
                                 .text_size(px(13.0))
+                                .whitespace_normal()
                                 .child("Diagnostic verification of packaging tools, kernel namespaces, compilers, and keyrings."),
                         ),
                 )
@@ -5177,7 +5287,7 @@ fn render_doctor(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> im
                         )
                         .child(
                             div()
-                                .w(px(120.0))
+                                .w(px(DOCTOR_STATUS_COLUMN_PX))
                                 .text_color(rgb(pal.text_muted))
                                 .text_size(px(12.0))
                                 .font_weight(FontWeight::BOLD)
@@ -5208,8 +5318,9 @@ fn render_doctor(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> im
                                 .map(|check| {
                                     div()
                                         .w_full()
-                                        .h(px(46.0))
+                                        .min_h(px(46.0))
                                         .px_4()
+                                        .py_2()
                                         .flex()
                                         .items_center()
                                         .border_b_1()
@@ -5217,29 +5328,31 @@ fn render_doctor(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> im
                                         .child(
                                             div()
                                                 .w(px(180.0))
+                                                .min_w(px(0.0))
+                                                .overflow_hidden()
                                                 .text_color(rgb(pal.text_primary))
                                                 .text_size(px(13.0))
                                                 .font_weight(FontWeight::BOLD)
+                                                .text_ellipsis()
                                                 .child(check.name.clone()),
                                         )
                                         .child(
                                             div()
-                                                .w(px(120.0))
+                                                .w(px(DOCTOR_STATUS_COLUMN_PX))
                                                 .flex()
                                                 .items_center()
                                                 .gap_1_5()
+                                                .overflow_hidden()
                                                 .child(
                                                     div()
                                                         .w(px(8.0))
                                                         .h(px(8.0))
                                                         .rounded_full()
-                                                        .bg(rgb(status_color(&check.status))),
+                                                        .bg(rgb(status_fg(theme, &check.status))),
                                                 )
                                                 .child(
                                                     div()
-                                                        .text_color(rgb(status_color(
-                                                            &check.status,
-                                                        )))
+                                                        .text_color(rgb(status_fg(theme, &check.status)))
                                                         .text_size(px(12.0))
                                                         .font_weight(FontWeight::BOLD)
                                                         .child(status_label(&check.status)),
@@ -5248,8 +5361,10 @@ fn render_doctor(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> im
                                         .child(
                                             div()
                                                 .flex_1()
+                                                .min_w(px(0.0))
                                                 .text_color(rgb(pal.text_secondary))
                                                 .text_size(px(12.0))
+                                                .whitespace_normal()
                                                 .child(check.message.clone()),
                                         )
                                         .into_any_element()
@@ -5284,24 +5399,6 @@ fn render_doctor(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> im
                         }),
                 ),
         )
-}
-
-/// An unavailable check is neither a pass nor a failure: rendering it red would
-/// tell the user their system is broken when it merely lacks an online probe.
-fn status_color(status: &str) -> u32 {
-    match status {
-        "pass" => ACCENT_GREEN,
-        "unavailable" => ACCENT_ORANGE,
-        _ => ACCENT_RED,
-    }
-}
-
-fn status_label(status: &str) -> &'static str {
-    match status {
-        "pass" => "PASS",
-        "unavailable" => "OFFLINE",
-        _ => "FAIL",
-    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -5372,6 +5469,7 @@ fn render_settings(app: &mut ArchBridgeApp, cx: &mut Context<ArchBridgeApp>) -> 
                 .child(
                     div()
                         .flex()
+                        .flex_wrap()
                         .flex_row()
                         .gap_3()
                         .pt_1()
@@ -5816,19 +5914,41 @@ where
 
 fn render_bottom_bar(app: &ArchBridgeApp) -> impl IntoElement {
     let pal = get_palette(app.state.theme);
+    let compact = compact_top_bar(app.state.viewport_width);
+    let ready_color = if app.state.health_checks.is_empty() {
+        pal.text_muted
+    } else if app.state.doctor_ready {
+        pal.accent_green
+    } else {
+        pal.accent_red
+    };
+    let keyring_color = match app.state.keyring_status.as_str() {
+        "Verified" => pal.accent_green,
+        "Failed" => pal.accent_red,
+        "Unavailable" => pal.accent_amber,
+        _ => pal.text_muted,
+    };
+    let keyring_mark = match app.state.keyring_status.as_str() {
+        "Verified" => "✓",
+        "Failed" => "✗",
+        _ => "–",
+    };
     div()
         .w_full()
-        .h(px(26.0))
+        .h(px(28.0))
         .px_2()
+        .overflow_hidden()
         .flex()
         .items_center()
         .justify_between()
         .child(
             div()
+                .flex_1()
+                .min_w(px(0.0))
+                .overflow_hidden()
                 .flex()
                 .items_center()
                 .gap_4()
-                // Ready indicator
                 .child(
                     div()
                         .flex()
@@ -5839,23 +5959,24 @@ fn render_bottom_bar(app: &ArchBridgeApp) -> impl IntoElement {
                                 .w(px(7.0))
                                 .h(px(7.0))
                                 .rounded_full()
-                                .bg(rgb(ACCENT_GREEN)),
+                                .bg(rgb(ready_color)),
                         )
                         .child(
                             div()
-                                .text_color(rgb(pal.text_secondary))
+                                .text_color(rgb(ready_color))
                                 .text_size(px(11.0))
-                                .child("Ready"),
+                                .child(app.state.readiness_label()),
                         ),
                 )
-                .child(div().w_px().h(px(10.0)).bg(rgb(pal.border_subtle)))
-                // Active Chroot
-                .child(
-                    div()
-                        .text_color(rgb(pal.text_muted))
-                        .text_size(px(11.0))
-                        .child(format!("Active Chroot: {}", app.state.active_chroot)),
-                )
+                .when(!compact, |this| {
+                    this.child(div().w_px().h(px(10.0)).bg(rgb(pal.border_subtle)))
+                        .child(
+                            div()
+                                .text_color(rgb(pal.text_muted))
+                                .text_size(px(11.0))
+                                .child(format!("Active Chroot: {}", app.state.active_chroot)),
+                        )
+                })
                 .child(div().w_px().h(px(10.0)).bg(rgb(pal.border_subtle)))
                 // Disk Space
                 .child(
@@ -5873,13 +5994,13 @@ fn render_bottom_bar(app: &ArchBridgeApp) -> impl IntoElement {
                         .gap_1()
                         .child(
                             div()
-                                .text_color(rgb(ACCENT_GREEN))
+                                .text_color(rgb(keyring_color))
                                 .text_size(px(11.0))
-                                .child("✓"),
+                                .child(keyring_mark),
                         )
                         .child(
                             div()
-                                .text_color(rgb(pal.text_muted))
+                                .text_color(rgb(keyring_color))
                                 .text_size(px(11.0))
                                 .child(format!("Keyring: {}", app.state.keyring_status)),
                         ),
