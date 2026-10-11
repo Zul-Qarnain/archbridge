@@ -45,8 +45,12 @@ pub fn inspect_package(file_path: &str) -> Result<InspectionReport, String> {
     if !path.exists() {
         return Err(format!("File not found: '{}'", file_path));
     }
+    if !path.is_file() {
+        return Err(format!("'{}' is not a regular file", file_path));
+    }
 
-    let bytes = fs::read(path).map_err(|e| format!("Failed to read file '{:?}': {}", path, e))?;
+    let bytes =
+        fs::read(path).map_err(|e| format!("Failed to read file '{}': {}", file_path, e))?;
     let size_bytes = bytes.len() as u64;
     let sha256 = format!("{:x}", Sha256::digest(&bytes));
     drop(bytes);
@@ -72,6 +76,8 @@ fn inspect_deb(
     let temp_dir = TempDir::new().map_err(|e| format!("Failed to create temp directory: {}", e))?;
     let control_dir = temp_dir.path().join("control");
     fs::create_dir_all(&control_dir).map_err(|e| e.to_string())?;
+    let temp_arg = utf8_arg(temp_dir.path())?;
+    let control_arg = utf8_arg(&control_dir)?;
 
     // Unpack deb archive members (control.tar.* and debian-binary) using bsdtar
     let step_ar = Step::new(
@@ -80,12 +86,16 @@ fn inspect_deb(
             "-xf".to_string(),
             file_path.to_string(),
             "-C".to_string(),
-            temp_dir.path().to_str().unwrap().to_string(),
+            temp_arg,
         ],
         "Unpack DEB archive members",
         30,
     );
-    let _ = run_step(&step_ar, None);
+    let unpack_note = match run_step(&step_ar, None) {
+        Ok(out) if out.exit_code == 0 => String::new(),
+        Ok(out) => out.stderr.trim().to_string(),
+        Err(err) => err,
+    };
 
     // Locate control.tar.* archive (supports .gz, .xz, .zst)
     let mut control_tar = None;
@@ -106,9 +116,9 @@ fn inspect_deb(
             "bsdtar",
             vec![
                 "-xf".to_string(),
-                c_tar.to_str().unwrap().to_string(),
+                utf8_arg(&c_tar)?,
                 "-C".to_string(),
-                control_dir.to_str().unwrap().to_string(),
+                control_arg,
             ],
             "Extract DEB control files",
             30,
@@ -129,11 +139,19 @@ fn inspect_deb(
     if control_file.exists() {
         if let Ok(content) = fs::read_to_string(&control_file) {
             for line in content.lines() {
+                // A line that starts with whitespace continues the previous
+                // field (a long Description, say). Reading it as `key: value`
+                // let a description line like " Version: 2" overwrite the real
+                // Version.
+                if line.starts_with([' ', '\t']) || line.starts_with('#') {
+                    continue;
+                }
                 if let Some((k, v)) = line.split_once(':') {
                     let key = k.trim();
                     let val = v.trim();
                     match key {
-                        "Package" => pkg_name = val.to_string(),
+                        "Package" if pkg_name == "unknown" => pkg_name = val.to_string(),
+                        "Package" => {}
                         "Version" => version = val.to_string(),
                         "Architecture" => architecture = val.to_string(),
                         "Description" => description = val.to_string(),
@@ -159,6 +177,20 @@ fn inspect_deb(
                 }
             }
         }
+    }
+
+    // Something that is not a Debian package must be refused, as a malformed
+    // RPM is: a report full of "unknown" reads like a package with no
+    // dependencies and no scripts, which is a statement nobody verified.
+    if pkg_name == "unknown" || pkg_name.is_empty() {
+        let why = if unpack_note.is_empty() {
+            "it has no control archive with a Package field".to_string()
+        } else {
+            unpack_note
+        };
+        return Err(format!(
+            "'{file_path}' is not a readable Debian package: {why}"
+        ));
     }
 
     // Inspect maintainer scripts (preinst, postinst, prerm, postrm) - never executed
@@ -657,4 +689,12 @@ fn extracted_regular_files(root: &Path) -> Vec<PathBuf> {
         }
     }
     files
+}
+
+/// A path as a command-line argument. A temporary directory under a non-UTF-8
+/// `TMPDIR` used to panic the whole inspection here.
+fn utf8_arg(path: &Path) -> Result<String, String> {
+    path.to_str()
+        .map(str::to_string)
+        .ok_or_else(|| format!("The path '{}' is not valid UTF-8", path.display()))
 }

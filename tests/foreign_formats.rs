@@ -484,3 +484,75 @@ fn real_rpm_inspection_never_claims_installability() {
         "inspection must never promise that a foreign package installs"
     );
 }
+
+/// A deb whose control file is exactly `control`.
+fn deb_with_control(dir: &Path, control: &[u8]) -> PathBuf {
+    let staged = dir.join("control-src");
+    stage(&staged, "control", control);
+    let control_tar = dir.join("control.tar.gz");
+    tar_dir(&control_tar, &staged, true);
+    let data = dir.join("data-src");
+    stage(&data, "usr/share/doc/x/README", b"x\n");
+    let data_tar = dir.join("data.tar.gz");
+    tar_dir(&data_tar, &data, true);
+    let deb = dir.join("x.deb");
+    fs::write(
+        &deb,
+        ar_archive(&[
+            ("debian-binary", b"2.0\n".to_vec()),
+            ("control.tar.gz", fs::read(&control_tar).unwrap()),
+            ("data.tar.gz", fs::read(&data_tar).unwrap()),
+        ]),
+    )
+    .unwrap();
+    deb
+}
+
+#[test]
+fn a_description_continuation_line_cannot_overwrite_a_control_field() {
+    if !skip_without_bsdtar("deb control parsing") {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let deb = deb_with_control(
+        dir.path(),
+        b"Package: real\nVersion: 1.0\nArchitecture: amd64\nDescription: tool\n Version: 99.9\n Depends: evil-package\n\tPackage: other\n",
+    );
+    let report = inspect_package(&deb.display().to_string()).unwrap();
+    assert_eq!(report.package_name, "real");
+    assert_eq!(report.version, "1.0", "a continuation line is not a field");
+    assert!(report.dependencies.is_empty(), "{:?}", report.dependencies);
+}
+
+#[test]
+fn a_file_that_is_not_a_debian_package_is_an_error_not_an_unknown_report() {
+    let dir = tempfile::tempdir().unwrap();
+    for (name, bytes) in [
+        ("empty.deb", Vec::new()),
+        ("magic-only.deb", b"!<arch>\n".to_vec()),
+        (
+            "noise.deb",
+            (0..5000u32).map(|i| (i * 31 % 251) as u8).collect(),
+        ),
+        ("text.deb", b"Package: sneaky\nVersion: 1\n".to_vec()),
+    ] {
+        let path = dir.path().join(name);
+        fs::write(&path, bytes).unwrap();
+        let error = inspect_package(&path.display().to_string())
+            .expect_err("nothing here is a Debian package");
+        assert!(
+            error.contains("not a readable Debian package"),
+            "{name}: {error}"
+        );
+    }
+}
+
+#[test]
+fn a_directory_named_like_a_package_is_refused_plainly() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = dir.path().join("fake.deb");
+    fs::create_dir(&fake).unwrap();
+    let error = inspect_package(&fake.display().to_string()).unwrap_err();
+    assert!(error.contains("not a regular file"), "{error}");
+    assert!(!error.contains("'\""), "no doubled quoting: {error}");
+}
