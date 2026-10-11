@@ -572,6 +572,43 @@ impl Engine {
         Ok(plan)
     }
 
+    /// A bare name that the user configured as `repo.<name>` stands for that
+    /// repository URL. A real local path always wins over a configured name.
+    fn configured_source(&self, target: &str) -> Option<String> {
+        if target.contains('/') || target.contains("://") || Path::new(target).exists() {
+            return None;
+        }
+        self.config.repos.get(target).cloned()
+    }
+
+    /// An HTTPS `.tar.gz`/`.tgz` archive on a host other than github.com and
+    /// gitlab.com, fetched only when the user vouched for that host by
+    /// configuring a `repo.*` URL on it. Anything else keeps being refused.
+    fn configured_archive_url(&self, source: &str) -> Result<Option<String>, String> {
+        let Some(host) = https_host(source) else {
+            return Ok(None);
+        };
+        if host == "github.com" || host == "gitlab.com" {
+            return Ok(None);
+        }
+        let path = source.split(['?', '#']).next().unwrap_or(source);
+        if !(path.ends_with(".tar.gz") || path.ends_with(".tgz")) {
+            return Ok(None);
+        }
+        let vouched = self
+            .config
+            .repos
+            .values()
+            .any(|configured| https_host(configured).as_deref() == Some(host.as_str()));
+        if !vouched {
+            return Ok(None);
+        }
+        if let Some(reason) = unsafe_fetch_host(&host) {
+            return Err(format!("Refusing to fetch '{source}': {reason}"));
+        }
+        Ok(Some(source.to_string()))
+    }
+
     pub fn prepare_build(
         &mut self,
         target: &str,
@@ -608,6 +645,14 @@ impl Engine {
         }
         validate_args(smoke_args)?;
         let version = ver_opt.unwrap_or("1.0.0");
+
+        // `source` is what the build actually reads: a bare name configured as
+        // `repo.<name>` stands for its URL, everything else is the target itself.
+        let source = self
+            .configured_source(target)
+            .unwrap_or_else(|| target.to_string());
+        let source = source.as_str();
+        let direct_archive = self.configured_archive_url(source)?;
 
         let job_id = format!("job-{}", generate_plan_id("build", target));
         let job_dir = PathBuf::from(".archbridge").join("jobs").join(&job_id);
@@ -700,32 +745,40 @@ impl Engine {
                 }
             };
             (snap, bsys, pkgb, name.to_string())
-        } else if target.starts_with("https://github.com/")
-            || target.starts_with("https://gitlab.com/")
+        } else if direct_archive.is_some()
+            || source.starts_with("https://github.com/")
+            || source.starts_with("https://gitlab.com/")
         {
-            let row = search(target, Some(target), &self.config);
-            let upstream = row.decision_table.iter().find(|r| r.source == "upstream");
-            let archive_url = upstream
-                .filter(|r| r.availability == "available")
-                .and_then(|r| r.candidates.first())
-                .and_then(|c| c.url.clone());
-            let url = match archive_url {
-                Some(u) => u,
-                None => {
-                    // The discovery row already knows whether this was a rate limit,
-                    // a missing repository or an unsupported host; pass that through.
-                    return Err(format!(
-                        "Cannot prepare a build for '{}': {}",
-                        target,
-                        upstream
-                            .map(|r| r.reason.as_str())
-                            .unwrap_or("no upstream source was queried")
-                    ));
-                }
+            let (url, upstream_version) = if let Some(url) = direct_archive.clone() {
+                // A configured host serving a plain archive: there is no release
+                // metadata to ask, so the review shows the archive's own hash.
+                (url, None)
+            } else {
+                let row = search(source, Some(source), &self.config);
+                let upstream = row.decision_table.iter().find(|r| r.source == "upstream");
+                let archive_url = upstream
+                    .filter(|r| r.availability == "available")
+                    .and_then(|r| r.candidates.first())
+                    .and_then(|c| c.url.clone());
+                let url = match archive_url {
+                    Some(u) => u,
+                    None => {
+                        // The discovery row already knows whether this was a rate
+                        // limit, a missing repository or an unsupported host.
+                        return Err(format!(
+                            "Cannot prepare a build for '{}': {}",
+                            target,
+                            upstream
+                                .map(|r| r.reason.as_str())
+                                .unwrap_or("no upstream source was queried")
+                        ));
+                    }
+                };
+                let upstream_version = upstream
+                    .and_then(|r| r.candidates.first())
+                    .and_then(|c| c.version.clone());
+                (url, upstream_version)
             };
-            let upstream_version = upstream
-                .and_then(|r| r.candidates.first())
-                .and_then(|c| c.version.clone());
             let step = Step::new(
                 "curl",
                 vec![
@@ -803,11 +856,12 @@ impl Engine {
         } else {
             // An HTTPS URL from a host that is not queried is a different answer
             // than "this is not a URL": the caller has to learn which to change.
-            return Err(if target.starts_with("https://") {
+            return Err(if source.starts_with("https://") {
                 format!(
-                    "Build source '{target}' is an HTTPS URL, but only github.com and gitlab.com \
-                     releases are fetched. Name a local directory or PKGBUILD, or pass the \
-                     repository with --repo."
+                    "Build source '{source}' is an HTTPS URL, but only github.com and gitlab.com \
+                     releases and archives (.tar.gz/.tgz) from a host you configured with \
+                     `archbridge config set repo.<name> <https-url>` are fetched. Name a local \
+                     directory or PKGBUILD, or configure the host first."
                 )
             } else {
                 format!(
@@ -1763,6 +1817,55 @@ pub fn publish_artifact(artifact: &Path, output_dir: &str) -> Result<PathBuf, St
 fn sha256_file(path: &Path) -> Result<String, String> {
     let bytes = fs::read(path).map_err(|e| format!("Cannot read '{}': {}", path.display(), e))?;
     Ok(format!("{:x}", Sha256::digest(&bytes)))
+}
+
+/// Host of an `https://` URL, lower-cased, or `None` for any other scheme, for
+/// credentials in the authority, or a malformed authority.
+fn https_host(url: &str) -> Option<String> {
+    let rest = url.strip_prefix("https://")?;
+    let authority = rest.split(['/', '?', '#']).next()?;
+    if authority.is_empty() || authority.contains('@') || authority.contains(char::is_whitespace) {
+        return None;
+    }
+    let host = authority
+        .rsplit_once(':')
+        .filter(|(_, port)| !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()))
+        .map_or(authority, |(host, _)| host);
+    if host.is_empty() {
+        return None;
+    }
+    Some(host.to_ascii_lowercase())
+}
+
+/// Why a configured host must not be fetched from: loopback, private and
+/// link-local addresses and local names would turn a build into a request
+/// against the user's own machine or network.
+fn unsafe_fetch_host(host: &str) -> Option<&'static str> {
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    if bare == "localhost" || bare.ends_with(".localhost") || bare.ends_with(".local") {
+        return Some("it names this machine or its local network");
+    }
+    if let Ok(ip) = bare.parse::<std::net::IpAddr>() {
+        let private = match ip {
+            std::net::IpAddr::V4(v4) => {
+                v4.is_loopback()
+                    || v4.is_private()
+                    || v4.is_link_local()
+                    || v4.is_unspecified()
+                    || v4.is_broadcast()
+            }
+            std::net::IpAddr::V6(v6) => {
+                v6.is_loopback()
+                    || v6.is_unspecified()
+                    || (v6.segments()[0] & 0xfe00) == 0xfc00
+                    || (v6.segments()[0] & 0xffc0) == 0xfe80
+            }
+        };
+        if private {
+            return Some("it is a loopback, private or link-local address");
+        }
+    }
+    None
 }
 
 fn generate_plan_id(action: &str, target: &str) -> String {

@@ -152,6 +152,11 @@ The desktop app writes the value through the engine the moment it is picked, on
 either the Build or Settings page, so no build can run against a folder that only
 exists in unsaved UI state. A relative `output_dir` is rejected, and the copy is
 re-hashed against the bytes the build produced before it is offered for install.
+`repo.<name>` URLs also steer builds: `archbridge build <name>` builds the
+configured URL, and an HTTPS `.tar.gz`/`.tgz` URL on any host that appears in some
+`repo.*` value is downloaded (hash-reviewed) like a GitHub/GitLab archive. Hosts
+nobody configured, plain HTTP, URLs with credentials, and loopback/private/local
+addresses are refused before any request is made.
 `keep_jobs` is a boolean (default `false`). After every build, successful or not,
 the engine removes the job's sources, build trees and chroot from
 `.archbridge/jobs/<job>`, keeping the `PKGBUILD`, `build.log` and — when no
