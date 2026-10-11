@@ -58,9 +58,7 @@ fn a_truncated_file_is_reported_not_silently_replaced_by_defaults() {
     // Exactly what a crash in the middle of the old `fs::write` produced.
     std::fs::write(&path, "{\"official\": true, \"aur\": fal").expect("write");
 
-    let error = Config::load_from(&path)
-        .err()
-        .expect("a half-written config must be an error");
+    let error = Config::load_from(&path).expect_err("a half-written config must be an error");
     assert!(
         error.contains(&path.display().to_string()),
         "the message must name the file: {error}"
@@ -71,7 +69,7 @@ fn a_truncated_file_is_reported_not_silently_replaced_by_defaults() {
     );
 
     std::fs::write(&path, "   ").expect("write");
-    let error = Config::load_from(&path).err().expect("empty file");
+    let error = Config::load_from(&path).expect_err("empty file");
     assert!(error.contains("empty"), "{error}");
 }
 
@@ -82,7 +80,7 @@ fn an_unknown_key_is_named_instead_of_being_ignored() {
     // "offical" is the typo a user actually makes; ignoring it means the
     // preference they think they set never applies.
     std::fs::write(&path, "{\"offical\": false, \"aur\": true}").expect("write");
-    let error = Config::load_from(&path).err().expect("unknown key");
+    let error = Config::load_from(&path).expect_err("unknown key");
     assert!(error.contains("offical"), "{error}");
     assert!(error.contains("aur"), "known keys must be listed: {error}");
 }
@@ -93,15 +91,11 @@ fn values_stored_in_the_file_are_revalidated_on_load() {
     std::fs::create_dir_all(path.parent().unwrap()).expect("mkdir");
 
     std::fs::write(&path, "{\"repos\": {\"x\": \"http://insecure.example/x\"}}").expect("write");
-    let error = Config::load_from(&path)
-        .err()
-        .expect("a non-HTTPS repo override must not load");
+    let error = Config::load_from(&path).expect_err("a non-HTTPS repo override must not load");
     assert!(error.contains("https"), "{error}");
 
     std::fs::write(&path, "{\"output_dir\": \"build/out\"}").expect("write");
-    let error = Config::load_from(&path)
-        .err()
-        .expect("a relative output dir must not load");
+    let error = Config::load_from(&path).expect_err("a relative output dir must not load");
     assert!(error.contains("absolute"), "{error}");
 
     std::fs::write(&path, "{\"output_dir\": \"/tmp/ok\"}").expect("write");
@@ -402,9 +396,7 @@ fn an_unwritable_target_is_reported_without_touching_the_existing_file() {
     let result = blocked.save();
     std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o755)).expect("chmod back");
     if !running_as_root {
-        let error = result
-            .err()
-            .expect("a read-only directory must block the save");
+        let error = result.expect_err("a read-only directory must block the save");
         assert!(error.contains("config"), "{error}");
     }
     assert_eq!(

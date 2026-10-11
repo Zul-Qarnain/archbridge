@@ -97,9 +97,7 @@ fn header_block(entry: &Raw) -> Vec<u8> {
     set((257, 263), b"ustar\0", &mut block);
     set((263, 265), b"00", &mut block);
     // The checksum covers the whole block with its own field treated as spaces.
-    for index in 148..156 {
-        block[index] = b' ';
-    }
+    block[148..156].fill(b' ');
     let sum: u32 = block.iter().map(|byte| *byte as u32).sum();
     set((148, 156), format!("{sum:06o}\0 ").as_bytes(), &mut block);
     block
@@ -112,7 +110,7 @@ fn raw_tar(entries: &[Raw]) -> Vec<u8> {
         if entry.typeflag == b'0' {
             bytes.extend_from_slice(&entry.data);
             let pad = (512 - entry.data.len() % 512) % 512;
-            bytes.extend(std::iter::repeat(0u8).take(pad));
+            bytes.extend(std::iter::repeat_n(0u8, pad));
         }
     }
     // Two zero blocks terminate the archive.

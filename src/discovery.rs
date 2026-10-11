@@ -749,8 +749,7 @@ fn parse_aur_results(body: &str, target: &str) -> Option<Vec<Candidate>> {
         let snapshot_url = item
             .get("URLPath")
             .and_then(|u| u.as_str())
-            .map(aur_snapshot_url)
-            .flatten();
+            .and_then(aur_snapshot_url);
         candidates.push(Candidate {
             name: name.to_string(),
             version: sanitize_opt(item.get("Version").and_then(|v| v.as_str())),
@@ -1167,7 +1166,7 @@ fn query_upstream_source(target: &str, repo_url: Option<&str>, probe: &dyn Probe
     }
 
     if let Some(path) = parse_gitlab_repo(repo_url_str) {
-        let project = path.split('/').last().unwrap_or_default().to_string();
+        let project = path.split('/').next_back().unwrap_or_default().to_string();
         let url = format!(
             "https://gitlab.com/{}/-/archive/HEAD/{}-HEAD.tar.gz",
             path, project
@@ -1260,10 +1259,7 @@ fn github_api_json(path: &str, probe: &dyn Probe) -> Result<serde_json::Value, S
         "Query GitHub API",
         10,
     );
-    let out = match probe.query(&step) {
-        Ok(out) => out,
-        Err(err) => return Err(err),
-    };
+    let out = probe.query(&step)?;
     if out.exit_code != 0 {
         let detail = out.stderr.trim();
         return Err(if detail.is_empty() {

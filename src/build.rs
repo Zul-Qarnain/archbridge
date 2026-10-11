@@ -336,7 +336,7 @@ fn find_built_package(dir: &Path) -> Option<PathBuf> {
             Some((modified, path))
         })
         .collect();
-    matches.sort_by(|a, b| b.0.cmp(&a.0));
+    matches.sort_by_key(|entry| std::cmp::Reverse(entry.0));
     matches
         .into_iter()
         .next()

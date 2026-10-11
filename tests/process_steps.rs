@@ -32,9 +32,7 @@ fn a_step_that_outlives_its_timeout_is_killed_and_reported() {
     // `sleep 30` with a one-second budget: the old code waited for the child,
     // which is fine, but never reaped it on the `try_wait` error path.
     let step = Step::new("sleep", vec!["30"], "test the timeout", 1);
-    let error = run_step(&step, None)
-        .err()
-        .expect("a 30s sleep must time out");
+    let error = run_step(&step, None).expect_err("a 30s sleep must time out");
     let elapsed = started.elapsed();
     assert!(error.contains("timed out after 1s"), "{error}");
     assert!(
@@ -91,7 +89,7 @@ fn a_loud_command_is_captured_without_being_truncated() {
     assert_eq!(out.exit_code, 0, "{}", out.stderr);
     // /dev/zero is NUL bytes: lossy decoding keeps one char per byte.
     assert_eq!(
-        out.stdout.as_bytes().len(),
+        out.stdout.len(),
         1048576,
         "a megabyte of output was truncated"
     );
@@ -153,7 +151,7 @@ fn a_missing_program_is_an_error_and_never_a_panic() {
         "spawn failure path",
         5,
     );
-    let error = run_step(&step, None).err().expect("spawn must fail");
+    let error = run_step(&step, None).expect_err("spawn must fail");
     assert!(error.contains("Failed to spawn"), "{error}");
 }
 

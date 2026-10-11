@@ -117,13 +117,10 @@ impl<R: Read> ReadToEndWithLimit for R {
                 return Ok(());
             }
             if buffer.len() as u64 + read as u64 > limit {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!(
-                        "the archive expands to more than {} bytes, over the snapshot limit",
-                        limit
-                    ),
-                ));
+                return Err(std::io::Error::other(format!(
+                    "the archive expands to more than {} bytes, over the snapshot limit",
+                    limit
+                )));
             }
             buffer.extend_from_slice(&chunk[..read]);
         }
@@ -237,7 +234,7 @@ pub fn walk_tree(root: &Path) -> Result<Vec<FileReview>, String> {
                     .unwrap_or_default();
                 let mut hasher = Sha256::new();
                 hasher.update(target.as_bytes());
-                push_review(&mut reviews, &rel_str)?;
+                push_review(&reviews, &rel_str)?;
                 reviews.push(FileReview {
                     path: rel_str,
                     sha256: format!("{:x}", hasher.finalize()),
@@ -246,7 +243,7 @@ pub fn walk_tree(root: &Path) -> Result<Vec<FileReview>, String> {
                     content: Some(format!("symlink -> {}", target)),
                 });
             } else if meta.is_file() {
-                push_review(&mut reviews, &rel_str)?;
+                push_review(&reviews, &rel_str)?;
                 let mut file = fs::File::open(&path)
                     .map_err(|e| format!("Failed to read file '{}': {}", rel_str, e))?;
                 let digest = digest_stream(&mut file, MAX_FILE_BYTES)

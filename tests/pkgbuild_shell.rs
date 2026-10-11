@@ -59,10 +59,9 @@ fn every_generated_pkgbuild_is_parsable_shell() {
                 String::from_utf8_lossy(&check.stderr)
             );
 
-            if subdir.is_some() && !matches!(&system, BuildSystem::Imported) {
+            if let (Some(dir), false) = (subdir, matches!(&system, BuildSystem::Imported)) {
                 // Imported payloads are repacked without compiling, so they never
                 // enter an extracted source tree.
-                let dir = subdir.unwrap();
                 assert!(script.contains(&format!("cd \"$srcdir/{}\"", dir)));
             }
             assert!(script.contains("pkgver='2.3.4_5'"));

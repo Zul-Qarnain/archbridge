@@ -186,10 +186,12 @@ pub fn detect_build_system_in_archive(reviews: &[FileReview]) -> (BuildSystem, O
             }
         }
     }
-    if has("Makefile") && !has("configure.ac") && !has("configure.in") {
-        if text_of("Makefile").is_some_and(makefile_declares_install) {
-            return (BuildSystem::Make, root);
-        }
+    if has("Makefile")
+        && !has("configure.ac")
+        && !has("configure.in")
+        && text_of("Makefile").is_some_and(makefile_declares_install)
+    {
+        return (BuildSystem::Make, root);
     }
 
     (
@@ -322,7 +324,7 @@ fn normalize_name(raw: &str) -> String {
             }
         })
         .collect();
-    while name.starts_with(|c| matches!(c, '-' | '+' | '.')) {
+    while name.starts_with(['-', '+', '.']) {
         name.remove(0);
     }
     if name.is_empty() {
@@ -346,7 +348,7 @@ pub fn sanitize_entry_name(raw: &str) -> String {
             }
         })
         .collect();
-    while name.starts_with(|c: char| matches!(c, '-' | '+' | '.')) {
+    while name.starts_with(['-', '+', '.']) {
         name.remove(0);
     }
     if name.is_empty() {
@@ -364,7 +366,7 @@ fn is_package_token(name: &str) -> bool {
         && name
             .chars()
             .next()
-            .map_or(false, |c| c.is_ascii_alphanumeric())
+            .is_some_and(|c| c.is_ascii_alphanumeric())
         && name
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '+' | '-' | '@'))
@@ -387,7 +389,6 @@ fn normalize_deb_constraint(dep: &str) -> String {
         return dep.to_string();
     };
     let version = body[operator.len()..]
-        .trim()
         .split_whitespace()
         .next()
         .unwrap_or_default();

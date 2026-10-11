@@ -486,12 +486,11 @@ fn prepare_accepts_config_set_in_both_param_shapes() {
         json!({"action": "config.set", "key": "flatpak", "value": false}),
     ));
     assert!(boolean.get("result").is_some(), "{boolean}");
-    assert_eq!(
+    assert!(
         boolean["result"]["summary"]
             .as_str()
             .unwrap_or_default()
             .contains("false"),
-        true,
         "{boolean}"
     );
 }
