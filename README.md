@@ -16,6 +16,26 @@
 ![JSON-RPC](https://img.shields.io/badge/IPC-JSON--RPC%202.0-f5a524?style=flat-square)
 ![Status](https://img.shields.io/badge/status-pre--release-red?style=flat-square)
 
+<br>
+
+[![Stars](https://img.shields.io/github/stars/Zul-Qarnain/archbridge?style=flat-square&logo=github)](https://github.com/Zul-Qarnain/archbridge/stargazers)
+[![Forks](https://img.shields.io/github/forks/Zul-Qarnain/archbridge?style=flat-square&logo=github)](https://github.com/Zul-Qarnain/archbridge/network/members)
+[![Issues](https://img.shields.io/github/issues/Zul-Qarnain/archbridge?style=flat-square)](https://github.com/Zul-Qarnain/archbridge/issues)
+[![Last commit](https://img.shields.io/github/last-commit/Zul-Qarnain/archbridge?style=flat-square)](https://github.com/Zul-Qarnain/archbridge/commits)
+![Safe first](https://img.shields.io/badge/install-safe--first-2ea44f?style=flat-square)
+![Never executes .deb scripts](https://img.shields.io/badge/.deb%2F.rpm%20scripts-never%20executed-critical?style=flat-square)
+![PRs welcome](https://img.shields.io/badge/PRs-welcome-brightgreen?style=flat-square)
+
+<p>
+<a href="#thirty-seconds">30-second tour</a> ·
+<a href="#watch-the-launch-video">Launch video</a> ·
+<a href="#-see-it-working">Screenshots</a> ·
+<a href="#-install">Install</a> ·
+<a href="#-use-it">Use it</a> ·
+<a href="#-safety-model--what-it-never-does">Safety</a> ·
+<a href="#-roadmap">Roadmap</a>
+</p>
+
 **ArchBridge finds the safest way to install a piece of software on Arch Linux — then shows you every command, hash and PKGBUILD it intends to run, and does nothing until you say yes.**
 
 *One Rust binary: `archbridge gui`, `archbridge search`, `archbridge serve`.*
@@ -98,7 +118,17 @@ Raw terminal output, unedited (the text files are kept next to the images in [`d
 <br><sub><code>archbridge inspect cron_3.0pl1-197_amd64.deb</code> (lines cut at 132 columns): four maintainer scripts read, each with <code>"executed": false</code>.</sub>
 </div>
 
-### Launch clip
+<a id="watch-the-launch-video"></a>
+### 🎬 Watch the launch video
+
+<div align="center">
+<a href="docs/media/archbridge-launch.mp4">
+<img src="docs/screenshots/brag-poster.png" alt="Play the 24-second ArchBridge launch video" width="80%">
+</a>
+<br><sub>▶ <a href="docs/media/archbridge-launch.mp4"><b>Play the 24-second launch video</b></a> (opens GitHub's built-in video player). Made from the real app and CLI captures; planned features are not shown as working.</sub>
+</div>
+
+### Quick preview
 
 <div align="center">
 <img src="docs/screenshots/brag-demo.gif" alt="A 24-second launch clip: the problem, the banner, Discover, Inspect, the reviewed plan, and the closing line" width="80%">
