@@ -885,3 +885,39 @@ fn a_search_plan_summary_names_the_source_without_debug_noise() {
     assert!(!plan.summary.contains("Some("), "{}", plan.summary);
     assert!(!plan.summary.contains("None"), "{}", plan.summary);
 }
+
+#[test]
+fn a_build_named_by_dot_or_trailing_slash_uses_the_directory_name() {
+    // Regression: `build .`, `build ..` and `build dir/` inferred an empty name
+    // and silently produced a package called "imported-package".
+    let temp = TempDir::new().unwrap();
+    let project = temp.path().join("my-tool");
+    fs::create_dir_all(project.join("sub")).unwrap();
+    fs::write(
+        project.join("CMakeLists.txt"),
+        "cmake_minimum_required(VERSION 3.16)",
+    )
+    .unwrap();
+    let mut engine = engine_in(&temp);
+    let dir = project.display().to_string();
+    for target in [
+        dir.clone(),
+        format!("{dir}/"),
+        format!("{dir}//"),
+        format!("{dir}/sub/.."),
+        format!("{dir}/./"),
+    ] {
+        let plan = engine
+            .prepare_build(&target, None, None, None, &[], &[])
+            .unwrap_or_else(|e| panic!("{target}: {e}"));
+        assert!(
+            pkgbuild_review(&plan)
+                .content
+                .as_deref()
+                .unwrap()
+                .contains("pkgname='my-tool'"),
+            "{target}: {}",
+            pkgbuild_review(&plan).content.as_deref().unwrap()
+        );
+    }
+}

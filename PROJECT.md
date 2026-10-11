@@ -180,8 +180,9 @@ preferences. Read-only operations and dry-runs do not initialize directories.
 Unsupported or ambiguous layouts report **“unsupported build system, manual
 PKGBUILD required”**. Autotools is not misidentified as plain make. Library-only
 Cargo crates, Cargo workspaces, nested Go commands, web-only npm applications,
-Yarn Berry, multiple primary build systems, and symlink-containing source
-snapshots require manual handling. Declaring a manual PKGBUILD does not waive
+Yarn Berry, and multiple primary build systems require manual handling.
+Symlinks in a local source directory are archived when they stay inside the tree;
+absolute links and links that escape it are rejected. Declaring a manual PKGBUILD does not waive
 snapshot path-safety checks.
 
 Detection is not dependency inference. Supply `--dependency` for known Arch

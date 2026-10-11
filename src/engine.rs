@@ -624,13 +624,17 @@ impl Engine {
     ) -> Result<Plan, String> {
         self.require_config()?;
         validate_target(target)?;
-        let inferred_name = name_opt.map(str::to_string).unwrap_or_else(|| {
-            if let Some(pos) = target.rfind('/') {
-                target[pos + 1..].to_string()
-            } else {
-                target.to_string()
-            }
-        });
+        // `source` is what the build actually reads: a bare name configured as
+        // `repo.<name>` stands for its URL, everything else is the target itself.
+        let source = self
+            .configured_source(target)
+            .unwrap_or_else(|| target.to_string());
+        let source = source.as_str();
+        let direct_archive = self.configured_archive_url(source)?;
+
+        let inferred_name = name_opt
+            .map(str::to_string)
+            .unwrap_or_else(|| infer_build_name(source));
         let name = inferred_name
             .strip_suffix(".deb")
             .or_else(|| inferred_name.strip_suffix(".rpm"))
@@ -649,14 +653,6 @@ impl Engine {
         }
         validate_args(smoke_args)?;
         let version = ver_opt.unwrap_or("1.0.0");
-
-        // `source` is what the build actually reads: a bare name configured as
-        // `repo.<name>` stands for its URL, everything else is the target itself.
-        let source = self
-            .configured_source(target)
-            .unwrap_or_else(|| target.to_string());
-        let source = source.as_str();
-        let direct_archive = self.configured_archive_url(source)?;
 
         let job_id = format!("job-{}", generate_plan_id("build", target));
         let job_dir = PathBuf::from(".archbridge").join("jobs").join(&job_id);
@@ -1832,6 +1828,35 @@ fn sha256_file(path: &Path) -> Result<String, String> {
     Ok(format!("{:x}", Sha256::digest(&bytes)))
 }
 
+/// The package name a build target implies when `--name` is not given: the
+/// directory's own name (resolved, so `.`, `..` and `dir/` name the directory
+/// rather than nothing), or the last path segment of a file or URL without its
+/// archive/VCS suffix.
+fn infer_build_name(target: &str) -> String {
+    let path = Path::new(target);
+    if path.is_dir() {
+        if let Some(name) = path
+            .canonicalize()
+            .ok()
+            .and_then(|real| real.file_name().map(|n| n.to_string_lossy().to_string()))
+        {
+            return name;
+        }
+    }
+    let trimmed = target.split(['?', '#']).next().unwrap_or(target);
+    let segment = trimmed
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or(trimmed);
+    let segment = segment
+        .strip_suffix(".tar.gz")
+        .or_else(|| segment.strip_suffix(".tgz"))
+        .or_else(|| segment.strip_suffix(".git"))
+        .unwrap_or(segment);
+    segment.to_string()
+}
+
 /// Host of an `https://` URL, lower-cased, or `None` for any other scheme, for
 /// credentials in the authority, or a malformed authority.
 fn https_host(url: &str) -> Option<String> {
@@ -1893,6 +1918,20 @@ fn generate_plan_id(action: &str, target: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_remote_source_is_named_without_its_archive_or_vcs_suffix() {
+        for (target, expected) in [
+            ("https://github.com/o/tool", "tool"),
+            ("https://github.com/o/tool/", "tool"),
+            ("https://github.com/o/tool.git", "tool"),
+            ("https://dl.example/x/tool-1.2.tar.gz", "tool-1.2"),
+            ("https://dl.example/x/tool-1.2.tgz?token=a/b", "tool-1.2"),
+            ("tool_1.0_amd64.deb", "tool_1.0_amd64.deb"),
+        ] {
+            assert_eq!(infer_build_name(target), expected, "{target}");
+        }
+    }
 
     fn binding(
         version: &str,
