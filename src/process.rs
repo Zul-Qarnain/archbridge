@@ -144,6 +144,58 @@ pub fn format_elapsed(ms: u64) -> String {
     }
 }
 
+/// Bytes a single stream may contribute to a captured result. A command that
+/// prints more than this is either a build log nobody will read or a stream
+/// designed to exhaust the daemon's memory.
+const MAX_CAPTURED_BYTES: usize = 512 * 1024 * 1024;
+/// Timeout used when a step does not name one.
+const DEFAULT_TIMEOUT_SECONDS: u64 = 30;
+/// Upper bound on a step's own timeout, so a bogus plan value cannot wedge the
+/// server for days.
+const MAX_TIMEOUT_SECONDS: u64 = 6 * 60 * 60;
+
+/// Environment variables a tool reinterprets as extra command-line arguments or
+/// as a program to execute. They are removed from every child: `TAR_OPTIONS` and
+/// `GZIP` are the classic way a hostile shell profile turns `tar` into code
+/// execution, and `*_ASKPASS` hands a GUI helper the user's credentials.
+const CONTAMINATING_ENV: &[&str] = &[
+    "TAR_OPTIONS",
+    "GZIP",
+    "BZIP2",
+    "XZ_OPT",
+    "ZIPFLAGS",
+    "UNZIP",
+    "GREP_OPTIONS",
+    "SUDO_ASKPASS",
+    "SSH_ASKPASS",
+    "LD_PRELOAD",
+    "BASH_ENV",
+    "ENV",
+    "CDPATH",
+    "PROMPT_COMMAND",
+];
+
+/// Read a stream up to a hard byte budget. The second field is the reason the
+/// read stopped early, if it did, so the caller can report it instead of
+/// handing back a truncated log that looks complete.
+fn read_capped(source: &mut dyn std::io::Read, limit: usize) -> (Vec<u8>, Option<String>) {
+    let mut out: Vec<u8> = Vec::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        match source.read(&mut buffer) {
+            Ok(0) => return (out, None),
+            Ok(read) => {
+                if out.len() + read > limit {
+                    return (out, Some(format!("it produced more than {limit} bytes")));
+                }
+                out.extend_from_slice(&buffer[..read]);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return (out, Some(e.to_string())),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Step {
     pub program: String,
@@ -221,6 +273,9 @@ fn run_captured(
     if let Some(dir) = working_dir {
         cmd.current_dir(dir);
     }
+    for name in CONTAMINATING_ENV {
+        cmd.env_remove(name);
+    }
 
     if input.is_some() {
         cmd.stdin(Stdio::piped());
@@ -238,36 +293,37 @@ fn run_captured(
     let step_started = Instant::now();
     tracker_start(step_id, &step.purpose);
 
-    if let Some(data) = input {
-        if let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(data);
-        }
-    }
+    // stdin is fed on its own thread: a child that writes a full pipe before it
+    // reads the rest of its input would otherwise deadlock against us here.
+    let stdin_writer = child.stdin.take().map(|mut stdin| {
+        let data = input.unwrap_or_default().to_vec();
+        std::thread::spawn(move || {
+            let _ = stdin.write_all(&data);
+            // Closing here is what tells a tool like `sudo -S` that no more
+            // input is coming.
+            drop(stdin);
+        })
+    });
 
     // Drain stdout/stderr on dedicated reader threads. Reading only after the
     // child exits deadlocks once a verbose command (e.g. mkarchroot) fills the
     // 64 KiB OS pipe buffer, which previously surfaced as a process timeout.
-    let stdout_reader = child.stdout.take().map(|mut r| {
-        std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = std::io::Read::read_to_end(&mut r, &mut buf);
-            buf
-        })
-    });
-    let stderr_reader = child.stderr.take().map(|mut r| {
-        std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = std::io::Read::read_to_end(&mut r, &mut buf);
-            buf
-        })
-    });
+    let stdout_reader = child
+        .stdout
+        .take()
+        .map(|mut r| std::thread::spawn(move || read_capped(&mut r, MAX_CAPTURED_BYTES)));
+    let stderr_reader = child
+        .stderr
+        .take()
+        .map(|mut r| std::thread::spawn(move || read_capped(&mut r, MAX_CAPTURED_BYTES)));
 
     let start = Instant::now();
-    let timeout = Duration::from_secs(if step.timeout_seconds == 0 {
-        30
+    let requested = if step.timeout_seconds == 0 {
+        DEFAULT_TIMEOUT_SECONDS
     } else {
         step.timeout_seconds
-    });
+    };
+    let timeout = Duration::from_secs(requested.min(MAX_TIMEOUT_SECONDS));
 
     let status = loop {
         match child.try_wait() {
@@ -286,6 +342,10 @@ fn run_captured(
                 std::thread::sleep(Duration::from_millis(50));
             }
             Err(e) => {
+                // A failed wait leaves the child running; reaping it here is what
+                // keeps an RPC daemon from accumulating zombies.
+                let _ = child.kill();
+                let _ = child.wait();
                 tracker_finish(step_id, &step.purpose, step_started, false);
                 return Err(format!(
                     "Error waiting for process '{}': {}",
@@ -295,17 +355,68 @@ fn run_captured(
         }
     };
 
-    let stdout_bytes = match stdout_reader {
-        Some(handle) => handle.join().unwrap_or_default(),
-        None => Vec::new(),
+    if let Some(writer) = stdin_writer {
+        let _ = writer.join();
+    }
+    let (stdout_bytes, stdout_problem) = match stdout_reader {
+        Some(handle) => handle
+            .join()
+            .unwrap_or_else(|_| (Vec::new(), Some("the reader failed".to_string()))),
+        None => (Vec::new(), None),
     };
-    let stderr_bytes = match stderr_reader {
-        Some(handle) => handle.join().unwrap_or_default(),
-        None => Vec::new(),
+    let (stderr_bytes, stderr_problem) = match stderr_reader {
+        Some(handle) => handle
+            .join()
+            .unwrap_or_else(|_| (Vec::new(), Some("the reader failed".to_string()))),
+        None => (Vec::new(), None),
     };
+    if let Some(problem) = stdout_problem.or(stderr_problem) {
+        tracker_finish(step_id, &step.purpose, step_started, false);
+        return Err(format!(
+            "Output of '{}' could not be captured within {} bytes: {problem}",
+            step.program, MAX_CAPTURED_BYTES
+        ));
+    }
 
     let exit_ok = status.code().unwrap_or(-1) == 0;
     tracker_finish(step_id, &step.purpose, step_started, exit_ok);
 
     Ok((status.code().unwrap_or(-1), stdout_bytes, stderr_bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_capped_read_stops_at_the_budget_instead_of_growing() {
+        let payload = vec![7u8; 4000];
+        let mut cursor = std::io::Cursor::new(payload.clone());
+        let (bytes, problem) = read_capped(&mut cursor, 64 * 1024);
+        assert_eq!(bytes, payload, "a stream inside the budget is kept whole");
+        assert_eq!(problem, None);
+
+        let mut cursor = std::io::Cursor::new(payload);
+        let (bytes, problem) = read_capped(&mut cursor, 1000);
+        assert!(bytes.len() <= 1000, "the cap was not honoured");
+        let problem = problem.expect("an over-budget stream must be reported");
+        assert!(problem.contains("1000 bytes"), "{problem}");
+    }
+
+    #[test]
+    fn a_stream_exactly_at_the_budget_is_not_truncated() {
+        let payload = vec![9u8; 1024];
+        let mut cursor = std::io::Cursor::new(payload.clone());
+        let (bytes, problem) = read_capped(&mut cursor, 1024);
+        assert_eq!(bytes, payload);
+        assert_eq!(problem, None);
+    }
+
+    #[test]
+    fn elapsed_formatting_stays_readable() {
+        assert_eq!(format_elapsed(0), "0s");
+        assert_eq!(format_elapsed(59_999), "59s");
+        assert_eq!(format_elapsed(60_000), "1m 00s");
+        assert_eq!(format_elapsed(3_725_000), "62m 05s");
+    }
 }
