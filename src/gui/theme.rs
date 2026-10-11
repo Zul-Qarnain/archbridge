@@ -100,6 +100,7 @@ pub struct ThemePalette {
     pub accent_cyan: u32,
     pub accent_green: u32,
     pub accent_red: u32,
+    pub accent_amber: u32,
 }
 
 impl ThemePalette {
@@ -122,11 +123,12 @@ pub fn get_palette(theme: AppTheme) -> ThemePalette {
             border_subtle: 0x16243b,
             text_primary: 0xffffff,
             text_secondary: 0xc9d1d9,
-            text_muted: 0x64748b,
-            text_placeholder: 0x475569,
+            text_muted: 0x94a3b8,
+            text_placeholder: 0x64748b,
             accent_cyan: 0x38bdf8,
             accent_green: 0x10b981,
-            accent_red: 0xef4444,
+            accent_red: 0xf87171,
+            accent_amber: 0xfbbf24,
         },
         AppTheme::Midnight => ThemePalette {
             bg_darkest: 0x000000,
@@ -142,9 +144,10 @@ pub fn get_palette(theme: AppTheme) -> ThemePalette {
             text_secondary: 0xd1d5db,
             text_muted: 0x9ca3af,
             text_placeholder: 0x6b7280,
-            accent_cyan: 0x06b6d4,
-            accent_green: 0x10b981,
-            accent_red: 0xf43f5e,
+            accent_cyan: 0x22d3ee,
+            accent_green: 0x34d399,
+            accent_red: 0xfb7185,
+            accent_amber: 0xfbbf24,
         },
         AppTheme::Light => ThemePalette {
             bg_darkest: 0xf1f5f9,
@@ -158,11 +161,95 @@ pub fn get_palette(theme: AppTheme) -> ThemePalette {
             border_subtle: 0xe2e8f0,
             text_primary: 0x0f172a,
             text_secondary: 0x334155,
-            text_muted: 0x64748b,
-            text_placeholder: 0x94a3b8,
-            accent_cyan: 0x0284c7,
-            accent_green: 0x059669,
+            text_muted: 0x475569,
+            text_placeholder: 0x64748b,
+            accent_cyan: 0x0369a1,
+            accent_green: 0x047857,
             accent_red: 0xdc2626,
+            accent_amber: 0xb45309,
         },
+    }
+}
+
+/// WCAG relative luminance for an sRGB hex color.
+pub fn relative_luminance(color: u32) -> f32 {
+    let channel = |c: u32| {
+        let s = (c as f32) / 255.0;
+        if s <= 0.04045 {
+            s / 12.92
+        } else {
+            ((s + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    let r = channel((color >> 16) & 0xff);
+    let g = channel((color >> 8) & 0xff);
+    let b = channel(color & 0xff);
+    0.2126 * r + 0.7152 * g + 0.0722 * b
+}
+
+/// Contrast ratio between two sRGB colors, in the range 1.0–21.0.
+pub fn contrast_ratio(foreground: u32, background: u32) -> f32 {
+    let lighter = relative_luminance(foreground).max(relative_luminance(background));
+    let darker = relative_luminance(foreground).min(relative_luminance(background));
+    (lighter + 0.05) / (darker + 0.05)
+}
+
+/// Foreground for a doctor status on this theme's cards. Unavailable is amber,
+/// never the failure red.
+pub fn status_fg(theme: AppTheme, status: &str) -> u32 {
+    let pal = get_palette(theme);
+    match status {
+        "pass" => pal.accent_green,
+        "unavailable" => pal.accent_amber,
+        "fail" => pal.accent_red,
+        _ => pal.text_muted,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // Import by name. `use super::*` would pull in gpui's `test` macro and
+    // make `#[test]` recurse instead of registering a unit test.
+    use super::{contrast_ratio, get_palette, status_fg};
+    use crate::gui::state::AppTheme;
+
+    fn assert_text_contrast(name: &str, fg: u32, bg: u32) {
+        let ratio = contrast_ratio(fg, bg);
+        assert!(
+            ratio >= 4.5,
+            "{name} contrast {ratio} is below 4.5 (fg {fg}, bg {bg})"
+        );
+    }
+
+    #[test]
+    fn every_theme_keeps_body_and_status_text_readable() {
+        for theme in [AppTheme::Dark, AppTheme::Midnight, AppTheme::Light] {
+            let pal = get_palette(theme);
+            let label = format!("{theme:?}");
+            assert_text_contrast(&format!("{label} primary"), pal.text_primary, pal.bg_dark);
+            assert_text_contrast(&format!("{label} muted"), pal.text_muted, pal.bg_dark);
+            assert_text_contrast(&format!("{label} cyan"), pal.accent_cyan, pal.bg_dark);
+            assert_text_contrast(&format!("{label} green"), pal.accent_green, pal.bg_dark);
+            assert_text_contrast(&format!("{label} red"), pal.accent_red, pal.bg_card);
+            assert_text_contrast(&format!("{label} amber"), pal.accent_amber, pal.bg_card);
+            for status in ["pass", "unavailable", "fail"] {
+                assert_text_contrast(
+                    &format!("{label} {status}"),
+                    status_fg(theme, status),
+                    pal.bg_card,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unavailable_status_is_not_painted_as_a_failure() {
+        for theme in [AppTheme::Dark, AppTheme::Midnight, AppTheme::Light] {
+            assert_ne!(status_fg(theme, "unavailable"), status_fg(theme, "fail"));
+            assert_eq!(
+                status_fg(theme, "unavailable"),
+                get_palette(theme).accent_amber
+            );
+        }
     }
 }
