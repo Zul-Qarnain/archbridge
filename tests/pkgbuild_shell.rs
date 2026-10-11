@@ -12,6 +12,7 @@ fn params(src_subdir: Option<&str>) -> PkgbuildParams {
         dependencies: vec!["glibc".to_string(), "openssl".to_string()],
         entry_binary: Some("demo-tool".to_string()),
         src_subdir: src_subdir.map(str::to_string),
+        architecture: Some("amd64".to_string()),
     }
 }
 
@@ -58,10 +59,9 @@ fn every_generated_pkgbuild_is_parsable_shell() {
                 String::from_utf8_lossy(&check.stderr)
             );
 
-            if subdir.is_some() && !matches!(&system, BuildSystem::Imported) {
+            if let (Some(dir), false) = (subdir, matches!(&system, BuildSystem::Imported)) {
                 // Imported payloads are repacked without compiling, so they never
                 // enter an extracted source tree.
-                let dir = subdir.unwrap();
                 assert!(script.contains(&format!("cd \"$srcdir/{}\"", dir)));
             }
             assert!(script.contains("pkgver='2.3.4_5'"));
@@ -127,6 +127,7 @@ fn imported_package_does_not_relink_an_existing_usr_bin_entry() {
             dependencies: vec![],
             entry_binary: Some("qoder".to_string()),
             src_subdir: None,
+            architecture: Some("amd64".to_string()),
         },
     )
     .unwrap();

@@ -96,16 +96,39 @@ fn cli_is_rpc_client_not_packaging_engine() {
 fn no_foreign_script_executor() {
     let inspect = source("inspect.rs");
     assert_contains(&inspect, "executed: false", "inspect.rs");
-    let squeezed = squeezed(&inspect);
+    let folded = squeezed(&inspect);
     for shell in ["sh", "bash", "ldd"] {
-        assert_absent(
-            &squeezed,
-            &format!("Step :: new (\"{shell}\""),
-            "inspect.rs",
-        );
-        assert_absent(&squeezed, &format!("Step::new(\"{shell}\""), "inspect.rs");
+        assert_absent(&folded, &format!("Step :: new (\"{shell}\""), "inspect.rs");
+        assert_absent(&folded, &format!("Step::new(\"{shell}\""), "inspect.rs");
     }
     assert_absent(&inspect, "Command::new", "inspect.rs");
+
+    // The header readers are the two places a hostile package gets closest to
+    // code: RPM scriptlets are shell source, and an ELF object is the thing an
+    // `ldd`-style probe would run. Neither module may launch anything at all —
+    // the answers come from bytes that were already read into memory.
+    for module in ["inspect.rs", "rpm.rs", "elf.rs"] {
+        let text = source(module);
+        let folded = squeezed(&text);
+        assert_absent(&text, "Command::new", module);
+        for program in ["sh", "bash", "ldd", "readelf", "objdump", "nm", "python"] {
+            assert_absent(&folded, &format!("Step :: new (\"{program}\""), module);
+            assert_absent(&folded, &format!("Step::new(\"{program}\""), module);
+        }
+    }
+
+    // Parsing an untrusted object is arithmetic on offsets, so it must be total:
+    // a truncated or hostile file is refused, never a panic on the way.
+    for module in ["rpm.rs", "elf.rs"] {
+        let text = source(module);
+        let production = text
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap_or_else(|| panic!("{module} has no test module to split on"));
+        for forbidden in [".unwrap()", ".expect(", "panic!(", "unreachable!("] {
+            assert_absent(production, forbidden, module);
+        }
+    }
 }
 
 #[test]
@@ -115,7 +138,11 @@ fn native_package_review_uses_pinned_bytes() {
     assert_contains(&build, "walk_tree(&root)", "build.rs");
     assert_absent(&build, "hasher.update(path_str.as_bytes())", "build.rs");
     assert_absent(&build, "\"-tvf\".to_string()", "build.rs");
-    assert_contains(&source("archive.rs"), "hasher.update(&bytes)", "archive.rs");
+    assert_contains(
+        &source("archive.rs"),
+        "hasher.update(&chunk[..read])",
+        "archive.rs",
+    );
 
     let inspect = source("inspect.rs");
     assert_contains(&inspect, "Sha256::digest(&bytes)", "inspect.rs");
@@ -162,16 +189,45 @@ fn no_unsigned_integrity_bypass() {
 #[test]
 fn dry_run_stops_before_rpc_execution() {
     let main = source("main.rs");
-    let stop = main
-        .find("if dry_run { return Ok(0); }")
-        .expect("main.rs must return before executing on --dry-run");
-    let execute = main
-        .find("client.call(\"v1.execute\"")
-        .expect("main.rs must call v1.execute");
+    let execute = "client.call(\"v1.execute\"";
+    // Every handler that can execute must short-circuit on `--dry-run` first.
+    // Checking only the first occurrence in the file let one correct handler
+    // stand in for the others, so a handler that dropped its guard stayed green.
+    let mut checked = 0;
+    for name in extract_fn_names(&main) {
+        let Some(start) = main.find(&format!("fn {name}(")) else {
+            continue;
+        };
+        let body = &main[start..];
+        let body = match body.find("\nfn ") {
+            Some(next) => &body[..next],
+            None => body,
+        };
+        if !body.contains(execute) {
+            continue;
+        }
+        checked += 1;
+        let stop = body
+            .find("if dry_run")
+            .unwrap_or_else(|| panic!("'{}' calls v1.execute but never checks --dry-run", name));
+        let execute = body.find(execute).expect("handler calls v1.execute");
+        assert!(
+            stop < execute,
+            "the dry-run short circuit at {stop} in '{name}' must precede v1.execute at {execute}"
+        );
+    }
     assert!(
-        stop < execute,
-        "the dry-run short circuit at {stop} must precede the v1.execute call at {execute}"
+        checked >= 4,
+        "expected the mutating handlers to stage plans, only found {checked}"
     );
+}
+
+fn extract_fn_names(text: &str) -> Vec<String> {
+    text.lines()
+        .filter_map(|line| line.trim().strip_prefix("fn "))
+        .filter_map(|rest| rest.split('(').next())
+        .map(str::to_string)
+        .collect()
 }
 
 #[test]

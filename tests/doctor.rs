@@ -1,6 +1,6 @@
 use archbridge::doctor::{
     check_disk_space, check_user_namespaces, compute_readiness, evaluate_network_probe_result,
-    run_doctor_with_probe, CheckResult, DEFAULT_NETWORK_ENDPOINT,
+    run_doctor_with_probe, CheckResult, DEFAULT_NETWORK_ENDPOINT, ESSENTIAL_CHECKS,
 };
 use archbridge::process::ProcessOutput;
 use archbridge::rpc::{JsonRpcRequest, RpcServer};
@@ -182,4 +182,96 @@ fn test_namespaces_check_fails_when_sysctls_disable_user_namespaces() {
             "kernel restrictions on unprivileged user namespaces must be reported"
         );
     }
+}
+
+/// A caller that gets `ready: false` needs one line that explains everything.
+/// The report has to lead with the host, because every other essential check is
+/// an Arch packaging tool that cannot exist on a machine that is not Arch.
+#[test]
+fn doctor_names_the_host_before_the_tools_it_cannot_find() {
+    let mut server = RpcServer::new();
+    let response = server.handle_request(JsonRpcRequest {
+        jsonrpc: "2.0".to_string(),
+        id: Some(json!(21)),
+        method: "v1.doctor".to_string(),
+        params: json!({}),
+    });
+    let res = response.result.expect("v1.doctor answers with a report");
+    let checks: Vec<CheckResult> =
+        serde_json::from_value(res.get("checks").cloned().unwrap()).expect("check list");
+
+    assert_eq!(
+        checks.first().map(|check| check.name.as_str()),
+        Some("arch"),
+        "the host check leads the report"
+    );
+    let host = &checks[0];
+    assert!(
+        matches!(host.status.as_str(), "pass" | "fail"),
+        "the host either is Arch or is not: {}",
+        host.status
+    );
+    if host.status == "fail" {
+        assert!(
+            host.message.starts_with("not an Arch Linux system"),
+            "the refusal must say what was found instead: {}",
+            host.message
+        );
+        assert!(
+            host.message.contains("pacman")
+                || host.message.contains("makepkg")
+                || host.message.contains("os-release"),
+            "and name the missing evidence: {}",
+            host.message
+        );
+    }
+
+    let ready = res.get("ready").unwrap().as_bool().unwrap();
+    assert_eq!(
+        ready,
+        compute_readiness(&checks),
+        "the answer a caller reads has to be the answer the checks compute"
+    );
+    if !ready {
+        assert!(
+            checks.iter().any(|check| {
+                ESSENTIAL_CHECKS.contains(&check.name.as_str()) && check.status != "pass"
+            }) || checks
+                .iter()
+                .any(|check| check.name == "network" && check.status == "fail"),
+            "a refusal has to point at a specific blocking check"
+        );
+    }
+}
+
+/// "unavailable" is the vocabulary's offline status. Reading a probe that never
+/// ran as a TLS failure would send the reader chasing certificates.
+#[test]
+fn an_unrunnable_network_probe_stays_out_of_the_blocking_vocabulary() {
+    let output = ProcessOutput {
+        exit_code: 6,
+        stdout: String::new(),
+        stderr: "curl: (6) Could not resolve host: archlinux.org".to_string(),
+    };
+    let offline = evaluate_network_probe_result(Ok(&output), DEFAULT_NETWORK_ENDPOINT);
+    assert_eq!(offline.status, "unavailable");
+
+    let never_ran = evaluate_network_probe_result(
+        Err("Failed to spawn process 'curl': No such file or directory (os error 2)"),
+        DEFAULT_NETWORK_ENDPOINT,
+    );
+    assert_eq!(never_ran.status, "unavailable", "{}", never_ran.message);
+
+    let mut checks = vec![offline, never_ran];
+    for name in ESSENTIAL_CHECKS {
+        checks.push(CheckResult {
+            name: name.to_string(),
+            status: "pass".to_string(),
+            message: "ok".to_string(),
+        });
+    }
+    assert!(
+        compute_readiness(&checks),
+        "an offline host, or a host with no curl, is still able to inspect and build locally"
+    );
 }

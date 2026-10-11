@@ -26,8 +26,8 @@ Rust library: discovery / config / inspection / recipe / planner / execution
           |
           +-- read-only pacman queries and public HTTPS metadata
           +-- data-only archive inspection (no foreign script execution)
-          +-- mkarchroot + systemd-nspawn + makepkg inside the root
-          +-- isolated runtime test
+          +-- unprivileged makepkg, clean-chroot fallback (mkarchroot + makechrootpkg)
+          +-- isolated runtime test (systemd-nspawn)
           +-- separately approved live installation
 ```
 
@@ -54,11 +54,11 @@ requirement and naturally gives each frontend a private, unprivileged session.
 It is a long-lived service process, not a new process per operation. There is no
 network listener, elevated service, or dependency on a GUI toolkit.
 
-`mkarchroot` with an explicit `systemd-nspawn` invocation was chosen over wrapping
-`pkgctl build`: all PKGBUILD evaluation is visibly inside the clean root, and the
-engine controls UID/network isolation and host mounts. The external Arch tools
-still supply the root bootstrap and packaging conventions. This is not a claim
-that every possible devtools/host configuration has been validated.
+`mkarchroot` with `makechrootpkg` was chosen over wrapping `pkgctl build` for the
+isolated path: PKGBUILD evaluation happens visibly inside a clean root and the
+external Arch tools supply the bootstrap and packaging conventions. That path is
+the **fallback**, not the default — see §6. This is not a claim that every
+possible devtools/host configuration has been validated.
 
 ## 3. Implemented surface
 
@@ -66,19 +66,23 @@ that every possible devtools/host configuration has been validated.
 | --- | --- |
 | `search <name>` | Ordered evidence table as structured JSON; exact/fuzzy matches distinguished |
 | `info <name>` | Same complete structured source/availability/recommendation report |
-| `inspect <file.deb\|file.rpm>` | Metadata, dependencies, scripts, desktop files, systemd units, ELF NEEDED names |
-| `build <url\|directory\|PKGBUILD>` | Snapshot/review, conservative recipe if needed, clean-root build, staged runtime testing |
+| `inspect <file.deb\|file.rpm>` | Metadata, dependencies, provided capabilities, scripts, desktop files, systemd units, and the ELF `DT_NEEDED` names the payload declares |
+| `build <url\|directory\|PKGBUILD>` | Snapshot/review, conservative recipe if needed, then an unprivileged `makepkg` with a clean-chroot fallback, then staged runtime testing |
 | `install <name\|file>` | Preference-aware discovery or native-artifact testing, then approved installation |
-| `test <package.pkg.tar.zst>` | Install/launch in disposable root; concrete pass/fail and diagnostic output |
+| `test <package.pkg.tar.zst>` | Unpack into a throwaway root, exec the entry binary in `systemd-nspawn`, and report the real exit code, stdout and stderr |
+| `uninstall <installed-package-name>` | Planned `pacman -Rns`; takes a name, never a path |
 | `config get [key]` | Read preferences without creating a config file |
 | `config set <key> <value>` | Planned, confirmed, atomic preference update |
-| `doctor` | Tooling, package prerequisites, namespaces, disk, compiler, HTTPS, keyring checks |
+| `doctor` | Host, tooling, package-prerequisite, namespace, disk, compiler and HTTPS checks |
 | `serve` | Versioned JSON-RPC service for any frontend |
+| `gui` (aliases `ui`, `--gui`, `--ui`) | Native GPUI desktop app over the same in-process engine |
 
 All mutating actions, including config changes and runtime tests, support
 `--dry-run` and `--yes`. Plans, reviews and outcomes are JSON documents on stdout;
-prompts go to stderr. `--json` is accepted explicitly but JSON is also the default.
-Use `jq`'s normal multiple-document input support for scripted output.
+prompts and the `--dry-run` note go to stderr, so a pipe carries JSON only. Output
+is JSON: there is no `--json` flag, and an unrecognized flag is a usage error
+(exit 2) rather than something silently ignored. `archbridge <command> --help`
+prints that one command's flags.
 
 Exit codes: `0` successful query/action/dry-run, `1` operational/test failure,
 `2` invalid CLI usage, `3` blocked plan or declined/missing consent.
@@ -148,6 +152,16 @@ The desktop app writes the value through the engine the moment it is picked, on
 either the Build or Settings page, so no build can run against a folder that only
 exists in unsaved UI state. A relative `output_dir` is rejected, and the copy is
 re-hashed against the bytes the build produced before it is offered for install.
+`repo.<name>` URLs also steer builds: `archbridge build <name>` builds the
+configured URL, and an HTTPS `.tar.gz`/`.tgz` URL on any host that appears in some
+`repo.*` value is downloaded (hash-reviewed) like a GitHub/GitLab archive. Hosts
+nobody configured, plain HTTP, URLs with credentials, and loopback/private/local
+addresses are refused before any request is made.
+`keep_jobs` is a boolean (default `false`). After every build, successful or not,
+the engine removes the job's sources, build trees and chroot from
+`.archbridge/jobs/<job>`, keeping the `PKGBUILD`, `build.log` and — when no
+`output_dir` published the package elsewhere — the built package the install plan
+needs. Set `keep_jobs` to `true` to keep the whole tree.
 Unknown keys/values and invalid config schemas fail rather than silently resetting
 preferences. Read-only operations and dry-runs do not initialize directories.
 
@@ -166,8 +180,9 @@ preferences. Read-only operations and dry-runs do not initialize directories.
 Unsupported or ambiguous layouts report **“unsupported build system, manual
 PKGBUILD required”**. Autotools is not misidentified as plain make. Library-only
 Cargo crates, Cargo workspaces, nested Go commands, web-only npm applications,
-Yarn Berry, multiple primary build systems, and symlink-containing source
-snapshots require manual handling. Declaring a manual PKGBUILD does not waive
+Yarn Berry, and multiple primary build systems require manual handling.
+Symlinks in a local source directory are archived when they stay inside the tree;
+absolute links and links that escape it are rejected. Declaring a manual PKGBUILD does not waive
 snapshot path-safety checks.
 
 Detection is not dependency inference. Supply `--dependency` for known Arch
@@ -190,22 +205,34 @@ flags are generated. Automatically generated debug split packages are disabled.
    a recipe if supported, and returns an immutable in-memory plan.
 2. The frontend displays the plan before consent. No disk staging happens yet.
 3. Execution creates a private `.archbridge/jobs/<id>` under the current working
-   directory and writes the approved input bytes there.
-4. `sudo -n mkarchroot` creates a new root containing base/base-devel/sudo.
-5. `systemd-nspawn` initializes an unprivileged builder and copies the reviewed
-   inputs through a read-only bind. No writable host mounts are supplied.
-6. `makepkg --syncdeps --noconfirm --cleanbuild --clean --force` executes **inside**
-   that root. It can obtain official dependencies; AUR dependency recursion is not
-   automated. Networking is available for build dependencies and source fetches.
-7. Bounded `.pkg.tar.zst` artifact bytes are retrieved without evaluating the
-   PKGBUILD on the host. The build root is removed.
-8. A new test plan reveals exact artifact hashes, metadata, native hooks and
-   launch argv. Review/confirm that stage too.
-9. Each artifact gets its own new test root and a native `pacman -U` there. Its
-   entry point launches as UID 65534 with no network, no host bind, and a 30-second
-   timeout. Failures report actual stage, exit code, stdout and stderr.
+   directory and writes the approved PKGBUILD and source bytes there.
+4. **First attempt — unprivileged host build**: `makepkg --force --clean` runs in
+   the job directory as the current user. No sudo, no chroot. If it produces a
+   `.pkg.tar.*` artifact, that artifact is the result and the build is over.
+5. **Fallback — clean chroot**, reached only when the native attempt produced no
+   package: `sudo -n mkarchroot -C /etc/pacman.conf <job>/chroot/root base
+   base-devel sudo`, then `sudo -n makechrootpkg -r <job>/chroot -- makepkg
+   --syncdeps --noconfirm --cleanbuild --clean --force`. It can obtain official
+   dependencies; AUR dependency recursion is not automated. Both phases are
+   appended to `<job>/build.log`, so the native failure is still readable after
+   the fallback runs.
+6. If neither path leaves a `.pkg.tar.*` file, the plan fails and says which
+   stages were attempted. A root that needs a password reports that it could not
+   be authorized rather than hanging.
+8. A test plan (`archbridge test <artifact>`) reveals the artifact's own file
+   list with per-file SHA-256 digests, and names the exact `/usr/...` path the
+   container will exec, resolved from that list. Review/confirm that stage too.
+9. Executing it unpacks the artifact into a fresh temporary root and launches the
+   entry point under `systemd-nspawn --private-users=pick --private-network
+   --user 65534` with a 30-second timeout. Failures report the actual exit code,
+   stdout and stderr. A root containing only the artifact has no dynamic loader,
+   so a dynamically linked binary is reported as an inconclusive test instead of
+   pretending the package is broken.
 10. `build` stops after testing. `install` offers a separate live installation
     plan only when **every** test passes, using exact tested bytes.
+11. `archbridge test` on its own stages the same container run: with `--dry-run`
+    it prints the plan and says nothing was executed; confirmed, it runs the
+    container and its exit code is the container's verdict.
 
 The frontend loops over returned `next_plan` values. `--yes` skips prompts, never
 plan display or mandatory tests. Any failure blocks the live-install transition.
@@ -240,17 +267,22 @@ from chroot enumeration. Later stages are displayed exactly before they execute.
 
 ## 7. Foreign-package inspection
 
-DEB control and payload archives are obtained with `dpkg-deb` tar-output modes.
-RPM metadata/dependency/scriptlet output is read using query-only `rpm` options;
-`bsdtar` transcodes the payload into a bounded in-memory tar stream. Archive
-members are not unpacked to attacker-chosen filesystem paths.
+Neither `dpkg-deb` nor `rpm` is required or invoked. `bsdtar` (libarchive) unpacks
+the DEB container and lists its `control.tar.*` / `data.tar.*` members; RPM
+metadata is decoded from the file's own lead and header regions by `src/rpm.rs`.
+Members are extracted only into a private temporary directory owned by the
+current user, and temporary files are removed automatically.
 
-The report includes metadata, dependency alternatives/version expressions,
-maintainer-script text, desktop files, systemd units, and ELF `DT_NEEDED` names.
-ELFs are copied into securely created, non-executable temporary files for
-`readelf --dynamic`; no `ldd`, ELF interpreter or package entry point is invoked.
-Temporary inspection files are removed automatically. ELF-analysis failures are
-reported, never silently interpreted as “no dependencies.”
+The report includes metadata, dependency version expressions, provided
+capabilities, maintainer-script and scriptlet text (with the interpreter rpm
+would use), desktop files, systemd units, and the ELF `DT_NEEDED` names of the
+payload's own objects. `src/elf.rs` reads those out of the binary's program and
+section tables in memory — ELF32/64, either byte order — with every offset and
+count validated against the file's length. No `ldd`, `readelf`, interpreter or
+package entry point is executed, and nothing from the package is loaded.
+Candidates are capped per package; a truncated or hostile object is refused by
+the parser and simply contributes no library names, while a package whose payload
+cannot be read is reported as such rather than as “no dependencies.”
 
 Script statuses distinguish readable shell text from unsupported/unparseable
 content; this is not a shell semantic analyzer. RPM query output preserves
@@ -262,10 +294,13 @@ per-script override policy and avoids implementing that out-of-scope behavior.
 
 ## 8. Doctor and privacy
 
-Doctor reports each required/optional executable, installed `base-devel`,
-`devtools`, and `archlinux-keyring`, namespace interfaces, free workspace disk
-(8 GiB minimum heuristic), compiler execution, HTTPS connectivity and a populated
-pacman keyring. It does not create a chroot or mutate keyrings. Kernel namespace
+Doctor reports whether this is an Arch Linux host at all (os-release plus the
+presence of `pacman` and `makepkg`), then each required executable, installed
+`base-devel`, `devtools`, `gcc`, the namespace sysctls, free workspace disk
+(2 GiB minimum), and HTTPS connectivity. `ready: false` exits 1 and names the
+blocking checks; an unreachable or unrunnable probe reads `unavailable` and does
+not by itself make the system unready. It does not create a chroot or mutate
+keyrings. Kernel namespace
 interfaces are a prerequisite check, not proof that the current VM permits all
 privileged nspawn operations. Full validation requires the acceptance builds.
 
@@ -288,7 +323,9 @@ Interrupted jobs may need manual cleanup; see the security/validation documents.
 | `src/archive.rs` | Bounded archive/local-source snapshotting and review manifests |
 | `src/recipe.rs` | Conservative build detection and PKGBUILD generation |
 | `src/inspect.rs` | Data-only DEB/RPM/ELF/native package inspection |
-| `src/build.rs` | Clean-root build, runtime smoke tests and staged artifacts |
+| `src/elf.rs` | Bounded, panic-free ELF header reader for `DT_NEEDED` |
+| `src/rpm.rs` | Bounded, panic-free RPM lead/header decoder for metadata, deps and scriptlets |
+| `src/build.rs` | Unprivileged makepkg, clean-chroot fallback, runtime smoke tests, staged artifacts |
 | `src/doctor.rs` | Read-only prerequisite diagnostics |
 | `src/process.rs` | Argument-vector process execution, timeouts and output limits |
 | `tests/core.rs` | Pure Rust policy/parser/recipe/planning regressions |

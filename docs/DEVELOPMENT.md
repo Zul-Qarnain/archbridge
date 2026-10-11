@@ -14,8 +14,10 @@ docs/                Public architecture, security, IPC, validation, and release
 
 - `src/discovery.rs`: source identity, availability, and recommendations.
 - `src/engine.rs`: plans, staged actions, confirmation, and execution invariants.
-- `src/inspect.rs`: data-only DEB/RPM inspection.
-- `src/build.rs`: clean-chroot build and isolated runtime testing.
+- `src/inspect.rs`: data-only DEB/RPM inspection; wires the two readers below.
+- `src/elf.rs`: bounded ELF header reader for `DT_NEEDED`; refuses hostile objects.
+- `src/rpm.rs`: bounded RPM lead/header decoder for metadata, deps and scriptlets.
+- `src/build.rs`: unprivileged makepkg with a clean-chroot fallback, plus isolated runtime testing.
 - `src/rpc.rs`: versioned frontend boundary.
 - `src/gui/`: native GPUI presentation, interactive panels, GPU rendering, and reactive view state.
 

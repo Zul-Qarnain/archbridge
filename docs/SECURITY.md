@@ -14,26 +14,41 @@ when you need a stronger isolation boundary against malicious code.
 
 ## Enforced design rules
 
-- No foreign-script executor exists. DEB scripts/RPM scriptlets are data only.
-  The unreviewed-script flag cannot override that Phase 1 rule.
-- No host `source PKGBUILD`, `makepkg`, `ldd`, shell interpolation of input names,
-  or execution of inspected ELF content.
+- No foreign-script executor exists. DEB maintainer scripts and RPM scriptlets are
+  data only, decoded from `control.tar.*` and the RPM header and displayed with
+  `executed: false`. There is no flag, RPC option or config key that turns
+  inspection into execution.
+- Nothing from a foreign package is ever run. `ldd`, `readelf` and `objdump` are
+  not invoked on payload files: `DT_NEEDED` is read from the object's own tables
+  by `src/elf.rs`, and an object that does not parse contributes nothing.
+- Names are passed as argument vectors, never interpolated into a shell command,
+  and no package-supplied string becomes a program to run.
+- **The reviewed PKGBUILD is a real exception.** `build` runs `makepkg` on the
+  host as the current user *first*, so whatever that script says can happen with
+  your user's privileges: `mkarchroot` isolation applies only if the native
+  attempt produces no package. Review the PKGBUILD in the plan's `reviews` before
+  consenting; it is shown there precisely so this is not a blind approval.
 - Source tar extraction is replaced with bounded in-memory regular-file parsing.
   Traversal, links, duplicate paths, devices, malformed UTF-8 paths and ambiguous
   source roots fail closed. Native control-file links and non-text install hooks
   are rejected.
 - Source files are snapshotted before review. Native package review and runtime
   installation use the same pinned bytes, not a second read of the original file.
+  A staged plan whose artifact changed on disk is executing bytes nobody reviewed,
+  so the plan names the digests it was staged with.
 - Plans have unguessable IDs, are held in one private RPC session, expire in ten
   minutes, are single-use and are invalidated by preference changes.
 - `sudo -n` cannot silently consume a password prompt from RPC stdin. Obtain sudo
   credentials separately; the service itself is not elevated.
-- `mkarchroot` creates a fresh root. `systemd-nspawn` explicitly uses private user
-  namespaces, ignores external `.nspawn` settings and supplies no writable host
-  bind mounts. No insecure namespace fallback is implemented.
-- Build commands run as an unprivileged chroot builder. Dependency resolution
-  can elevate inside the container, not onto the host. Review supplied PKGBUILDs
-  and all bundled text before permitting execution.
+- When the fallback runs, `mkarchroot` creates a fresh root from `base`,
+  `base-devel` and `sudo` under the job directory, and `makechrootpkg` builds in
+  it. Runtime smoke tests use `systemd-nspawn` with private user namespaces, no
+  network, UID 65534, a 30-second timeout and no writable host bind mounts. No
+  insecure namespace fallback is implemented.
+- The native attempt has no such isolation: it builds in the job directory as the
+  calling user. Only the chroot fallback confines the build, and only the fallback
+  needs `sudo -n`. A plan states which is which in its summary and warnings.
+  Dependency resolution can elevate inside the container, not onto the host.
 - Runtime launch uses UID 65534, a private network, a short timeout and a distinct
   root. Native install hooks run only after they have been included in a review
   plan; live hooks require a separately displayed installation stage.
@@ -65,13 +80,19 @@ private job directories and exclusive file creation, but does not defend against
 an attacker already controlling that same user account, system binaries, sudo
 policy or package-manager configuration.
 
-`readelf`, `dpkg-deb`, `rpm`, `bsdtar` and tar decompression still parse untrusted
-data and can themselves have vulnerabilities. Keep tools current and inspect
-hostile files in a VM. `readelf` uses non-executable temporary files; inspection
-is not an implementation of a full ELF loader or cross-distro dependency solver.
+`bsdtar` (libarchive) still parses untrusted archives, and it can itself have
+vulnerabilities: keep tools current and inspect hostile files in a VM. It is used
+only to list and unpack members — never to interpret a package. The ELF and RPM
+readers in `src/elf.rs` and `src/rpm.rs` are this crate's own, bounded parsers:
+they read tables, not programs, so they are not an implementation of a full ELF
+loader, a dependency solver, or rpm's transaction semantics. Candidate payload
+files are capped per inspection, extracted into a private temporary directory,
+and only regular files under that directory are opened; symlinks and other entry
+kinds are skipped rather than followed.
 
 Shell text classification is intentionally not a proof that a script is safe.
-RPM trigger output can remain a group of unreviewed scriptlets. No group or script
+RPM triggers (`%triggerin` and friends) are not decoded: the six scriptlet phases
+rpm runs per package are. No group or script
 can execute through Phase 1. Repository-search suggestions are not verified
 publisher identities. SHA-256 pins fetched bytes but does not authenticate the
 publisher of a source release or AppImage.

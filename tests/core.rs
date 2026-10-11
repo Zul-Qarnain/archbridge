@@ -111,6 +111,7 @@ fn test_recipe_cmake_detection() {
         dependencies: vec!["glibc".to_string()],
         entry_binary: Some("testpkg".to_string()),
         src_subdir: None,
+        architecture: None,
     };
 
     let pkgbuild = generate_pkgbuild(&sys, &params).unwrap();
@@ -153,10 +154,31 @@ fn imported_pkgbuild_extracts_payload_without_running_scripts() {
         dependencies: vec![],
         entry_binary: None,
         src_subdir: None,
+        // DEB spells the x86_64 architecture `amd64`.
+        architecture: Some("amd64".to_string()),
     };
     let pkgbuild = generate_pkgbuild(&BuildSystem::Imported, &params).unwrap();
     assert!(pkgbuild.contains("tar -xzf \"$srcdir/src.tar.gz\""));
+    assert!(
+        pkgbuild.contains("arch=('x86_64')"),
+        "the copied payload's own architecture has to be what the package claims: {pkgbuild}"
+    );
     assert!(!pkgbuild.contains("preinst"));
+    // Repackaging copies the files; nothing that could run a maintainer script
+    // is ever emitted into the script makepkg executes.
+    for forbidden in [
+        "install=",
+        "pkginstall",
+        "preinst",
+        "postinst",
+        "postrm",
+        "prerm",
+    ] {
+        assert!(
+            !pkgbuild.contains(forbidden),
+            "a generated PKGBUILD must not carry {forbidden}:\n{pkgbuild}"
+        );
+    }
 }
 
 fn archive_review(path: &str, content: Option<&str>) -> FileReview {
@@ -178,6 +200,7 @@ fn params_for(name: &str, version: &str) -> PkgbuildParams {
         dependencies: vec![],
         entry_binary: None,
         src_subdir: None,
+        architecture: None,
     }
 }
 
@@ -532,4 +555,265 @@ fn a_blocked_plan_is_never_staged_for_execution() {
     let err = engine.execute_plan(&plan.plan_id, true).unwrap_err();
     assert!(err.contains("no longer staged"), "got '{err}'");
     assert!(!reason.is_empty());
+}
+
+/// An engine whose sources are all switched off answers discovery without ever
+/// touching the network, which is what makes this path testable off Arch.
+fn offline_engine(temp: &TempDir) -> Engine {
+    let config_path = temp.path().join("config.json");
+    fs::write(
+        &config_path,
+        r#"{"official":false,"aur":false,"flatpak":false,"appimage":false,"upstream":false,"deb":false,"rpm":false}"#,
+    )
+    .expect("write config");
+    Engine::with_config_path(&config_path)
+}
+
+#[test]
+fn install_by_name_reports_discovery_not_a_path_error() {
+    // `install htop` used to fall through to prepare_build and answer
+    // "not a valid local path, PKGBUILD, or HTTPS URL" for input that was
+    // never meant to be a path.
+    let temp = TempDir::new().expect("tempdir");
+    let mut engine = offline_engine(&temp);
+    let err = engine
+        .prepare_install("htop")
+        .expect_err("an unresolvable name must not fabricate a plan");
+    assert!(
+        !err.contains("not a valid local path"),
+        "the old path-shaped message came back: {err}"
+    );
+    assert!(err.contains("htop"), "must name the target: {err}");
+    assert!(
+        err.contains("archbridge search htop"),
+        "must point at the discovery command: {err}"
+    );
+    assert!(
+        err.contains("archbridge install <file"),
+        "must offer installing a concrete artifact: {err}"
+    );
+}
+
+#[test]
+fn install_by_name_lists_every_source_answer() {
+    let temp = TempDir::new().expect("tempdir");
+    let mut engine = offline_engine(&temp);
+    let err = engine
+        .prepare_install("htop")
+        .expect_err("no source is enabled, so nothing resolves");
+    for source in ["official", "aur", "flatpak", "appimage", "upstream"] {
+        assert!(
+            err.contains(source),
+            "the decision for '{source}' must reach the user: {err}"
+        );
+    }
+    assert!(err.contains("disabled"), "the reason must be shown: {err}");
+}
+
+#[test]
+fn install_still_accepts_a_source_url_for_building() {
+    // Installing from a repository URL is a build-then-install path; it must not
+    // be swallowed by the new discovery error for bare names.
+    let temp = TempDir::new().expect("tempdir");
+    let mut engine = offline_engine(&temp);
+    let err = engine
+        .prepare_install("https://github.com/htop-dev/htop")
+        .expect_err("the source lookup is disabled in this engine");
+    assert!(
+        err.contains("Cannot prepare a build"),
+        "a URL must be routed to the build-then-install path, got: {err}"
+    );
+}
+
+/// Build a `.pkg.tar.gz` holding one launcher, with the same archive tool the
+/// inspector itself uses. Returns None on a host that lacks it, so the cases
+/// below skip rather than fail for the wrong reason.
+fn package_fixture(temp: &TempDir) -> Option<std::path::PathBuf> {
+    if std::process::Command::new("bsdtar")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("bsdtar is unavailable; skipping");
+        return None;
+    }
+    let stage = temp.path().join("stage");
+    fs::create_dir_all(stage.join("usr/bin")).expect("stage dirs");
+    fs::write(stage.join("usr/bin/demo"), "#!/bin/sh\necho demo 1.0\n").expect("write launcher");
+    fs::write(stage.join(".PKGINFO"), "pkgname = demo\npkgver = 1.0-1\n").expect("write PKGINFO");
+    let artifact = temp.path().join("demo-1.0-1-x86_64.pkg.tar.gz");
+    let status = std::process::Command::new("bsdtar")
+        .args([
+            "-czf",
+            artifact.to_str().expect("utf-8 temp path"),
+            "-C",
+            stage.to_str().expect("utf-8 stage path"),
+            ".",
+        ])
+        .status()
+        .expect("bsdtar must run");
+    assert!(status.success(), "could not build the package fixture");
+    Some(artifact)
+}
+
+#[test]
+fn a_test_plan_names_the_program_and_the_isolation_it_will_run_under() {
+    let temp = TempDir::new().unwrap();
+    let Some(artifact) = package_fixture(&temp) else {
+        return;
+    };
+    let mut engine = Engine::with_config_path(&temp.path().join("config.json"));
+    let plan = engine
+        .prepare_test(artifact.to_str().unwrap(), None, &[])
+        .expect("a package with a usr/bin launcher is testable");
+
+    assert_eq!(plan.action, "test");
+    assert!(
+        plan.summary.contains("/usr/bin/demo"),
+        "the plan has to name the path the container execs, not the archive: {}",
+        plan.summary
+    );
+    assert!(
+        plan.summary.contains("--private-users=pick")
+            && plan.summary.contains("--private-network")
+            && plan.summary.contains("65534"),
+        "the summary must state the isolation: {}",
+        plan.summary
+    );
+    assert!(
+        plan.summary.contains("--version"),
+        "the default argument is shown"
+    );
+    let step = &plan.steps[0];
+    assert_eq!(step.program, "systemd-nspawn");
+    assert_eq!(step.timeout_seconds, 30);
+    assert!(
+        plan.reviews
+            .iter()
+            .any(|review| review.path == "usr/bin/demo"),
+        "the reviewed file list is the artifact's own"
+    );
+}
+
+#[test]
+fn smoke_arguments_and_an_explicit_entry_reach_the_plan() {
+    let temp = TempDir::new().unwrap();
+    let Some(artifact) = package_fixture(&temp) else {
+        return;
+    };
+    let mut engine = Engine::with_config_path(&temp.path().join("config.json"));
+    let args = vec!["--help".to_string()];
+    let plan = engine
+        .prepare_test(artifact.to_str().unwrap(), Some("demo"), &args)
+        .expect("an explicit entry is honoured");
+    assert!(
+        plan.summary.contains("\"--help\""),
+        "--smoke-arg used to be accepted and then dropped: {}",
+        plan.summary
+    );
+    assert!(
+        !plan.summary.contains("--version"),
+        "the default is replaced"
+    );
+
+    let absent = engine
+        .prepare_test(
+            artifact.to_str().unwrap(),
+            Some("not-in-the-package"),
+            &args,
+        )
+        .expect_err("an entry the artifact does not ship cannot be staged");
+    assert!(absent.contains("is not part of"), "{absent}");
+}
+
+#[test]
+fn executing_a_staged_test_asks_the_container_instead_of_declaring_victory() {
+    let temp = TempDir::new().unwrap();
+    let Some(artifact) = package_fixture(&temp) else {
+        return;
+    };
+    let mut engine = Engine::with_config_path(&temp.path().join("config.json"));
+    let plan = engine
+        .prepare_test(artifact.to_str().unwrap(), None, &[])
+        .expect("staged");
+
+    // Unconfirmed plans are refused before anything runs.
+    let refused = engine
+        .execute_plan(&plan.plan_id, false)
+        .expect_err("confirmation is required");
+    assert!(refused.contains("confirmation"), "{refused}");
+
+    // The root holds this artifact alone, so there is no loader in it: the run
+    // is inconclusive, and the engine must say so instead of claiming a pass.
+    let result = engine
+        .execute_plan(&plan.plan_id, true)
+        .expect("the smoke test runs to a verdict");
+    assert!(!result.ok, "an untestable root must not report a pass");
+    assert!(
+        !result.message.contains("completed successfully"),
+        "the old message claimed a finished test that never started: {}",
+        result.message
+    );
+    let output = result.output.expect("the container's own report");
+    assert!(
+        output.contains("loader") || output.contains("systemd-nspawn"),
+        "the verdict has to carry why: {output}"
+    );
+    // Plans are single use: the same id is gone after the run.
+    assert!(!engine.pending_plans.contains_key(&plan.plan_id));
+}
+
+#[test]
+fn a_test_plan_refuses_an_artifact_that_is_not_there() {
+    let temp = TempDir::new().unwrap();
+    let mut engine = Engine::with_config_path(&temp.path().join("config.json"));
+    let missing = temp.path().join("ghost-1.0-1-x86_64.pkg.tar.zst");
+    let err = engine
+        .prepare_test(missing.to_str().unwrap(), None, &[])
+        .expect_err("there is nothing to test");
+    assert!(err.contains("is not a file"), "{err}");
+    assert!(
+        !engine
+            .pending_plans
+            .values()
+            .any(|(plan, ..)| plan.action == "test"),
+        "a refused prepare must not stage a plan"
+    );
+}
+
+#[test]
+fn a_build_plan_says_which_builder_and_isolation_it_will_use() {
+    let temp = TempDir::new().unwrap();
+    let source = temp.path().join("src");
+    fs::create_dir_all(source.join("src")).unwrap();
+    fs::write(
+        source.join("Cargo.toml"),
+        "[package]\nname = \"demo\"\nversion = \"1.0.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    fs::write(source.join("src/main.rs"), "fn main() {}\n").unwrap();
+    fs::write(source.join("Cargo.lock"), "version = 3\n").unwrap();
+
+    let mut engine = Engine::with_config_path(&temp.path().join("config.json"));
+    let plan = engine
+        .prepare_build(source.to_str().unwrap(), Some("demo"), None, None, &[], &[])
+        .unwrap();
+    let summary = plan.summary.to_lowercase();
+    assert!(
+        summary.contains("unprivileged") || summary.contains("native"),
+        "the summary must name the builder that runs first: {}",
+        plan.summary
+    );
+    assert!(
+        summary.contains("chroot"),
+        "and the isolation it falls back to: {}",
+        plan.summary
+    );
+    assert!(
+        plan.warnings
+            .iter()
+            .any(|warning| warning.contains("sudo") || warning.contains("administrator")),
+        "a plan that may escalate must warn about it: {:?}",
+        plan.warnings
+    );
 }
