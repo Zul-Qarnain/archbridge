@@ -279,6 +279,8 @@ SUBCOMMANDS:
 
 KEYS:
   official, aur, flatpak, appimage, upstream, deb, rpm   (boolean)
+  keep_jobs                             boolean; true keeps each build's working tree under
+                                        .archbridge/jobs (default false: removed after the build)
   output_dir                            absolute path, or empty for the job dir
   repo.<name>                           a named repository URL
 

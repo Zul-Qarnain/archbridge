@@ -16,6 +16,7 @@ const KNOWN_KEYS: &[&str] = &[
     "deb",
     "rpm",
     "repos",
+    "keep_jobs",
     "output_dir",
 ];
 
@@ -38,6 +39,11 @@ pub struct Config {
 
     #[serde(default)]
     pub repos: BTreeMap<String, String>,
+
+    /// Keep every build's working directory (`.archbridge/jobs/<job>`) instead
+    /// of removing the sources, build trees and chroot once the build ends.
+    #[serde(default)]
+    pub keep_jobs: bool,
 
     /// Where finished build artifacts are copied. Empty keeps the default: the
     /// per-job build directory. An absolute path only, so a build run from a
@@ -67,6 +73,7 @@ impl Default for Config {
             deb: true,
             rpm: true,
             repos: BTreeMap::new(),
+            keep_jobs: false,
             output_dir: String::new(),
             path: Self::config_path(),
         }
@@ -197,6 +204,7 @@ impl Config {
             "upstream" => Ok(serde_json::Value::Bool(self.upstream)),
             "deb" => Ok(serde_json::Value::Bool(self.deb)),
             "rpm" => Ok(serde_json::Value::Bool(self.rpm)),
+            "keep_jobs" => Ok(serde_json::Value::Bool(self.keep_jobs)),
             "output_dir" => Ok(serde_json::Value::String(self.output_dir.clone())),
             "all" => Ok(serde_json::to_value(self).unwrap_or_default()),
             k if k.starts_with("repo.") => {
@@ -232,6 +240,7 @@ impl Config {
             "upstream" => self.upstream = parse_bool(value)?,
             "deb" => self.deb = parse_bool(value)?,
             "rpm" => self.rpm = parse_bool(value)?,
+            "keep_jobs" => self.keep_jobs = parse_bool(value)?,
             "output_dir" => {
                 let dir = value.trim();
                 validate_output_dir(dir)?;

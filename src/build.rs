@@ -343,6 +343,59 @@ fn find_built_package(dir: &Path) -> Option<PathBuf> {
         .map(|(_, path)| fs::canonicalize(&path).unwrap_or(path))
 }
 
+/// Remove what a finished build left in its job directory.
+///
+/// Every build writes the source tarball, a `src/`+`pkg/` tree and (for the
+/// fallback) a whole `chroot/` into `.archbridge/jobs/<job>`. Nothing ever
+/// removed them, so each build leaked hundreds of megabytes. What survives is
+/// what a person can still use: the `PKGBUILD`, `build.log`, and — when no
+/// output directory published the package elsewhere — the built `.pkg.tar.*`
+/// files the install plan points at.
+///
+/// Refuses any directory that is not `<anything>/.archbridge/jobs/<job>`, so a
+/// wrong argument can never delete a project. Returns the paths that could not
+/// be removed (a chroot populated by `sudo` may contain root-owned files).
+pub fn clean_job_dir(job_dir: &Path, keep_artifacts: bool) -> Vec<String> {
+    let is_job_dir = job_dir
+        .parent()
+        .is_some_and(|jobs| jobs.file_name().is_some_and(|name| name == "jobs"))
+        && job_dir
+            .parent()
+            .and_then(Path::parent)
+            .is_some_and(|root| root.file_name().is_some_and(|name| name == ".archbridge"));
+    if !is_job_dir {
+        return vec![format!(
+            "{}: not a .archbridge/jobs/<job> directory, left alone",
+            job_dir.display()
+        )];
+    }
+    let Ok(entries) = fs::read_dir(job_dir) else {
+        return Vec::new();
+    };
+    let mut leftovers = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().to_string();
+        let keep = name == "PKGBUILD"
+            || name == "build.log"
+            || (keep_artifacts && name.contains(".pkg.tar."));
+        if keep {
+            continue;
+        }
+        // `symlink_metadata`: a link is removed as a link, never followed into
+        // whatever it points at.
+        let removal = match fs::symlink_metadata(&path) {
+            Ok(meta) if meta.is_dir() => fs::remove_dir_all(&path),
+            Ok(_) => fs::remove_file(&path),
+            Err(error) => Err(error),
+        };
+        if let Err(error) = removal {
+            leftovers.push(format!("{}: {error}", path.display()));
+        }
+    }
+    leftovers
+}
+
 pub fn execute_chroot_build(
     job_dir: &Path,
     pkgbuild_content: &str,

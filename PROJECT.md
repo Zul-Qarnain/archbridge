@@ -152,6 +152,11 @@ The desktop app writes the value through the engine the moment it is picked, on
 either the Build or Settings page, so no build can run against a folder that only
 exists in unsaved UI state. A relative `output_dir` is rejected, and the copy is
 re-hashed against the bytes the build produced before it is offered for install.
+`keep_jobs` is a boolean (default `false`). After every build, successful or not,
+the engine removes the job's sources, build trees and chroot from
+`.archbridge/jobs/<job>`, keeping the `PKGBUILD`, `build.log` and — when no
+`output_dir` published the package elsewhere — the built package the install plan
+needs. Set `keep_jobs` to `true` to keep the whole tree.
 Unknown keys/values and invalid config schemas fail rather than silently resetting
 preferences. Read-only operations and dry-runs do not initialize directories.
 

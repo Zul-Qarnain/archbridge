@@ -430,3 +430,17 @@ fn a_missing_file_is_not_an_error() {
     assert!(config.aur);
     assert_eq!(config.path, path.to_path_buf());
 }
+
+#[test]
+fn keep_jobs_is_a_boolean_preference_that_defaults_to_cleaning_up() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.json");
+    let mut config = Config::load_from(&path).unwrap();
+    assert!(!config.keep_jobs, "cleanup is the default");
+    assert_eq!(config.get("keep_jobs").unwrap(), serde_json::json!(false));
+    config.set("keep_jobs", " Yes ").unwrap();
+    assert!(config.keep_jobs);
+    config.save().unwrap();
+    assert!(Config::load_from(&path).unwrap().keep_jobs);
+    assert!(config.set("keep_jobs", "maybe").is_err());
+}

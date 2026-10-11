@@ -1,6 +1,6 @@
 use crate::archive::{snapshot_directory, snapshot_tarball_bytes, FileReview};
 use crate::build::{
-    execute_chroot_build, package_files, resolve_entry, run_runtime_smoke_test,
+    clean_job_dir, execute_chroot_build, package_files, resolve_entry, run_runtime_smoke_test,
     snapshot_foreign_package, SmokeTestReport,
 };
 use crate::config::Config;
@@ -1358,95 +1358,22 @@ impl Engine {
                 })
             }
             "build" => {
-                if let Some(StagedAction::Build(staged)) = staged_opt {
-                    let job_dir = PathBuf::from(".archbridge")
-                        .join("jobs")
-                        .join(&staged.job_id);
-                    let art_path =
-                        execute_chroot_build(&job_dir, &staged.pkgbuild, &staged.source_tarball)?;
-                    // The install plan shells out to `pacman -U` in a later RPC, and the
-                    // job directory is recorded relative to the CWD that built it. Store
-                    // the absolute path so the install works from any working directory.
-                    let art_path = match art_path.canonicalize() {
-                        Ok(absolute) => absolute,
-                        Err(_) => art_path,
-                    };
-                    let art_path =
-                        publish_artifact(&art_path, &self.config.output_dir).map_err(|e| {
-                            format!("{e}; the build itself succeeded at {}", art_path.display())
-                        })?;
-
-                    if staged.run_smoke_test {
-                        bump_phase_total(1);
-                        let smoke_res: SmokeTestReport =
-                            run_runtime_smoke_test(&art_path, &staged.entry, &staged.smoke_args)?;
-                        if !smoke_res.passed {
-                            return Ok(ExecutionResult {
-                                ok: false,
-                                plan_id: plan_id.to_string(),
-                                message: format!(
-                                    "Runtime smoke test failed for entry '{}': {}",
-                                    staged.entry, smoke_res.stderr
-                                ),
-                                output: Some(format!(
-                                    "Exit code: {}\nStdout: {}\nStderr: {}",
-                                    smoke_res.exit_code, smoke_res.stdout, smoke_res.stderr
-                                )),
-                                next_plan: None,
-                            });
-                        }
-                    }
-
-                    // Create next_plan for install
-                    let install_plan_id = generate_plan_id("install", &staged.target);
-                    let next_plan = Plan {
-                        protocol_version: "v1.0".to_string(),
-                        plan_id: install_plan_id.clone(),
-                        action: "install".to_string(),
-                        summary: format!("Install built package '{}'", art_path.display()),
-                        steps: vec![Step::new(
-                            "sudo",
-                            vec![
-                                "-n".to_string(),
-                                "pacman".to_string(),
-                                "-U".to_string(),
-                                "--noconfirm".to_string(),
-                                art_path.to_string_lossy().to_string(),
-                            ],
-                            "Install package to host",
-                            120,
-                        )],
-                        filesystem_changes: vec![FilesystemChange {
-                            path: "/".to_string(),
-                            action: "modify".to_string(),
-                            description: format!(
-                                "Install package '{}' to host system",
-                                art_path.display()
-                            ),
-                        }],
-                        reviews: vec![],
-                        warnings: vec!["Modifies system packages on host".to_string()],
-                        decision: None,
-                        downstream: None,
-                        blocked: None,
-                    };
-
-                    self.stage_plan(next_plan.clone(), None);
-
-                    Ok(ExecutionResult {
-                        ok: true,
-                        plan_id: plan_id.to_string(),
-                        message: if staged.run_smoke_test {
-                            format!("Build and smoke test passed for '{}'", art_path.display())
-                        } else {
-                            format!("Package repackaged successfully at {}", art_path.display())
-                        },
-                        output: Some(format!("Artifact produced at {}", art_path.display())),
-                        next_plan: Some(next_plan),
-                    })
-                } else {
-                    Err("Staged build data missing".to_string())
+                let Some(StagedAction::Build(staged)) = staged_opt else {
+                    return Err("Staged build data missing".to_string());
+                };
+                let job_dir = PathBuf::from(".archbridge")
+                    .join("jobs")
+                    .join(&staged.job_id);
+                let outcome = self.run_staged_build(plan_id, &staged, &job_dir);
+                // Success or failure, the working tree (sources, chroot, build
+                // trees) is dead weight once the build has ended; only the
+                // artifact still needed for the install plan, the PKGBUILD and
+                // the log stay, unless the user asked to keep everything.
+                if !self.config.keep_jobs {
+                    let keep_artifacts = self.config.output_dir.trim().is_empty();
+                    let _ = clean_job_dir(&job_dir, keep_artifacts);
                 }
+                outcome
             }
             "install" | "uninstall" => {
                 let mut last_out = String::new();
@@ -1510,6 +1437,93 @@ impl Engine {
             }
             _ => Err(format!("Unknown action '{}'", plan.action)),
         }
+    }
+
+    /// Build the staged job and, when it passes, stage the install plan that
+    /// follows it. Cleanup of the job directory is the caller's job so that it
+    /// runs on every exit path, including the `?` returns in here.
+    fn run_staged_build(
+        &mut self,
+        plan_id: &str,
+        staged: &StagedBuild,
+        job_dir: &Path,
+    ) -> Result<ExecutionResult, String> {
+        let art_path = execute_chroot_build(job_dir, &staged.pkgbuild, &staged.source_tarball)?;
+        // The install plan shells out to `pacman -U` in a later RPC, and the
+        // job directory is recorded relative to the CWD that built it. Store
+        // the absolute path so the install works from any working directory.
+        let art_path = match art_path.canonicalize() {
+            Ok(absolute) => absolute,
+            Err(_) => art_path,
+        };
+        let art_path = publish_artifact(&art_path, &self.config.output_dir)
+            .map_err(|e| format!("{e}; the build itself succeeded at {}", art_path.display()))?;
+
+        if staged.run_smoke_test {
+            bump_phase_total(1);
+            let smoke_res: SmokeTestReport =
+                run_runtime_smoke_test(&art_path, &staged.entry, &staged.smoke_args)?;
+            if !smoke_res.passed {
+                return Ok(ExecutionResult {
+                    ok: false,
+                    plan_id: plan_id.to_string(),
+                    message: format!(
+                        "Runtime smoke test failed for entry '{}': {}",
+                        staged.entry, smoke_res.stderr
+                    ),
+                    output: Some(format!(
+                        "Exit code: {}\nStdout: {}\nStderr: {}",
+                        smoke_res.exit_code, smoke_res.stdout, smoke_res.stderr
+                    )),
+                    next_plan: None,
+                });
+            }
+        }
+
+        // Create next_plan for install
+        let install_plan_id = generate_plan_id("install", &staged.target);
+        let next_plan = Plan {
+            protocol_version: "v1.0".to_string(),
+            plan_id: install_plan_id.clone(),
+            action: "install".to_string(),
+            summary: format!("Install built package '{}'", art_path.display()),
+            steps: vec![Step::new(
+                "sudo",
+                vec![
+                    "-n".to_string(),
+                    "pacman".to_string(),
+                    "-U".to_string(),
+                    "--noconfirm".to_string(),
+                    art_path.to_string_lossy().to_string(),
+                ],
+                "Install package to host",
+                120,
+            )],
+            filesystem_changes: vec![FilesystemChange {
+                path: "/".to_string(),
+                action: "modify".to_string(),
+                description: format!("Install package '{}' to host system", art_path.display()),
+            }],
+            reviews: vec![],
+            warnings: vec!["Modifies system packages on host".to_string()],
+            decision: None,
+            downstream: None,
+            blocked: None,
+        };
+
+        self.stage_plan(next_plan.clone(), None);
+
+        Ok(ExecutionResult {
+            ok: true,
+            plan_id: plan_id.to_string(),
+            message: if staged.run_smoke_test {
+                format!("Build and smoke test passed for '{}'", art_path.display())
+            } else {
+                format!("Package repackaged successfully at {}", art_path.display())
+            },
+            output: Some(format!("Artifact produced at {}", art_path.display())),
+            next_plan: Some(next_plan),
+        })
     }
 }
 
