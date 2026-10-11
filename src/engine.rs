@@ -1,6 +1,7 @@
 use crate::archive::{snapshot_directory, snapshot_tarball_bytes, FileReview};
 use crate::build::{
-    execute_chroot_build, run_runtime_smoke_test, snapshot_foreign_package, SmokeTestReport,
+    execute_chroot_build, package_files, resolve_entry, run_runtime_smoke_test,
+    snapshot_foreign_package, SmokeTestReport,
 };
 use crate::config::Config;
 use crate::discovery::{search, DecisionReport};
@@ -73,9 +74,25 @@ pub struct StagedBuild {
     pub artifact_path: Option<PathBuf>,
 }
 
+/// What a staged `test` plan will really run: the artifact that was reviewed,
+/// the entry binary resolved out of its own file list, and the arguments the
+/// user passed. Without this the execution step would have nothing to run.
+pub struct StagedTest {
+    pub artifact: PathBuf,
+    pub entry: String,
+    pub smoke_args: Vec<String>,
+}
+
+/// The work a staged plan carries past the review, kept out of the JSON a user
+/// confirms so the plan stays a description rather than a closure.
+pub enum StagedAction {
+    Build(StagedBuild),
+    Test(StagedTest),
+}
+
 pub struct Engine {
     pub config: Config,
-    pub pending_plans: HashMap<String, (Plan, Instant, Option<StagedBuild>)>,
+    pub pending_plans: HashMap<String, (Plan, Instant, Option<StagedAction>)>,
 }
 
 impl Default for Engine {
@@ -357,7 +374,7 @@ impl Engine {
     /// Stage a plan so it becomes executable, dropping any plan whose review
     /// window has already closed. A daemon can serve searches for days; without
     /// this the pending store grows without bound and keeps stale consent alive.
-    fn stage_plan(&mut self, plan: Plan, staged: Option<StagedBuild>) -> Plan {
+    fn stage_plan(&mut self, plan: Plan, staged: Option<StagedAction>) -> Plan {
         self.purge_expired();
         self.pending_plans
             .insert(plan.plan_id.clone(), (plan.clone(), Instant::now(), staged));
@@ -796,7 +813,7 @@ impl Engine {
             blocked: None,
         };
 
-        let staged = StagedBuild {
+        let staged = StagedAction::Build(StagedBuild {
             job_id,
             target: target.to_string(),
             pkgbuild,
@@ -805,7 +822,7 @@ impl Engine {
             smoke_args: smoke_args.to_vec(),
             run_smoke_test,
             artifact_path: None,
-        };
+        });
 
         let plan = self.stage_plan(plan, Some(staged));
         Ok(plan)
@@ -940,32 +957,73 @@ impl Engine {
         Ok(plan)
     }
 
+    /// Stage a runtime smoke test. The plan names the exact program the
+    /// container will exec, resolved from the artifact's own file list, and
+    /// executing it really starts the container: a plan that only described a
+    /// test the user could never see run is worse than no test at all.
     pub fn prepare_test(
         &mut self,
         pkg_path: &str,
         entry_opt: Option<&str>,
-        _smoke_args: &[String],
+        smoke_args: &[String],
     ) -> Result<Plan, String> {
-        let entry = entry_opt.unwrap_or_else(|| {
-            if let Some(pos) = pkg_path.rfind('/') {
-                &pkg_path[pos + 1..]
-            } else {
+        let artifact = Path::new(pkg_path);
+        if !artifact.is_file() {
+            return Err(format!(
+                "There is no package artifact to test at '{}'",
                 pkg_path
+            ));
+        }
+        let bytes =
+            fs::read(artifact).map_err(|e| format!("Failed to read '{}': {e}", pkg_path))?;
+        let reviews = package_files(&bytes)?;
+
+        let entry = match entry_opt {
+            Some(name) => name.to_string(),
+            None => {
+                let preferred = artifact
+                    .file_name()
+                    .map(|name| name.to_string_lossy().to_lowercase())
+                    .unwrap_or_default();
+                let preferred = preferred.split('-').next().unwrap_or("");
+                foreign_entry(&reviews, preferred).ok_or_else(|| {
+                    let shipped: Vec<&str> = reviews
+                        .iter()
+                        .filter(|review| review.path.starts_with("usr/bin/"))
+                        .map(|review| review.path.as_str())
+                        .take(8)
+                        .collect();
+                    format!(
+                        "'{}' ships no runnable usr/bin entry ({:?}); pass --entry <binary>",
+                        pkg_path, shipped
+                    )
+                })?
             }
-        });
+        };
+        let program = resolve_entry(&reviews, &entry)?;
+
+        let mut container_args = vec![
+            "--private-users=pick".to_string(),
+            "--private-network".to_string(),
+            "--user".to_string(),
+            "65534".to_string(),
+            "-D".to_string(),
+            "<throwaway root unpacked from this artifact>".to_string(),
+            program.clone(),
+        ];
+        if smoke_args.is_empty() {
+            container_args.push("--version".to_string());
+        } else {
+            container_args.extend(smoke_args.iter().cloned());
+        }
 
         let plan_id = generate_plan_id("test", pkg_path);
         let steps = vec![Step::new(
             "systemd-nspawn",
-            vec![
-                "--private-users=pick",
-                "--private-network",
-                "--user",
-                "65534",
-                "-D",
-                "/tmp/disposable_test_root",
-                entry,
-            ],
+            container_args
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
             "Execute runtime smoke test",
             30,
         )];
@@ -975,19 +1033,52 @@ impl Engine {
             plan_id: plan_id.clone(),
             action: "test".to_string(),
             summary: format!(
-                "Test package artifact '{}' with entry binary '{}'",
-                pkg_path, entry
+                "Smoke test '{}' from '{}': unpack the artifact into a throwaway root, then exec \
+                 {} with {:?} inside systemd-nspawn ({}) as UID 65534 with a 30 second timeout",
+                entry,
+                pkg_path,
+                program,
+                if smoke_args.is_empty() {
+                    vec!["--version".to_string()]
+                } else {
+                    smoke_args.to_vec()
+                },
+                "--private-users=pick --private-network --user 65534"
             ),
             steps,
-            filesystem_changes: vec![],
-            reviews: vec![],
-            warnings: vec!["Runs package binary in isolated container".to_string()],
+            filesystem_changes: vec![FilesystemChange {
+                path: std::env::temp_dir().to_string_lossy().to_string(),
+                action: "create".to_string(),
+                description: format!(
+                    "Unpack '{}' into a temporary root that is discarded when the test ends; the \
+                     live system is not written to",
+                    pkg_path
+                ),
+            }],
+            reviews,
+            warnings: vec![
+                "The container has no network, no host bind mounts and no privileged user; the \
+                 artifact is the only thing inside the root"
+                    .to_string(),
+                "A dynamically linked binary needs a loader and system libraries that a root \
+                 holding only this artifact does not have; that case is reported as an \
+                 inconclusive test rather than a package failure"
+                    .to_string(),
+            ],
             decision: None,
-            downstream: None,
+            downstream: Some(
+                "A passing smoke test does not install anything; install is a separate plan."
+                    .to_string(),
+            ),
             blocked: None,
         };
 
-        let plan = self.stage_plan(plan, None);
+        let staged = StagedAction::Test(StagedTest {
+            artifact: fs::canonicalize(artifact).unwrap_or_else(|_| artifact.to_path_buf()),
+            entry,
+            smoke_args: smoke_args.to_vec(),
+        });
+        let plan = self.stage_plan(plan, Some(staged));
         Ok(plan)
     }
 
@@ -1027,6 +1118,7 @@ impl Engine {
         // count if the chroot fallback is needed.
         let total_steps = match plan.action.as_str() {
             "build" => 1,
+            "test" => 1,
             "install" | "uninstall" => plan.steps.len(),
             _ => 0,
         };
@@ -1034,6 +1126,7 @@ impl Engine {
             "build" => "Building package",
             "install" => "Installing package",
             "uninstall" => "Uninstalling package",
+            "test" => "Running smoke test",
             other => other,
         };
         begin_phase(label, total_steps);
@@ -1046,7 +1139,7 @@ impl Engine {
         &mut self,
         plan_id: &str,
         plan: Plan,
-        staged_opt: Option<StagedBuild>,
+        staged_opt: Option<StagedAction>,
     ) -> Result<ExecutionResult, String> {
         // Privileged plans can run for many minutes; refresh the cached sudo
         // timestamp in the background so later `sudo -n` steps keep working.
@@ -1066,8 +1159,15 @@ impl Engine {
             "inspect" => Ok(ExecutionResult {
                 ok: true,
                 plan_id: plan_id.to_string(),
-                message: "Inspection completed successfully".to_string(),
-                output: Some("Package inspected. Maintainer scripts unexecuted.".to_string()),
+                message:
+                    "Inspection needed no execution: the report was produced when the plan was \
+                     staged"
+                        .to_string(),
+                output: Some(
+                    "Foreign package parsed at prepare time. Maintainer scripts and scriptlets \
+                     were read as text and never executed."
+                        .to_string(),
+                ),
                 next_plan: None,
             }),
             "config.set" => {
@@ -1096,7 +1196,7 @@ impl Engine {
                 })
             }
             "build" => {
-                if let Some(staged) = staged_opt {
+                if let Some(StagedAction::Build(staged)) = staged_opt {
                     let job_dir = PathBuf::from(".archbridge")
                         .join("jobs")
                         .join(&staged.job_id);
@@ -1216,13 +1316,36 @@ impl Engine {
                     next_plan: None,
                 })
             }
-            "test" => Ok(ExecutionResult {
-                ok: true,
-                plan_id: plan_id.to_string(),
-                message: "Test execution completed".to_string(),
-                output: None,
-                next_plan: None,
-            }),
+            "test" => {
+                let staged = match staged_opt {
+                    Some(StagedAction::Test(staged)) => staged,
+                    Some(StagedAction::Build(_)) => {
+                        return Err(
+                            "Plan carries build data but was staged as a smoke test".to_string()
+                        )
+                    }
+                    None => return Err("Staged smoke-test data missing".to_string()),
+                };
+                let report =
+                    run_runtime_smoke_test(&staged.artifact, &staged.entry, &staged.smoke_args)?;
+                Ok(ExecutionResult {
+                    ok: report.passed,
+                    plan_id: plan_id.to_string(),
+                    message: if report.passed {
+                        format!("Runtime smoke test passed: {} exited 0", report.entry_point)
+                    } else {
+                        format!(
+                            "Runtime smoke test did not pass: {} exited {}",
+                            report.entry_point, report.exit_code
+                        )
+                    },
+                    output: Some(format!(
+                        "Program: {}\nExit code: {}\nStdout: {}\nStderr: {}",
+                        report.entry_point, report.exit_code, report.stdout, report.stderr
+                    )),
+                    next_plan: None,
+                })
+            }
             _ => Err(format!("Unknown action '{}'", plan.action)),
         }
     }
