@@ -1,8 +1,8 @@
 <div align="center">
 <a id="top"></a>
-<img src="assets/archbridge.svg" alt="The ArchBridge logo." width="140">
+<img src="assets/banner.png" alt="ArchBridge: the safest way to install anything on Arch Linux." width="100%">
 
-<h1>ArchBridge</h1>
+<h1 hidden>ArchBridge</h1>
 
 [![CI](https://github.com/Zul-Qarnain/archbridge/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Zul-Qarnain/archbridge/actions/workflows/ci.yml)
 ![Version](https://img.shields.io/badge/version-0.5.0--dev-informational?style=flat-square)
@@ -15,8 +15,6 @@
 ![GPUI](https://img.shields.io/badge/desktop-GPUI-6f42c1?style=flat-square)
 ![JSON-RPC](https://img.shields.io/badge/IPC-JSON--RPC%202.0-f5a524?style=flat-square)
 ![Status](https://img.shields.io/badge/status-pre--release-red?style=flat-square)
-
-<!-- TODO: replace the logo above with a real banner image, e.g. assets/banner.png -->
 
 **ArchBridge finds the safest way to install a piece of software on Arch Linux — then shows you every command, hash and PKGBUILD it intends to run, and does nothing until you say yes.**
 
