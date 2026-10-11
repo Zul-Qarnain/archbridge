@@ -1,7 +1,96 @@
 use crate::config::Config;
-use crate::process::{run_step, Step};
+use crate::process::{run_step, ProcessOutput, Step};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+
+/// Everything discovery does to the outside world goes through a probe, so a
+/// test can hand back canned pacman/AUR/GitHub output instead of running a
+/// program or reaching the network.
+pub trait Probe {
+    fn query(&self, step: &Step) -> Result<ProcessOutput, String>;
+}
+
+/// The production probe: run the step as a bounded child process.
+pub struct ProcessProbe;
+
+impl Probe for ProcessProbe {
+    fn query(&self, step: &Step) -> Result<ProcessOutput, String> {
+        run_step(step, None)
+    }
+}
+
+/// Longest display string taken from a foreign source. A description is read by
+/// a human in a review, not stored as data.
+const DISPLAY_BYTES: usize = 512;
+const URL_BYTES: usize = 2048;
+/// Candidate cap per source: enough to choose from, far below what a hostile
+/// mirror can return in one response.
+const MAX_CANDIDATES: usize = 25;
+
+/// A search target is also a command argument and a URL segment, so it has a
+/// ceiling of its own.
+fn valid_target(target: &str) -> bool {
+    let trimmed = target.trim();
+    !trimmed.is_empty()
+        && trimmed.len() <= 256
+        && !trimmed.contains('\0')
+        && !trimmed.chars().any(char::is_control)
+}
+
+/// Strip what a terminal would act on and what no reviewer can read: control
+/// sequences, and text longer than a screen.
+fn sanitize_display(value: &str) -> String {
+    let mut out = String::with_capacity(value.len().min(DISPLAY_BYTES));
+    for ch in value.chars() {
+        if ch.is_control() {
+            continue;
+        }
+        if out.chars().count() >= DISPLAY_BYTES {
+            out.push_str("...");
+            break;
+        }
+        out.push(ch);
+    }
+    out.trim().to_string()
+}
+
+fn sanitize_opt(value: Option<&str>) -> Option<String> {
+    let cleaned = value.map(sanitize_display).unwrap_or_default();
+    (!cleaned.is_empty()).then_some(cleaned)
+}
+
+/// A URL a candidate offers must be fetchable and unambiguous: http(s) only,
+/// no control characters, no embedded whitespace that would split an argument.
+fn sanitize_url(value: Option<&str>) -> Option<String> {
+    let raw = value?.trim();
+    if raw.is_empty() || raw.len() > URL_BYTES {
+        return None;
+    }
+    if raw.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return None;
+    }
+    let (scheme, rest) = raw.split_once("://")?;
+    if !matches!(scheme.to_ascii_lowercase().as_str(), "http" | "https") {
+        return None;
+    }
+    if rest.is_empty() {
+        return None;
+    }
+    Some(raw.to_string())
+}
+
+/// A package name that will be used to build a request path or a pacman
+/// selector. Anything outside the package-name alphabet is data, not a name.
+fn is_package_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 128
+        && !name.contains("..")
+        && name != "."
+        && !name.starts_with('.')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '+' | '-' | '@'))
+}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Candidate {
@@ -47,17 +136,52 @@ pub struct DecisionReport {
 }
 
 pub fn search(target: &str, explicit_repo: Option<&str>, config: &Config) -> DecisionReport {
+    search_with(target, explicit_repo, config, &ProcessProbe)
+}
+
+pub fn search_with(
+    target: &str,
+    explicit_repo: Option<&str>,
+    config: &Config,
+    probe: &dyn Probe,
+) -> DecisionReport {
     let sources = [
         "official", "aur", "flatpak", "appimage", "upstream", "deb", "rpm",
     ];
     let mut rows = Vec::new();
+
+    // An empty or control-character target is not a query: `pacman -Ss ""` and
+    // `?q=` style searches return the whole universe, which is a data dump and a
+    // great deal of needless work.
+    if !valid_target(target) {
+        return DecisionReport {
+            target: target.to_string(),
+            recommended_source: None,
+            decision_table: sources
+                .iter()
+                .map(|source| DecisionRow {
+                    source: source.to_string(),
+                    availability: "unavailable".to_string(),
+                    recommended: false,
+                    reason: if target.trim().is_empty() {
+                        "No search target was given".to_string()
+                    } else {
+                        "The search target contains characters that cannot be queried".to_string()
+                    },
+                    candidates: vec![],
+                })
+                .collect(),
+        };
+    }
+    let target = target.trim();
 
     let is_deb_file = target.ends_with(".deb") && Path::new(target).exists();
     let is_rpm_file = target.ends_with(".rpm") && Path::new(target).exists();
 
     // Determine repository URL if available
     let repo_url = explicit_repo
-        .map(|s| s.to_string())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
         .or_else(|| config.repos.get(target).cloned());
 
     for source in sources {
@@ -77,23 +201,23 @@ pub fn search(target: &str, explicit_repo: Option<&str>, config: &Config) -> Dec
 
         match source {
             "official" => {
-                let row = query_official(target);
+                let row = query_official(target, probe);
                 rows.push(row);
             }
             "aur" => {
-                let row = query_aur(target);
+                let row = query_aur(target, probe);
                 rows.push(row);
             }
             "flatpak" => {
-                let row = query_release_asset(target, repo_url.as_deref(), "flatpak");
+                let row = query_release_asset(target, repo_url.as_deref(), "flatpak", probe);
                 rows.push(row);
             }
             "appimage" => {
-                let row = query_release_asset(target, repo_url.as_deref(), "appimage");
+                let row = query_release_asset(target, repo_url.as_deref(), "appimage", probe);
                 rows.push(row);
             }
             "upstream" => {
-                let row = query_upstream_source(target, repo_url.as_deref());
+                let row = query_upstream_source(target, repo_url.as_deref(), probe);
                 rows.push(row);
             }
             "deb" => {
@@ -162,9 +286,14 @@ pub fn search(target: &str, explicit_repo: Option<&str>, config: &Config) -> Dec
         }
     }
 
-    // Determine recommendation: first available source in preference order
+    // Determine recommendation: first available source in preference order.
+    // DEB and RPM are data-only formats that are never installed, so an available
+    // foreign file must not become the recommended action.
     let mut recommended_source = None;
     for row in &mut rows {
+        if matches!(row.source.as_str(), "deb" | "rpm") {
+            continue;
+        }
         if row.availability == "available" && recommended_source.is_none() {
             row.recommended = true;
             recommended_source = Some(row.source.clone());
@@ -178,17 +307,17 @@ pub fn search(target: &str, explicit_repo: Option<&str>, config: &Config) -> Dec
     }
 }
 
-fn query_official(target: &str) -> DecisionRow {
+fn query_official(target: &str, probe: &dyn Probe) -> DecisionRow {
     let step = Step::new(
         "pacman",
         vec!["-Ss", target],
         "Query official Arch repositories",
         10,
     );
-    match run_step(&step, None) {
+    match probe.query(&step) {
         Ok(out) if out.exit_code == 0 && !out.stdout.trim().is_empty() => {
             let mut candidates = parse_pacman_ss(&out.stdout, target);
-            enrich_official(&mut candidates);
+            enrich_official(&mut candidates, probe);
             if candidates.is_empty() {
                 DecisionRow {
                     source: "official".to_string(),
@@ -227,6 +356,10 @@ fn query_official(target: &str) -> DecisionRow {
     }
 }
 
+/// `pacman -Ss` prints a two-line record per package: `repo/name version` then
+/// the description. Neither line is trusted: a name outside the package alphabet
+/// is data, not a candidate, and a "description" that is itself a package header
+/// means the record ran out before one was printed.
 fn parse_pacman_ss(output: &str, target: &str) -> Vec<Candidate> {
     let mut candidates = Vec::new();
     let lines: Vec<&str> = output.lines().collect();
@@ -238,51 +371,98 @@ fn parse_pacman_ss(output: &str, target: &str) -> Vec<Candidate> {
             if parts.len() >= 2 {
                 let pkg_full = parts[0]; // e.g. core/bash or extra/bash
                 let version = parts[1];
-                let pkg_name = pkg_full.split('/').nth(1).unwrap_or(pkg_full);
-                let desc = if i + 1 < lines.len() {
-                    lines[i + 1].trim().to_string()
-                } else {
-                    String::new()
-                };
-                if pkg_name.eq_ignore_ascii_case(target) || pkg_name.contains(target) {
-                    candidates.push(Candidate {
-                        name: pkg_name.to_string(),
-                        version: Some(version.to_string()),
-                        url: None,
-                        source_url: None,
-                        description: if desc.is_empty() { None } else { Some(desc) },
-                        repository: if pkg_full.contains('/') {
-                            Some(pkg_full.split('/').next().unwrap_or("").to_string())
-                        } else {
-                            None
-                        },
-                        ..Default::default()
-                    });
+                let mut segments = pkg_full.splitn(2, '/');
+                let repository = segments.next().unwrap_or_default();
+                let pkg_name = segments.next().unwrap_or_default();
+                if !pkg_name.is_empty() && is_package_name(pkg_name) && !repository.is_empty() {
+                    let desc = match lines.get(i + 1) {
+                        // The next record's header is not this package's summary.
+                        Some(next) if !is_package_header(next) && !next.trim().is_empty() => {
+                            sanitize_opt(Some(next.trim()))
+                        }
+                        _ => None,
+                    };
+                    if pkg_name.eq_ignore_ascii_case(target) || pkg_name.contains(target) {
+                        candidates.push(Candidate {
+                            name: pkg_name.to_string(),
+                            version: sanitize_opt(Some(version)),
+                            url: None,
+                            source_url: None,
+                            description: desc,
+                            repository: sanitize_opt(Some(repository)),
+                            ..Default::default()
+                        });
+                        if candidates.len() >= MAX_CANDIDATES {
+                            break;
+                        }
+                    }
                 }
             }
         }
         i += 1;
     }
+    rank_candidates(&mut candidates, target);
     candidates
+}
+
+/// A line shaped like `repo/name 1.2-3`, which starts a new `-Ss` record.
+fn is_package_header(line: &str) -> bool {
+    let line = line.trim();
+    match line.split_once(char::is_whitespace) {
+        Some((left, version)) => {
+            left.contains('/')
+                && is_package_name(left.split('/').nth(1).unwrap_or_default())
+                && is_package_name(version)
+        }
+        None => false,
+    }
+}
+
+/// Exact matches first, then names that start with the target, then the rest:
+/// "found 25 candidates" is useless if the package typed by name is last.
+fn rank_candidates(candidates: &mut [Candidate], target: &str) {
+    let score = |name: &str| -> u8 {
+        if name.eq_ignore_ascii_case(target) {
+            0
+        } else if name
+            .to_ascii_lowercase()
+            .starts_with(&target.to_ascii_lowercase())
+        {
+            1
+        } else {
+            2
+        }
+    };
+    candidates.sort_by_key(|candidate| (score(&candidate.name), candidate.name.clone()));
 }
 
 /// `pacman -Ss` yields only names, versions and one-line descriptions, so the
 /// detail panel used to fill licence, architecture, size and maintainer with
 /// invented text. `-Si` reports all of them from the sync database, and only the
 /// leading candidates are worth the extra local lookups.
-fn enrich_official(candidates: &mut [Candidate]) {
+fn enrich_official(candidates: &mut [Candidate], probe: &dyn Probe) {
     for candidate in candidates.iter_mut().take(3) {
         let selector = match &candidate.repository {
             Some(repo) if !repo.is_empty() => format!("{}/{}", repo, candidate.name),
             _ => candidate.name.clone(),
         };
+        // The selector is a pacman argument built from database text; anything
+        // that is not a name/repo pair is not worth asking about.
+        if !is_package_name(&candidate.name)
+            || candidate
+                .repository
+                .as_deref()
+                .is_some_and(|repo| !is_package_name(repo))
+        {
+            continue;
+        }
         let step = Step::new(
             "pacman",
             vec!["-Si", "--color=never", &selector],
             "Read official package metadata",
             10,
         );
-        let Ok(out) = run_step(&step, None) else {
+        let Ok(out) = probe.query(&step) else {
             continue;
         };
         if out.exit_code != 0 {
@@ -293,20 +473,20 @@ fn enrich_official(candidates: &mut [Candidate]) {
             fields
                 .iter()
                 .find(|(k, _)| k == key)
-                .map(|(_, value)| value.clone())
+                .and_then(|(_, value)| sanitize_opt(Some(value)))
         };
         if candidate.version.is_none() {
             candidate.version = get("Version");
         }
         candidate.repository = get("Repository").or_else(|| candidate.repository.clone());
         candidate.architecture = get("Architecture");
-        candidate.license = get("Licenses");
+        candidate.license = get("Licences").or_else(|| get("Licenses"));
         candidate.size = get("Installed Size").or_else(|| get("Download Size"));
         candidate.maintainer = get("Maintainer")
             .filter(|m| !m.eq_ignore_ascii_case("Unknown Packager"))
             .or_else(|| get("Packager"));
         if candidate.url.is_none() {
-            candidate.url = get("URL");
+            candidate.url = sanitize_url(get("URL").as_deref());
         }
         if candidate.description.is_none() {
             candidate.description = get("Description");
@@ -360,7 +540,67 @@ fn encode_url_segment(raw: &str) -> String {
     out
 }
 
-fn query_aur(target: &str) -> DecisionRow {
+/// Turn one AUR RPC v5 body into candidates. A mirror or a compromised response
+/// can name anything, so a package is only listed when its name is a package
+/// name and the URLs it offers are fetchable; everything else is dropped whole.
+fn parse_aur_results(body: &str, target: &str) -> Option<Vec<Candidate>> {
+    let val: serde_json::Value = serde_json::from_str(body).ok()?;
+    let results = val.get("results").and_then(|r| r.as_array())?;
+    let mut candidates = Vec::new();
+    for item in results {
+        let name = item.get("Name").and_then(|n| n.as_str()).unwrap_or("");
+        if !is_package_name(name) {
+            continue;
+        }
+        if !(name.eq_ignore_ascii_case(target) || name.contains(target)) {
+            continue;
+        }
+        // `URLPath` is the AUR git snapshot holding the PKGBUILD — the actual
+        // thing a build would consume, so it is only usable as a path on the
+        // AUR host, never as an absolute URL of its own choosing.
+        let snapshot_url = item
+            .get("URLPath")
+            .and_then(|u| u.as_str())
+            .map(aur_snapshot_url)
+            .flatten();
+        candidates.push(Candidate {
+            name: name.to_string(),
+            version: sanitize_opt(item.get("Version").and_then(|v| v.as_str())),
+            url: sanitize_url(item.get("URL").and_then(|u| u.as_str())),
+            source_url: snapshot_url.clone(),
+            description: sanitize_opt(item.get("Description").and_then(|d| d.as_str())),
+            repository: Some("AUR".to_string()),
+            maintainer: sanitize_opt(item.get("Maintainer").and_then(|m| m.as_str())),
+            out_of_date: sanitize_opt(item.get("OutOfDate").and_then(|o| o.as_str())),
+            license: sanitize_opt(item.get("License").and_then(|l| l.as_str())),
+            ..Default::default()
+        });
+        if candidates.len() >= MAX_CANDIDATES {
+            break;
+        }
+    }
+    rank_candidates(&mut candidates, target);
+    Some(candidates)
+}
+
+/// An AUR `URLPath` is a path on the AUR host. A value that is absolute, escapes
+/// with `..`, or starts a new authority (`//host`) would be sent somewhere else.
+fn aur_snapshot_url(path: &str) -> Option<String> {
+    let path = path.trim();
+    if !path.starts_with('/') || path.starts_with("//") || path.contains('\0') {
+        return None;
+    }
+    if path
+        .split('/')
+        .any(|segment| segment == ".." || segment == ".")
+    {
+        return None;
+    }
+    let full = format!("https://aur.archlinux.org{path}");
+    sanitize_url(Some(&full))
+}
+
+fn query_aur(target: &str, probe: &dyn Probe) -> DecisionRow {
     let url = format!(
         "https://aur.archlinux.org/rpc/v5/search/{}",
         encode_url_segment(target)
@@ -371,84 +611,30 @@ fn query_aur(target: &str) -> DecisionRow {
         "Query AUR RPC v5",
         10,
     );
-    match run_step(&step, None) {
+    match probe.query(&step) {
         Ok(out) if out.exit_code == 0 && !out.stdout.trim().is_empty() => {
-            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&out.stdout) {
-                if let Some(results) = val.get("results").and_then(|r| r.as_array()) {
-                    let mut candidates = Vec::new();
-                    for item in results {
-                        let name = item
-                            .get("Name")
-                            .and_then(|n| n.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        let ver = item
-                            .get("Version")
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string());
-                        let desc = item
-                            .get("Description")
-                            .and_then(|d| d.as_str())
-                            .map(|s| s.to_string());
-                        let aur_url = item
-                            .get("URL")
-                            .and_then(|u| u.as_str())
-                            .map(|s| s.to_string());
-                        let maintainer = item
-                            .get("Maintainer")
-                            .and_then(|m| m.as_str())
-                            .map(|s| s.to_string());
-                        let out_of_date = item
-                            .get("OutOfDate")
-                            .and_then(|o| o.as_str())
-                            .map(|s| s.to_string());
-                        // `URLPath` is the AUR git snapshot holding the PKGBUILD —
-                        // the actual thing a build would consume.
-                        let snapshot_url = item
-                            .get("URLPath")
-                            .and_then(|u| u.as_str())
-                            .map(|path| format!("https://aur.archlinux.org{}", path));
-
-                        if name.eq_ignore_ascii_case(target) || name.contains(target) {
-                            candidates.push(Candidate {
-                                name,
-                                version: ver,
-                                url: aur_url,
-                                source_url: snapshot_url,
-                                description: desc,
-                                repository: Some("AUR".to_string()),
-                                maintainer,
-                                out_of_date,
-                                ..Default::default()
-                            });
-                        }
-                    }
-
-                    if candidates.is_empty() {
-                        return DecisionRow {
-                            source: "aur".to_string(),
-                            availability: "unavailable".to_string(),
-                            recommended: false,
-                            reason: format!("No matching packages found in AUR for '{}'", target),
-                            candidates: vec![],
-                        };
-                    } else {
-                        return DecisionRow {
-                            source: "aur".to_string(),
-                            availability: "available".to_string(),
-                            recommended: false,
-                            reason: format!("Found {} package(s) in AUR", candidates.len()),
-                            candidates,
-                        };
-                    }
-                }
-            }
-            DecisionRow {
-                source: "aur".to_string(),
-                availability: "unavailable".to_string(),
-                recommended: false,
-                reason: "AUR RPC returned invalid JSON or empty result".to_string(),
-                candidates: vec![],
+            match parse_aur_results(&out.stdout, target) {
+                Some(candidates) if !candidates.is_empty() => DecisionRow {
+                    source: "aur".to_string(),
+                    availability: "available".to_string(),
+                    recommended: false,
+                    reason: format!("Found {} package(s) in AUR", candidates.len()),
+                    candidates,
+                },
+                Some(_) => DecisionRow {
+                    source: "aur".to_string(),
+                    availability: "unavailable".to_string(),
+                    recommended: false,
+                    reason: format!("No matching packages found in AUR for '{}'", target),
+                    candidates: vec![],
+                },
+                None => DecisionRow {
+                    source: "aur".to_string(),
+                    availability: "unavailable".to_string(),
+                    recommended: false,
+                    reason: "AUR RPC returned invalid JSON or empty result".to_string(),
+                    candidates: vec![],
+                },
             }
         }
         Ok(_) => DecisionRow {
@@ -468,7 +654,12 @@ fn query_aur(target: &str) -> DecisionRow {
     }
 }
 
-fn query_release_asset(target: &str, repo_url: Option<&str>, asset_type: &str) -> DecisionRow {
+fn query_release_asset(
+    target: &str,
+    repo_url: Option<&str>,
+    asset_type: &str,
+    probe: &dyn Probe,
+) -> DecisionRow {
     let repo_url_str = match repo_url {
         Some(url) => url,
         None => {
@@ -517,17 +708,28 @@ fn query_release_asset(target: &str, repo_url: Option<&str>, asset_type: &str) -
         "Query GitHub release assets",
         10,
     );
-    match run_step(&step, None) {
+    match probe.query(&step) {
         Ok(out) if out.exit_code == 0 && !out.stdout.trim().is_empty() => {
             if let Ok(val) = serde_json::from_str::<serde_json::Value>(&out.stdout) {
                 if let Some(assets) = val.get("assets").and_then(|a| a.as_array()) {
                     let mut candidates = Vec::new();
                     for asset in assets {
-                        let name = asset.get("name").and_then(|n| n.as_str()).unwrap_or("");
-                        let download_url = asset
-                            .get("browser_download_url")
-                            .and_then(|u| u.as_str())
-                            .map(|s| s.to_string());
+                        let name = match asset.get("name").and_then(|n| n.as_str()) {
+                            Some(name) if !name.trim().is_empty() => sanitize_display(name),
+                            _ => continue,
+                        };
+                        // An asset with no fetchable HTTPS location is a name in a
+                        // list, not something a build can be pointed at: the engine
+                        // only accepts an HTTPS source, and a plain http download
+                        // can be replaced on the wire.
+                        let download_url = match sanitize_url(
+                            asset.get("browser_download_url").and_then(|u| u.as_str()),
+                        )
+                        .filter(|url| url.starts_with("https://"))
+                        {
+                            Some(url) => url,
+                            None => continue,
+                        };
 
                         let matches = match asset_type {
                             "flatpak" => {
@@ -541,16 +743,16 @@ fn query_release_asset(target: &str, repo_url: Option<&str>, asset_type: &str) -
 
                         if matches {
                             candidates.push(Candidate {
-                                name: name.to_string(),
-                                version: val
-                                    .get("tag_name")
-                                    .and_then(|t| t.as_str())
-                                    .map(|s| s.to_string()),
-                                url: download_url,
+                                name,
+                                version: sanitize_opt(val.get("tag_name").and_then(|t| t.as_str())),
+                                url: Some(download_url),
                                 source_url: Some(repo_url_str.to_string()),
                                 description: Some(format!("Release asset from {}", repo_url_str)),
                                 ..Default::default()
                             });
+                            if candidates.len() >= MAX_CANDIDATES {
+                                break;
+                            }
                         }
                     }
 
@@ -597,7 +799,7 @@ fn query_release_asset(target: &str, repo_url: Option<&str>, asset_type: &str) -
     }
 }
 
-fn query_upstream_source(target: &str, repo_url: Option<&str>) -> DecisionRow {
+fn query_upstream_source(target: &str, repo_url: Option<&str>, probe: &dyn Probe) -> DecisionRow {
     let repo_url_str = match repo_url {
         Some(url) => url,
         None => {
@@ -606,7 +808,7 @@ fn query_upstream_source(target: &str, repo_url: Option<&str>) -> DecisionRow {
             {
                 target
             } else {
-                return query_github_repositories(target);
+                return query_github_repositories(target, probe);
             }
         }
     };
@@ -615,19 +817,20 @@ fn query_upstream_source(target: &str, repo_url: Option<&str>) -> DecisionRow {
     if let Some((owner, repo)) = parse_github_repo(repo_url_str) {
         // A tagged release is the reproducible choice, so it is tried first; every
         // step that fails records why, instead of a later message guessing.
-        let release = match github_api_json(&format!("/repos/{}/{}/releases/latest", owner, repo)) {
-            Ok(val) => val
-                .get("tag_name")
-                .and_then(|t| t.as_str())
-                .zip(val.get("tarball_url").and_then(|u| u.as_str()))
-                .map(|(tag, url)| (tag.to_string(), url.to_string())),
-            Err(err) => {
-                notes.push(format!("no tagged release read: {}", err));
-                None
-            }
-        };
+        let release =
+            match github_api_json(&format!("/repos/{}/{}/releases/latest", owner, repo), probe) {
+                Ok(val) => val
+                    .get("tag_name")
+                    .and_then(|t| t.as_str())
+                    .zip(val.get("tarball_url").and_then(|u| u.as_str()))
+                    .map(|(tag, url)| (tag.to_string(), url.to_string())),
+                Err(err) => {
+                    notes.push(format!("no tagged release read: {}", err));
+                    None
+                }
+            };
         if let Some((tag_name, tarball_url)) = release {
-            if probe_source_archive(&tarball_url).is_some() {
+            if probe_source_archive(&tarball_url, probe).is_some() {
                 return upstream_row(
                     &repo,
                     repo_url_str,
@@ -645,7 +848,7 @@ fn query_upstream_source(target: &str, repo_url: Option<&str>) -> DecisionRow {
         }
 
         // Repositories without releases are still buildable from a branch snapshot.
-        let default_branch = match github_api_json(&format!("/repos/{}/{}", owner, repo)) {
+        let default_branch = match github_api_json(&format!("/repos/{}/{}", owner, repo), probe) {
             Ok(val) => match val.get("default_branch").and_then(|b| b.as_str()) {
                 Some(branch) => Some(branch.to_string()),
                 None => {
@@ -663,7 +866,7 @@ fn query_upstream_source(target: &str, repo_url: Option<&str>) -> DecisionRow {
                 "https://github.com/{}/{}/archive/refs/heads/{}.tar.gz",
                 owner, repo, branch
             );
-            if let Some(resolved) = probe_source_archive(&url) {
+            if let Some(resolved) = probe_source_archive(&url, probe) {
                 return upstream_row(
                     &repo,
                     repo_url_str,
@@ -686,7 +889,7 @@ fn query_upstream_source(target: &str, repo_url: Option<&str>) -> DecisionRow {
         // Unauthenticated API reads are rate limited per egress IP, and a rate
         // limit hides a branch that GitHub's own archive endpoint resolves as HEAD.
         let url = format!("https://github.com/{}/{}/archive/HEAD.tar.gz", owner, repo);
-        if let Some(resolved) = probe_source_archive(&url) {
+        if let Some(resolved) = probe_source_archive(&url, probe) {
             let revision = revision_from_archive_url(&resolved);
             let shown = revision.clone().unwrap_or_else(|| "HEAD".to_string());
             return upstream_row(
@@ -713,7 +916,7 @@ fn query_upstream_source(target: &str, repo_url: Option<&str>) -> DecisionRow {
             "https://gitlab.com/{}/-/archive/HEAD/{}-HEAD.tar.gz",
             path, project
         );
-        if let Some(resolved) = probe_source_archive(&url) {
+        if let Some(resolved) = probe_source_archive(&url, probe) {
             let revision = revision_from_archive_url(&resolved);
             let shown = revision.clone().unwrap_or_else(|| "HEAD".to_string());
             return upstream_row(
@@ -792,7 +995,7 @@ fn upstream_unavailable(repo_url: &str, notes: Vec<String>) -> DecisionRow {
 
 /// Read a GitHub API path. Failure text is kept because the reason matters to the
 /// caller: `curl -f` discards the body that explains a 403 rate limit.
-fn github_api_json(path: &str) -> Result<serde_json::Value, String> {
+fn github_api_json(path: &str, probe: &dyn Probe) -> Result<serde_json::Value, String> {
     let api_url = format!("https://api.github.com{}", path);
     let step = Step::new(
         "curl",
@@ -800,7 +1003,7 @@ fn github_api_json(path: &str) -> Result<serde_json::Value, String> {
         "Query GitHub API",
         10,
     );
-    let out = match run_step(&step, None) {
+    let out = match probe.query(&step) {
         Ok(out) => out,
         Err(err) => return Err(err),
     };
@@ -823,7 +1026,7 @@ fn github_api_json(path: &str) -> Result<serde_json::Value, String> {
 /// Ask the URL itself whether it serves an archive, returning the address it
 /// resolves to. A release listing can name an asset that is gone, and a 404 page
 /// would otherwise reach the archive parser.
-fn probe_source_archive(url: &str) -> Option<String> {
+fn probe_source_archive(url: &str, probe: &dyn Probe) -> Option<String> {
     let step = Step::new(
         "curl",
         vec![
@@ -839,16 +1042,18 @@ fn probe_source_archive(url: &str) -> Option<String> {
         "Verify upstream source archive",
         15,
     );
-    match run_step(&step, None) {
+    match probe.query(&step) {
         Ok(out) if out.exit_code == 0 => match out.stdout.lines().last() {
             Some(final_response) => {
                 let mut fields = final_response.split_whitespace();
                 let is_archive = fields.next() == Some("200")
                     && !fields.next().unwrap_or("text/html").starts_with("text/");
                 if is_archive {
+                    // The address curl ended up at is what a build would fetch,
+                    // so it has to be a URL that can actually be fetched.
                     fields
                         .next()
-                        .map(str::to_string)
+                        .and_then(|final_url| sanitize_url(Some(final_url)))
                         .or_else(|| Some(url.to_string()))
                 } else {
                     None
@@ -885,13 +1090,17 @@ pub fn parse_gitlab_repo(url: &str) -> Option<String> {
         return None;
     }
     let path = &segments[1..];
-    if path.len() < 2 || path.iter().any(|s| *s == "-" || s.contains(".git")) {
+    if path.len() < 2
+        || path
+            .iter()
+            .any(|segment| *segment == "-" || segment.contains(".git") || !is_package_name(segment))
+    {
         return None;
     }
     Some(path.join("/"))
 }
 
-fn query_github_repositories(target: &str) -> DecisionRow {
+fn query_github_repositories(target: &str, probe: &dyn Probe) -> DecisionRow {
     let query = target
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_' || c.is_ascii_whitespace())
@@ -927,7 +1136,7 @@ fn query_github_repositories(target: &str) -> DecisionRow {
         "Search GitHub repositories",
         10,
     );
-    let output = match run_step(&step, None) {
+    let output = match probe.query(&step) {
         Ok(out) if out.exit_code == 0 => out.stdout,
         _ => String::new(),
     };
@@ -945,7 +1154,16 @@ fn query_github_repositories(target: &str) -> DecisionRow {
     };
 
     let normalized_target = target.to_ascii_lowercase().replace(['-', '_', ' '], "");
-    let candidates = value
+    if normalized_target.is_empty() {
+        return DecisionRow {
+            source: "upstream".to_string(),
+            availability: "unavailable".to_string(),
+            recommended: false,
+            reason: "GitHub search requires a package name or repository URL".to_string(),
+            candidates: vec![],
+        };
+    }
+    let mut candidates: Vec<Candidate> = value
         .get("items")
         .and_then(|items| items.as_array())
         .into_iter()
@@ -953,33 +1171,40 @@ fn query_github_repositories(target: &str) -> DecisionRow {
         .filter_map(|item| {
             let name = item.get("name")?.as_str()?;
             let normalized_name = name.to_ascii_lowercase().replace(['-', '_', ' '], "");
+            // An empty name matches everything, which would list the whole result
+            // set as if the user had asked for it.
+            if normalized_name.is_empty() {
+                return None;
+            }
             if !normalized_name.contains(&normalized_target)
                 && !normalized_target.contains(&normalized_name)
             {
                 return None;
             }
-            let full_name = item.get("full_name")?.as_str()?;
+            // The archive URL is built from these two segments, so they must be a
+            // plain `owner/repo` pair and nothing else.
+            let (owner, repo) = parse_github_repo(item.get("full_name")?.as_str()?)?;
             let branch = item
                 .get("default_branch")
                 .and_then(|branch| branch.as_str())
+                .filter(|branch| is_package_name(branch))
                 .unwrap_or("main");
-            let html_url = item.get("html_url")?.as_str()?.to_string();
+            let html_url = sanitize_url(item.get("html_url").and_then(|url| url.as_str()))?;
             Some(Candidate {
-                name: full_name.to_string(),
+                name: format!("{owner}/{repo}"),
                 version: None,
                 url: Some(format!(
-                    "https://github.com/{}/archive/refs/heads/{}.tar.gz",
-                    full_name, branch
+                    "https://github.com/{}/{}/archive/refs/heads/{}.tar.gz",
+                    owner, repo, branch
                 )),
                 source_url: Some(html_url),
-                description: item
-                    .get("description")
-                    .and_then(|description| description.as_str())
-                    .map(|description| description.to_string()),
+                description: sanitize_opt(item.get("description").and_then(|d| d.as_str())),
                 ..Default::default()
             })
         })
-        .collect::<Vec<_>>();
+        .take(MAX_CANDIDATES)
+        .collect();
+    rank_candidates(&mut candidates, target);
 
     if candidates.is_empty() {
         DecisionRow {
@@ -1007,16 +1232,54 @@ fn query_github_repositories(target: &str) -> DecisionRow {
 /// path-bearing segment: matching `github.com` anywhere in the string would
 /// happily accept `https://notgithub.com.example/owner/repo`.
 pub fn parse_github_repo(url: &str) -> Option<(String, String)> {
-    let trimmed = url.trim().trim_end_matches('/').trim_end_matches(".git");
-    let after_scheme = trimmed.split_once("://").map_or(trimmed, |rest| rest.1);
-    let mut segments = after_scheme.split('/').filter(|s| !s.is_empty());
-    let host = segments.next()?.to_lowercase();
-    if host != "github.com" {
+    // A bare `owner/repo` (as GitHub search reports `full_name`) is accepted, and
+    // anything else must be a github.com URL whose query/fragment says nothing
+    // about which repository is meant.
+    let trimmed = url
+        .trim()
+        .split(['?', '#'])
+        .next()
+        .unwrap_or("")
+        .trim_end_matches('/')
+        .trim_end_matches(".git");
+    let (host_part, path_part) = match trimmed.split_once("://") {
+        Some((scheme, rest)) => {
+            if !matches!(scheme.to_ascii_lowercase().as_str(), "http" | "https") {
+                return None;
+            }
+            let mut parts = rest.splitn(2, '/');
+            (
+                parts.next().unwrap_or_default(),
+                parts.next().unwrap_or_default(),
+            )
+        }
+        // No scheme: either a bare `owner/repo` (how GitHub search reports
+        // `full_name`) or a host-first URL such as `github.com/owner/repo`.
+        None => {
+            if trimmed.contains('/') {
+                let mut parts = trimmed.splitn(2, '/');
+                let first = parts.next().unwrap_or_default();
+                let rest = parts.next().unwrap_or_default();
+                if first.contains('.') {
+                    (first, rest)
+                } else {
+                    ("github.com", trimmed)
+                }
+            } else {
+                return None;
+            }
+        }
+    };
+    if !matches!(
+        host_part.to_ascii_lowercase().as_str(),
+        "github.com" | "www.github.com"
+    ) {
         return None;
     }
+    let mut segments = path_part.split('/').filter(|segment| !segment.is_empty());
     let owner = segments.next()?;
     let repo = segments.next()?;
-    if owner.is_empty() || repo.is_empty() {
+    if !is_package_name(owner) || !is_package_name(repo) {
         return None;
     }
     Some((owner.to_string(), repo.to_string()))
