@@ -95,7 +95,13 @@ pub fn progress_snapshot() -> ProgressSnapshot {
     ProgressSnapshot {
         phase,
         total_steps: total,
-        completed_steps: completed.min(total.max(completed)),
+        // Steps a phase did not plan for (archive unpacking, a retried probe)
+        // still land in the history; a bar past 100% would only mislead.
+        completed_steps: if total > 0 {
+            completed.min(total)
+        } else {
+            completed
+        },
         elapsed_ms,
         running: t
             .running
@@ -179,6 +185,18 @@ pub fn run_step(step: &Step, input: Option<&[u8]>) -> Result<ProcessOutput, Stri
     run_step_in_dir(step, input, None)
 }
 
+/// Run a housekeeping step (e.g. a sudo timestamp refresh) that is not part of
+/// any plan. It must not appear in the live progress tracker: counting it
+/// advanced the GUI progress bar while the real build step was still running.
+pub fn run_step_untracked(step: &Step, input: Option<&[u8]>) -> Result<ProcessOutput, String> {
+    let (exit_code, stdout, stderr) = run_captured_inner(step, input, None, false)?;
+    Ok(ProcessOutput {
+        exit_code,
+        stdout: String::from_utf8_lossy(&stdout).to_string(),
+        stderr: String::from_utf8_lossy(&stderr).to_string(),
+    })
+}
+
 pub fn run_step_in_dir(
     step: &Step,
     input: Option<&[u8]>,
@@ -216,6 +234,15 @@ fn run_captured(
     input: Option<&[u8]>,
     working_dir: Option<&Path>,
 ) -> Result<(i32, Vec<u8>, Vec<u8>), String> {
+    run_captured_inner(step, input, working_dir, true)
+}
+
+fn run_captured_inner(
+    step: &Step,
+    input: Option<&[u8]>,
+    working_dir: Option<&Path>,
+    tracked: bool,
+) -> Result<(i32, Vec<u8>, Vec<u8>), String> {
     let mut cmd = Command::new(&step.program);
     cmd.args(&step.args);
     if let Some(dir) = working_dir {
@@ -236,13 +263,29 @@ fn run_captured(
 
     let step_id = NEXT_STEP_ID.fetch_add(1, Ordering::Relaxed);
     let step_started = Instant::now();
-    tracker_start(step_id, &step.purpose);
-
-    if let Some(data) = input {
-        if let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(data);
+    let finish = |ok: bool| {
+        if tracked {
+            tracker_finish(step_id, &step.purpose, step_started, ok);
         }
+    };
+    if tracked {
+        tracker_start(step_id, &step.purpose);
     }
+
+    // stdin is written from its own thread and closed when done: writing it
+    // inline before the output readers exist can deadlock against a child that
+    // fills its stdout pipe before it reads its input.
+    let stdin_writer = match (input, child.stdin.take()) {
+        (Some(data), Some(mut stdin)) => {
+            let data = data.to_vec();
+            Some(std::thread::spawn(move || {
+                let mut data = data;
+                let _ = stdin.write_all(&data);
+                data.fill(0);
+            }))
+        }
+        _ => None,
+    };
 
     // Drain stdout/stderr on dedicated reader threads. Reading only after the
     // child exits deadlocks once a verbose command (e.g. mkarchroot) fills the
@@ -276,7 +319,7 @@ fn run_captured(
                 if start.elapsed() >= timeout {
                     let _ = child.kill();
                     let _ = child.wait();
-                    tracker_finish(step_id, &step.purpose, step_started, false);
+                    finish(false);
                     return Err(format!(
                         "Process '{}' timed out after {}s",
                         step.program,
@@ -286,7 +329,9 @@ fn run_captured(
                 std::thread::sleep(Duration::from_millis(50));
             }
             Err(e) => {
-                tracker_finish(step_id, &step.purpose, step_started, false);
+                let _ = child.kill();
+                let _ = child.wait();
+                finish(false);
                 return Err(format!(
                     "Error waiting for process '{}': {}",
                     step.program, e
@@ -304,8 +349,12 @@ fn run_captured(
         None => Vec::new(),
     };
 
+    if let Some(handle) = stdin_writer {
+        let _ = handle.join();
+    }
+
     let exit_ok = status.code().unwrap_or(-1) == 0;
-    tracker_finish(step_id, &step.purpose, step_started, exit_ok);
+    finish(exit_ok);
 
     Ok((status.code().unwrap_or(-1), stdout_bytes, stderr_bytes))
 }

@@ -1,4 +1,4 @@
-use crate::archive::{walk_tree, FileReview, SourceSnapshot};
+use crate::archive::{unpack_tarball_tree, walk_tree, FileReview, SourceSnapshot};
 use crate::process::{run_step, run_step_in_dir, Step};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -157,10 +157,25 @@ pub struct SmokeConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SmokeTestReport {
     pub passed: bool,
+    /// True when the binary could not be exercised at all in the isolated root
+    /// (for example it needs the host's dynamic loader). Not a pass, and not
+    /// evidence the package is broken either.
+    #[serde(default)]
+    pub inconclusive: bool,
     pub entry_point: String,
     pub exit_code: i32,
     pub stdout: String,
     pub stderr: String,
+}
+
+/// How a staged build's pinned source bytes are placed in the job directory.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SourceLayout {
+    /// Written verbatim as `src.tar.*` for a generated PKGBUILD's `source=()`.
+    Tarball,
+    /// Unpacked beside the PKGBUILD, because a user-written PKGBUILD refers to
+    /// its local sources by name. `strip_prefix` drops a wrapping directory.
+    Tree { strip_prefix: Option<String> },
 }
 
 /// Unpack an Arch package into `dest` with the system `bsdtar`, which handles
@@ -242,8 +257,11 @@ fn write_build_log(job_dir: &Path, phase: &str, log: &str) {
     let _ = fs::write(&path, text);
 }
 
-fn find_built_package(dir: &Path) -> Option<PathBuf> {
-    let mut matches: Vec<(std::time::SystemTime, PathBuf)> = fs::read_dir(dir)
+pub fn find_built_package(dir: &Path) -> Option<PathBuf> {
+    // makepkg's default `debug` option also emits `<name>-debug-*.pkg.tar.*`
+    // (detached symbols) next to the real package, often with the newer mtime.
+    // Installing that instead of the program was the result of "freshest wins".
+    let mut matches: Vec<(bool, std::time::SystemTime, PathBuf)> = fs::read_dir(dir)
         .ok()?
         .flatten()
         .map(|entry| entry.path())
@@ -252,38 +270,54 @@ fn find_built_package(dir: &Path) -> Option<PathBuf> {
                 .map(|name| name.to_string_lossy().contains(".pkg.tar."))
                 .unwrap_or(false)
         })
+        .filter(|path| path.is_file())
         .filter_map(|path| {
             let modified = path.metadata().and_then(|m| m.modified()).ok()?;
-            Some((modified, path))
+            let is_debug = path
+                .file_name()
+                .map(|name| name.to_string_lossy().contains("-debug-"))
+                .unwrap_or(false);
+            Some((is_debug, modified, path))
         })
         .collect();
-    matches.sort_by(|a, b| b.0.cmp(&a.0));
+    // Non-debug first, then newest first.
+    matches.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
     matches
         .into_iter()
         .next()
-        .map(|(_, path)| fs::canonicalize(&path).unwrap_or(path))
+        .map(|(_, _, path)| fs::canonicalize(&path).unwrap_or(path))
 }
 
 pub fn execute_chroot_build(
     job_dir: &Path,
     pkgbuild_content: &str,
     source_tarball: &[u8],
+    layout: &SourceLayout,
 ) -> Result<PathBuf, String> {
     fs::create_dir_all(job_dir).map_err(|e| format!("Failed to create job dir: {}", e))?;
+
+    match layout {
+        SourceLayout::Tarball => {
+            let source_name = if pkgbuild_content.contains("source=('src.tar.xz')") {
+                "src.tar.xz"
+            } else if pkgbuild_content.contains("source=('src.tar.zst')") {
+                "src.tar.zst"
+            } else {
+                "src.tar.gz"
+            };
+            let src_tar_path = job_dir.join(source_name);
+            fs::write(&src_tar_path, source_tarball)
+                .map_err(|e| format!("Failed to write source tarball: {}", e))?;
+        }
+        SourceLayout::Tree { strip_prefix } => {
+            unpack_tarball_tree(source_tarball, job_dir, strip_prefix.as_deref())?;
+        }
+    }
+    // Written last so the reviewed PKGBUILD always wins over any file of the
+    // same name inside the unpacked tree.
     let pkgbuild_path = job_dir.join("PKGBUILD");
     fs::write(&pkgbuild_path, pkgbuild_content)
         .map_err(|e| format!("Failed to write PKGBUILD: {}", e))?;
-
-    let source_name = if pkgbuild_content.contains("source=('src.tar.xz')") {
-        "src.tar.xz"
-    } else if pkgbuild_content.contains("source=('src.tar.zst')") {
-        "src.tar.zst"
-    } else {
-        "src.tar.gz"
-    };
-    let src_tar_path = job_dir.join(source_name);
-    fs::write(&src_tar_path, source_tarball)
-        .map_err(|e| format!("Failed to write source tarball: {}", e))?;
 
     // 1. First attempt: unprivileged native makepkg (fast, safe, no root/sudo needed)
     let makepkg_step = Step::new(
@@ -432,6 +466,7 @@ pub fn run_runtime_smoke_test(
         // about the package, so the finding is reported instead.
         return Ok(SmokeTestReport {
             passed: false,
+            inconclusive: true,
             entry_point: program,
             exit_code: -1,
             stdout: String::new(),
@@ -474,6 +509,7 @@ pub fn run_runtime_smoke_test(
     match run_step(&step, None) {
         Ok(out) => Ok(SmokeTestReport {
             passed: out.exit_code == 0,
+            inconclusive: false,
             entry_point: program.clone(),
             exit_code: out.exit_code,
             stdout: out.stdout,
@@ -481,6 +517,7 @@ pub fn run_runtime_smoke_test(
         }),
         Err(e) => Ok(SmokeTestReport {
             passed: false,
+            inconclusive: false,
             entry_point: program.clone(),
             exit_code: -1,
             stdout: String::new(),

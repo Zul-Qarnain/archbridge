@@ -178,10 +178,25 @@ pub fn search(target: &str, explicit_repo: Option<&str>, config: &Config) -> Dec
     }
 }
 
+/// `pacman -Ss` takes a regular expression. A literal search for `c++` or
+/// `g++` used to be a regex error that read as "not in the official repos".
+fn escape_regex(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len() * 2);
+    for c in raw.chars() {
+        if "\\.+*?()|[]{}^$".contains(c) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
 fn query_official(target: &str) -> DecisionRow {
+    let pattern = escape_regex(target);
+    // `--` keeps a target that starts with a dash from becoming a pacman option.
     let step = Step::new(
         "pacman",
-        vec!["-Ss", target],
+        vec!["-Ss", "--", pattern.as_str()],
         "Query official Arch repositories",
         10,
     );
@@ -278,7 +293,7 @@ fn enrich_official(candidates: &mut [Candidate]) {
         };
         let step = Step::new(
             "pacman",
-            vec!["-Si", "--color=never", &selector],
+            vec!["-Si", "--color=never", "--", &selector],
             "Read official package metadata",
             10,
         );
@@ -451,6 +466,15 @@ fn query_aur(target: &str) -> DecisionRow {
                 candidates: vec![],
             }
         }
+        // A non-zero curl exit is a transport or HTTP failure (offline, 403,
+        // 5xx), which says nothing about whether the AUR has the package.
+        Ok(out) if out.exit_code != 0 => DecisionRow {
+            source: "aur".to_string(),
+            availability: "unknown".to_string(),
+            recommended: false,
+            reason: format!("AUR RPC request failed: {}", out.stderr.trim()),
+            candidates: vec![],
+        },
         Ok(_) => DecisionRow {
             source: "aur".to_string(),
             availability: "unavailable".to_string(),
@@ -580,11 +604,19 @@ fn query_release_asset(target: &str, repo_url: Option<&str>, asset_type: &str) -
                 candidates: vec![],
             }
         }
-        Ok(_) => DecisionRow {
+        Ok(out) => DecisionRow {
             source: asset_type.to_string(),
-            availability: "unavailable".to_string(),
+            availability: if out.exit_code != 0 {
+                "unknown".to_string()
+            } else {
+                "unavailable".to_string()
+            },
             recommended: false,
-            reason: format!("Could not fetch release metadata from {}", api_url),
+            reason: format!(
+                "Could not fetch release metadata from {}: {}",
+                api_url,
+                out.stderr.trim()
+            ),
             candidates: vec![],
         },
         Err(e) => DecisionRow {

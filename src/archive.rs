@@ -249,3 +249,116 @@ pub fn snapshot_tarball_bytes(bytes: &[u8]) -> Result<SourceSnapshot, String> {
         reviews,
     })
 }
+
+/// Read one regular file out of a gzip tarball held in memory.
+pub fn read_tarball_entry(bytes: &[u8], wanted: &str) -> Result<Vec<u8>, String> {
+    let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(bytes));
+    let entries = archive
+        .entries()
+        .map_err(|e| format!("Failed to parse tar archive entries: {}", e))?;
+    for entry in entries {
+        let mut entry = entry.map_err(|e| format!("Failed to read archive entry: {}", e))?;
+        let path = entry
+            .path()
+            .map_err(|e| format!("Invalid path in archive entry: {}", e))?
+            .to_string_lossy()
+            .to_string();
+        if path.trim_start_matches("./") == wanted && entry.header().entry_type().is_file() {
+            let mut out = Vec::new();
+            entry
+                .read_to_end(&mut out)
+                .map_err(|e| format!("Failed to read '{}': {}", wanted, e))?;
+            return Ok(out);
+        }
+    }
+    Err(format!("'{}' is not in the archive", wanted))
+}
+
+/// Unpack the pinned gzip tarball into `dest`, optionally dropping a wrapping
+/// directory. Only regular files, directories and relative in-tree symlinks are
+/// written; absolute paths, `..` components and device nodes are refused, so a
+/// hostile archive cannot write outside the job directory.
+pub fn unpack_tarball_tree(
+    bytes: &[u8],
+    dest: &Path,
+    strip_prefix: Option<&str>,
+) -> Result<(), String> {
+    use std::path::Component;
+
+    let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(bytes));
+    let entries = archive
+        .entries()
+        .map_err(|e| format!("Failed to parse tar archive entries: {}", e))?;
+    for entry in entries {
+        let mut entry = entry.map_err(|e| format!("Failed to read archive entry: {}", e))?;
+        let raw = entry
+            .path()
+            .map_err(|e| format!("Invalid path in archive entry: {}", e))?
+            .into_owned();
+        let mut rel = raw.as_path();
+        if let Ok(stripped) = rel.strip_prefix(".") {
+            rel = stripped;
+        }
+        if let Some(prefix) = strip_prefix {
+            match rel.strip_prefix(prefix) {
+                Ok(stripped) => rel = stripped,
+                Err(_) => continue,
+            }
+        }
+        if rel.as_os_str().is_empty() {
+            continue;
+        }
+        if !rel.components().all(|c| matches!(c, Component::Normal(_))) {
+            return Err(format!(
+                "Unsafe path in source archive: '{}'",
+                raw.display()
+            ));
+        }
+        let target = dest.join(rel);
+        let kind = entry.header().entry_type();
+        if kind.is_dir() {
+            fs::create_dir_all(&target)
+                .map_err(|e| format!("Failed to create '{}': {}", rel.display(), e))?;
+        } else if kind.is_file() {
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent)
+                    .map_err(|e| format!("Failed to create '{}': {}", parent.display(), e))?;
+            }
+            let mut data = Vec::new();
+            entry
+                .read_to_end(&mut data)
+                .map_err(|e| format!("Failed to read '{}': {}", rel.display(), e))?;
+            fs::write(&target, &data)
+                .map_err(|e| format!("Failed to write '{}': {}", rel.display(), e))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = entry.header().mode().unwrap_or(0o644) & 0o755;
+                let _ = fs::set_permissions(&target, fs::Permissions::from_mode(mode | 0o600));
+            }
+        } else if kind.is_symlink() {
+            let link = entry
+                .link_name()
+                .map_err(|e| format!("Invalid link in '{}': {}", rel.display(), e))?
+                .ok_or_else(|| format!("Symlink '{}' has no target", rel.display()))?;
+            let link_text = link.to_string_lossy();
+            if link.is_absolute() || link_text.contains("..") {
+                return Err(format!(
+                    "Unsafe symlink in source archive: '{}' -> '{}'",
+                    rel.display(),
+                    link_text
+                ));
+            }
+            #[cfg(unix)]
+            {
+                if let Some(parent) = target.parent() {
+                    fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+                }
+                std::os::unix::fs::symlink(&*link, &target)
+                    .map_err(|e| format!("Failed to link '{}': {}", rel.display(), e))?;
+            }
+        }
+        // Device nodes, FIFOs and hard links carry nothing a build needs.
+    }
+    Ok(())
+}

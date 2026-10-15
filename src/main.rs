@@ -13,8 +13,17 @@ fn main() {
 
     let command = args[1].as_str();
     if command == "gui" || command == "--gui" || command == "ui" || command == "--ui" {
-        // Launch the native GPUI window — no Python subprocess needed
-        archbridge::gui::run_gui();
+        // Launch the native GPUI window — no Python subprocess needed. GPUI
+        // panics when no display or Vulkan-capable GPU is available; turn that
+        // into a readable error instead of a raw backtrace.
+        if std::panic::catch_unwind(archbridge::gui::run_gui).is_err() {
+            eprintln!(
+                "Error: ArchBridge could not open its window. A graphical session and a \
+                 Vulkan-capable GPU driver (e.g. mesa's vulkan drivers) are required. \
+                 The command-line interface works without them."
+            );
+            std::process::exit(1);
+        }
         return;
     }
 
@@ -245,7 +254,13 @@ fn handle_config(client: &mut DirectRpcClient, args: &[String]) -> Result<i32, S
             if positional.len() < 2 {
                 return usage_error("Usage: archbridge config set <key> <value>");
             }
-            report_extra_targets("config set", &positional, &mut problems);
+            // Key and value are both positional; only a third one is extra.
+            for extra in positional.iter().skip(2) {
+                problems.push(format!(
+                    "Unexpected argument '{}' for 'config set'; expected <key> <value>",
+                    extra
+                ));
+            }
             if !problems.is_empty() {
                 return usage_errors(&problems);
             }

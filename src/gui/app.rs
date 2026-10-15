@@ -223,6 +223,9 @@ impl ArchBridgeApp {
             .into_iter()
             .map(|(key, value)| (key.to_string(), value.to_string()))
             .collect();
+        // Every config write withdraws the engine's staged plans, so the build
+        // page must not keep offering one it can no longer run.
+        self.reset_build_flow("source preferences changed.");
         self.state.settings_busy = true;
         self.state.settings_msg = None;
         cx.notify();
@@ -536,6 +539,30 @@ impl ArchBridgeApp {
                             })
                             .unwrap_or_default();
 
+                        app.state.doctor_checked = true;
+                        for check in &checks {
+                            match check.name.as_str() {
+                                "disk_space" => {
+                                    app.state.free_disk_space = match check.status.as_str() {
+                                        "pass" | "fail" => check
+                                            .message
+                                            .split(" in ")
+                                            .next()
+                                            .unwrap_or(&check.message)
+                                            .replace("Only ", ""),
+                                        _ => "Unknown".to_string(),
+                                    }
+                                }
+                                "keyring" => {
+                                    app.state.keyring_status = if check.status == "pass" {
+                                        "Verified".to_string()
+                                    } else {
+                                        "Not ready".to_string()
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
                         let failed = checks.iter().filter(|c| c.status == "fail").count();
                         let unavailable =
                             checks.iter().filter(|c| c.status == "unavailable").count();
@@ -756,6 +783,7 @@ impl ArchBridgeApp {
         self.state.build_result = None;
         self.state.build_plan_consumed = false;
         self.state.install_plan_consumed = false;
+        self.state.last_prepare = Some((action, target.to_string()));
 
         self.state.build_busy = true;
         self.state.build_msg = None;
@@ -769,7 +797,7 @@ impl ArchBridgeApp {
                 match result {
                     Ok(val) => match serde_json::from_value::<crate::engine::Plan>(val) {
                         Ok(plan) => {
-                            let installing = plan.action == "install";
+                            let installing = plan.action == "install" && plan.decision.is_some();
                             app.state.active_plan = Some(plan);
                             app.state.build_stage = 2;
                             app.state.active_tab = ActiveTab::Build;
@@ -806,12 +834,43 @@ impl ArchBridgeApp {
 
     /// Prepare the plan the recommended source actually implies.
     pub fn prepare_plan_for_result(&mut self, result: &SearchResult, cx: &mut Context<Self>) {
-        let action = if result.source == "official" {
-            "install"
-        } else {
-            "build"
+        let hosted_repo = |url: &Option<String>| {
+            url.clone().filter(|u| {
+                u.starts_with("https://github.com/") || u.starts_with("https://gitlab.com/")
+            })
         };
-        self.prepare_plan(action, &result.name, cx);
+        match result.source.as_str() {
+            // The engine resolves an exact official name to `pacman -S` and an
+            // exact AUR name to a build of its pinned snapshot.
+            "official" | "aur" => self.prepare_plan("install", &result.name, cx),
+            // A GitHub search hit is named "owner/repo", which is not a build
+            // target; the repository URL is.
+            "upstream" => {
+                match hosted_repo(&result.source_url).or_else(|| hosted_repo(&result.url)) {
+                    Some(repo) => self.prepare_plan("build", &repo, cx),
+                    None => self.prepare_plan("build", &result.name, cx),
+                }
+            }
+            "flatpak" | "appimage" => {
+                self.state.active_tab = ActiveTab::Build;
+                self.state.build_msg = Some(StatusMsg {
+                    level: MsgLevel::Info,
+                    text: format!(
+                        "ArchBridge does not repackage {} releases. Download '{}'{} and run it \
+                         with its own tooling, or build from the upstream source instead.",
+                        result.source,
+                        result.name,
+                        result
+                            .url
+                            .as_deref()
+                            .map(|u| format!(" from {u}"))
+                            .unwrap_or_default()
+                    ),
+                });
+                cx.notify();
+            }
+            _ => self.prepare_plan("build", &result.name, cx),
+        }
     }
 
     pub fn authenticate_sudo(&mut self, cx: &mut Context<Self>) {
@@ -871,6 +930,8 @@ impl ArchBridgeApp {
                     cx.notify();
                     match pending.as_deref() {
                         Some("execute") => app.execute_plan(cx),
+                        Some("install_built") => app.install_built_package(cx),
+                        Some("reprepare") => app.reprepare_last_plan(cx),
                         Some("uninstall") => app.run_uninstall(cx),
                         _ => {}
                     }
@@ -1026,12 +1087,9 @@ impl ArchBridgeApp {
             return;
         }
         if !self.state.sudo_session_active {
-            self.state.active_plan = self
-                .state
-                .build_result
-                .as_ref()
-                .and_then(|r| r.next_plan.clone());
-            self.open_auth_dialog(Some("execute"));
+            // Routed back here after authentication. Sending it through
+            // `execute_plan` hit the consumed *build* plan and never installed.
+            self.open_auth_dialog(Some("install_built"));
             cx.notify();
             return;
         }
@@ -1054,6 +1112,21 @@ impl ArchBridgeApp {
                             // The install plan is consumed once it runs, so the
                             // button that ran it has to go with it.
                             app.state.build_stage = 5;
+                        } else if needs_reauth(&val) {
+                            // The consumed install plan cannot be resent, but
+                            // the pinned artifact can be staged again.
+                            app.state.sudo_session_active = false;
+                            if let Some(artifact) = app
+                                .state
+                                .build_result
+                                .as_ref()
+                                .and_then(|r| r.next_plan.as_ref())
+                                .and_then(|p| p.reviews.first())
+                                .map(|review| review.path.clone())
+                            {
+                                app.state.last_prepare = Some(("install", artifact));
+                                app.open_auth_dialog(Some("reprepare"));
+                            }
                         }
                         app.state.build_msg = Some(StatusMsg {
                             level: if ok {
@@ -1171,6 +1244,13 @@ impl ArchBridgeApp {
                             serde_json::from_value::<crate::engine::ExecutionResult>(val)
                         {
                             let ok = exec.ok;
+                            if !ok && exec.message.contains("password is required") {
+                                // The step ran without a live sudo credential.
+                                // This plan is consumed; collect a credential
+                                // and stage a fresh one for review.
+                                app.state.sudo_session_active = false;
+                                app.open_auth_dialog(Some("reprepare"));
+                            }
                             app.state.build_stage = if ok { 4 } else { 3 };
                             app.state.build_log = exec.output.clone().unwrap_or_default();
                             app.state.build_msg = Some(StatusMsg {
@@ -1195,9 +1275,11 @@ impl ArchBridgeApp {
                         });
                         if e.contains("password is required") || e.contains("authorize") {
                             // The cached sudo timestamp expired or was never
-                            // valid; collect a fresh one and retry the plan.
+                            // valid. The engine consumed the plan when it ran,
+                            // so after authenticating a fresh plan is prepared
+                            // for review; resending this one could never work.
                             app.state.sudo_session_active = false;
-                            app.open_auth_dialog(Some("execute"));
+                            app.open_auth_dialog(Some("reprepare"));
                         }
                     }
                 }
@@ -1205,6 +1287,14 @@ impl ArchBridgeApp {
             },
             cx,
         );
+    }
+
+    /// Stage the last prepared action again, for review, after the previous
+    /// plan was consumed by a run that needed a fresh credential.
+    fn reprepare_last_plan(&mut self, cx: &mut Context<Self>) {
+        if let Some((action, target)) = self.state.last_prepare.clone() {
+            self.prepare_plan(action, &target, cx);
+        }
     }
 
     pub fn run_uninstall(&mut self, cx: &mut Context<Self>) {
@@ -1255,6 +1345,10 @@ impl ArchBridgeApp {
                                     Ok(r) => {
                                         let ok =
                                             r.get("ok").and_then(|o| o.as_bool()).unwrap_or(false);
+                                        if !ok && needs_reauth(&r) {
+                                            app.state.sudo_session_active = false;
+                                            app.open_auth_dialog(Some("uninstall"));
+                                        }
                                         app.state.uninstall_msg = Some(StatusMsg {
                                             level: if ok {
                                                 MsgLevel::Success
@@ -5834,27 +5928,47 @@ fn render_bottom_bar(app: &ArchBridgeApp) -> impl IntoElement {
                         .flex()
                         .items_center()
                         .gap_1_5()
-                        .child(
-                            div()
-                                .w(px(7.0))
-                                .h(px(7.0))
-                                .rounded_full()
-                                .bg(rgb(ACCENT_GREEN)),
-                        )
+                        .child(div().w(px(7.0)).h(px(7.0)).rounded_full().bg(rgb(
+                            if !app.state.doctor_checked {
+                                pal.text_muted
+                            } else if app.state.doctor_ready {
+                                ACCENT_GREEN
+                            } else {
+                                ACCENT_RED
+                            },
+                        )))
                         .child(
                             div()
                                 .text_color(rgb(pal.text_secondary))
                                 .text_size(px(11.0))
-                                .child("Ready"),
+                                // Only the Doctor's verdict may say "Ready".
+                                .child(if !app.state.doctor_checked {
+                                    "System not checked"
+                                } else if app.state.doctor_ready {
+                                    "Ready"
+                                } else {
+                                    "Not ready"
+                                }),
                         ),
                 )
                 .child(div().w_px().h(px(10.0)).bg(rgb(pal.border_subtle)))
-                // Active Chroot
+                // Live engine activity
                 .child(
                     div()
                         .text_color(rgb(pal.text_muted))
                         .text_size(px(11.0))
-                        .child(format!("Active Chroot: {}", app.state.active_chroot)),
+                        .child(format!(
+                            "Engine: {}",
+                            if app.state.engine_busy() {
+                                app.state
+                                    .progress
+                                    .phase
+                                    .clone()
+                                    .unwrap_or_else(|| "Working".to_string())
+                            } else {
+                                "Idle".to_string()
+                            }
+                        )),
                 )
                 .child(div().w_px().h(px(10.0)).bg(rgb(pal.border_subtle)))
                 // Disk Space
@@ -5871,12 +5985,14 @@ fn render_bottom_bar(app: &ArchBridgeApp) -> impl IntoElement {
                         .flex()
                         .items_center()
                         .gap_1()
-                        .child(
-                            div()
-                                .text_color(rgb(ACCENT_GREEN))
-                                .text_size(px(11.0))
-                                .child("✓"),
-                        )
+                        .when(app.state.keyring_status == "Verified", |row| {
+                            row.child(
+                                div()
+                                    .text_color(rgb(ACCENT_GREEN))
+                                    .text_size(px(11.0))
+                                    .child("✓"),
+                            )
+                        })
                         .child(
                             div()
                                 .text_color(rgb(pal.text_muted))
@@ -5905,6 +6021,14 @@ fn render_bottom_bar(app: &ArchBridgeApp) -> impl IntoElement {
                         .child("ArchBridge"),
                 ),
         )
+}
+
+/// True when an execution result says the step ran without a sudo credential.
+fn needs_reauth(result: &Value) -> bool {
+    result
+        .get("message")
+        .and_then(|m| m.as_str())
+        .is_some_and(|m| m.contains("password is required"))
 }
 
 #[cfg(test)]

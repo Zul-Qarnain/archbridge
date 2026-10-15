@@ -307,6 +307,26 @@ pub fn sanitize_entry_name(raw: &str) -> String {
     name
 }
 
+/// `name`, optionally followed by one of `=`, `<`, `>`, `<=`, `>=` and a version.
+pub fn is_dependency_spec(dep: &str) -> bool {
+    let name_char = |c: char| c.is_ascii_alphanumeric() || matches!(c, '@' | '.' | '_' | '+' | '-');
+    let split = dep.find(['<', '>', '=']).unwrap_or(dep.len());
+    let (name, constraint) = dep.split_at(split);
+    if name.is_empty() || name.starts_with(['-', '.']) || !name.chars().all(name_char) {
+        return false;
+    }
+    if constraint.is_empty() {
+        return true;
+    }
+    let version = constraint.trim_start_matches(['<', '>', '=']);
+    let operator = &constraint[..constraint.len() - version.len()];
+    matches!(operator, "=" | "<" | ">" | "<=" | ">=")
+        && !version.is_empty()
+        && version
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '+' | ':' | '-' | '~'))
+}
+
 pub fn generate_pkgbuild(system: &BuildSystem, params: &PkgbuildParams) -> Result<String, String> {
     let pkgname = normalize_name(&params.name.replace('_', "-"));
     let (pkgver, epoch_line) = normalize_version(if params.version.is_empty() {
@@ -335,6 +355,17 @@ pub fn generate_pkgbuild(system: &BuildSystem, params: &PkgbuildParams) -> Resul
         None => "\"$srcdir\"".to_string(),
     };
 
+    // Dependencies are spliced into a single-quoted bash array that makepkg
+    // sources, so a quote in one would run whatever follows it. Only what a
+    // pacman dependency can actually look like is accepted.
+    for dep in &params.dependencies {
+        if !is_dependency_spec(dep) {
+            return Err(format!(
+                "Dependency '{}' is not a valid pacman dependency (expected a package name, optionally with a version constraint such as 'glibc>=2.38')",
+                dep
+            ));
+        }
+    }
     let depends_str = if params.dependencies.is_empty() {
         "()".to_string()
     } else {

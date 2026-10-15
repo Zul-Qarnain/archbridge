@@ -2,7 +2,7 @@ use crate::doctor::run_doctor;
 use crate::engine::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::io::{BufRead, Write};
+use std::io::{BufRead, Read, Write};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JsonRpcRequest {
@@ -184,13 +184,18 @@ impl RpcServer {
                         .prepare_search(target, req_obj.get("repo").and_then(|r| r.as_str())),
                     "inspect" => self.engine.prepare_inspect(target).map(|(plan, _)| plan),
                     "config.set" => {
-                        let k = req.params.get("key").and_then(|k| k.as_str()).unwrap_or("");
-                        let v = req
-                            .params
-                            .get("value")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("");
-                        self.engine.prepare_config_set(k, v)
+                        // Accept the key/value at the top level (CLI) or inside
+                        // `request` like every other action.
+                        let field = |name: &str| {
+                            req_obj
+                                .get(name)
+                                .or_else(|| req.params.get(name))
+                                .and_then(|v| v.as_str())
+                        };
+                        match (field("key"), field("value")) {
+                            (Some(k), Some(v)) => self.engine.prepare_config_set(k, v),
+                            _ => Err("config.set requires string 'key' and 'value'".to_string()),
+                        }
                     }
                     "build" => {
                         self.engine
@@ -222,6 +227,7 @@ impl RpcServer {
             }
             _ => Err(format!("Method not found: '{}'", req.method)),
         };
+        let method_missing = matches!(&res, Err(e) if e.starts_with("Method not found"));
 
         if phase_label.is_some() {
             crate::process::end_phase();
@@ -239,7 +245,8 @@ impl RpcServer {
                 id: req.id,
                 result: None,
                 error: Some(JsonRpcError {
-                    code: -32000,
+                    // JSON-RPC 2.0 reserves -32601 for an unknown method.
+                    code: if method_missing { -32601 } else { -32000 },
                     message: e,
                 }),
             },
@@ -251,9 +258,19 @@ impl RpcServer {
         mut reader: R,
         mut writer: W,
     ) -> Result<(), String> {
+        const MAX_FRAME: u64 = 1_048_576;
         let mut line = String::new();
-        while reader.read_line(&mut line).map_err(|e| e.to_string())? > 0 {
-            if line.len() > 1_048_576 {
+        loop {
+            // Bounded read: an unterminated multi-gigabyte "line" used to be
+            // buffered in full before the size check ever ran.
+            let read = (&mut reader)
+                .take(MAX_FRAME + 1)
+                .read_line(&mut line)
+                .map_err(|e| e.to_string())?;
+            if read == 0 {
+                break;
+            }
+            if line.len() as u64 > MAX_FRAME {
                 let err_resp = JsonRpcResponse {
                     jsonrpc: "2.0".to_string(),
                     id: None,

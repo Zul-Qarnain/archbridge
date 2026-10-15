@@ -113,8 +113,10 @@ pub struct AppState {
     pub search_history: Vec<String>,
     pub show_history_menu: bool,
     pub doctor_ready: bool,
+    /// False until the Doctor has actually run: the status bar may not claim
+    /// readiness, disk space or keyring state it never measured.
+    pub doctor_checked: bool,
     pub sudo_session_active: bool,
-    pub active_chroot: String,
     pub free_disk_space: String,
     pub keyring_status: String,
 
@@ -151,6 +153,9 @@ pub struct AppState {
     /// Same, for the install plan a successful build hands off to.
     pub install_plan_consumed: bool,
     pub build_msg: Option<StatusMsg>,
+    /// The last action/target sent to `v1.prepare`, so a plan consumed by a run
+    /// that needed re-authentication can be staged again for review.
+    pub last_prepare: Option<(&'static str, String)>,
 
     // ──────────────────── uninstall ─────────────────────
     pub installed_packages: Vec<InstalledPackage>,
@@ -217,10 +222,10 @@ impl Default for AppState {
             search_history: Vec::new(),
             show_history_menu: false,
             doctor_ready: false,
+            doctor_checked: false,
             sudo_session_active: false,
-            active_chroot: "None".into(),
-            free_disk_space: "47 GiB Free".into(),
-            keyring_status: "Verified".into(),
+            free_disk_space: "Not checked".into(),
+            keyring_status: "Not checked".into(),
 
             // Clean default Discovery state
             search_query: "".into(),
@@ -246,6 +251,7 @@ impl Default for AppState {
             build_plan_consumed: false,
             install_plan_consumed: false,
             build_msg: None,
+            last_prepare: None,
 
             installed_packages: Vec::new(),
             installed_loading: false,

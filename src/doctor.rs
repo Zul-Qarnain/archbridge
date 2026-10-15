@@ -108,6 +108,13 @@ pub fn evaluate_network_probe_result(
                     || stderr_lower.contains("timed out")
                     || stderr_lower.contains("operation timeout");
 
+                // curl's exit code is authoritative; the stderr keywords are only
+                // a fallback. "SSL connection timeout" (exit 28) is an offline
+                // network, not a certificate failure.
+                let offline_code = matches!(out.exit_code, 5 | 6 | 7 | 28 | 52);
+                let tls_code = matches!(out.exit_code, 35 | 51 | 58 | 59 | 60 | 77 | 82 | 83 | 90);
+                let is_tls_error = tls_code || (!offline_code && is_tls_error);
+
                 if is_tls_error {
                     CheckResult {
                         name: "network".to_string(),
@@ -317,6 +324,27 @@ pub fn check_disk_space(workspace: &Path) -> CheckResult {
     }
 }
 
+/// Locate an executable on `PATH` without spawning `which`, which is not part
+/// of Arch's `base` and made every tool look missing on minimal hosts.
+pub fn find_in_path(program: &str) -> Option<std::path::PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join(program))
+        .find(|candidate| {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::metadata(candidate)
+                    .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+                    .unwrap_or(false)
+            }
+            #[cfg(not(unix))]
+            {
+                candidate.is_file()
+            }
+        })
+}
+
 pub fn run_doctor() -> DoctorReport {
     run_doctor_with_probe(probe_network, DEFAULT_NETWORK_ENDPOINT)
 }
@@ -328,26 +356,17 @@ where
     let mut checks = Vec::new();
 
     // 1. pacman
-    let step_pacman = Step::new("which", vec!["pacman"], "Check pacman presence", 5);
-    if let Ok(out) = run_step(&step_pacman, None) {
-        if out.exit_code == 0 {
-            checks.push(CheckResult {
-                name: "pacman".to_string(),
-                status: "pass".to_string(),
-                message: "pacman package manager is installed".to_string(),
-            });
-        } else {
-            checks.push(CheckResult {
-                name: "pacman".to_string(),
-                status: "fail".to_string(),
-                message: "pacman executable not found in PATH".to_string(),
-            });
-        }
+    if find_in_path("pacman").is_some() {
+        checks.push(CheckResult {
+            name: "pacman".to_string(),
+            status: "pass".to_string(),
+            message: "pacman package manager is installed".to_string(),
+        });
     } else {
         checks.push(CheckResult {
             name: "pacman".to_string(),
             status: "fail".to_string(),
-            message: "Failed to check pacman executable".to_string(),
+            message: "pacman executable not found in PATH".to_string(),
         });
     }
 
@@ -383,20 +402,8 @@ where
     }
 
     // 3. devtools (mkarchroot & makechrootpkg)
-    let step_mkchroot = Step::new(
-        "which",
-        vec!["mkarchroot"],
-        "Check devtools (mkarchroot)",
-        5,
-    );
-    let step_makechrootpkg = Step::new(
-        "which",
-        vec!["makechrootpkg"],
-        "Check devtools (makechrootpkg)",
-        5,
-    );
-    let mk_ok = run_step(&step_mkchroot, None).is_ok_and(|o| o.exit_code == 0);
-    let pkg_ok = run_step(&step_makechrootpkg, None).is_ok_and(|o| o.exit_code == 0);
+    let mk_ok = find_in_path("mkarchroot").is_some();
+    let pkg_ok = find_in_path("makechrootpkg").is_some();
     if mk_ok && pkg_ok {
         checks.push(CheckResult {
             name: "devtools".to_string(),

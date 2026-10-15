@@ -1,11 +1,15 @@
-use crate::archive::{snapshot_directory, snapshot_tarball_bytes, FileReview};
+use crate::archive::{read_tarball_entry, snapshot_directory, snapshot_tarball_bytes, FileReview};
 use crate::build::{
     execute_chroot_build, run_runtime_smoke_test, snapshot_foreign_package, SmokeTestReport,
+    SourceLayout,
 };
 use crate::config::Config;
 use crate::discovery::{search, DecisionReport};
 use crate::inspect::inspect_package;
-use crate::process::{begin_phase, bump_phase_total, end_phase, run_step, run_step_bytes, Step};
+use crate::process::{
+    begin_phase, bump_phase_total, end_phase, run_step, run_step_bytes, run_step_untracked,
+    ProcessOutput, Step,
+};
 use crate::recipe::{
     detect_build_system, detect_build_system_in_archive, generate_pkgbuild, sanitize_entry_name,
     BuildSystem, PkgbuildParams,
@@ -15,7 +19,7 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -67,15 +71,40 @@ pub struct StagedBuild {
     pub target: String,
     pub pkgbuild: String,
     pub source_tarball: Vec<u8>,
+    /// How the pinned source bytes are laid out in the job directory.
+    pub source_layout: SourceLayout,
     pub entry: String,
     pub smoke_args: Vec<String>,
     pub run_smoke_test: bool,
     pub artifact_path: Option<PathBuf>,
 }
 
+/// Everything execution needs beyond the reviewed `Plan` itself. Execution
+/// reads these typed values instead of re-parsing human-readable plan text,
+/// which broke on any value containing a quote.
+pub enum StagedAction {
+    Build(StagedBuild),
+    Config {
+        key: String,
+        value: String,
+    },
+    /// Install a package file whose bytes were hashed at review time.
+    InstallFile {
+        package: PathBuf,
+        sha256: String,
+    },
+    /// Smoke test a package file whose bytes were hashed at review time.
+    Test {
+        package: PathBuf,
+        sha256: String,
+        entry: String,
+        smoke_args: Vec<String>,
+    },
+}
+
 pub struct Engine {
     pub config: Config,
-    pub pending_plans: HashMap<String, (Plan, Instant, Option<StagedBuild>)>,
+    pub pending_plans: HashMap<String, (Plan, Instant, Option<StagedAction>)>,
 }
 
 impl Default for Engine {
@@ -123,7 +152,9 @@ impl SudoKeepalive {
                     "Refresh cached sudo timestamp",
                     15,
                 );
-                if run_step(&step, None).is_err() {
+                // Untracked: a background refresh is not a plan step and must
+                // not advance the visible progress of the build it protects.
+                if run_step_untracked(&step, None).is_err() {
                     return;
                 }
             })
@@ -357,7 +388,7 @@ impl Engine {
     /// Stage a plan so it becomes executable, dropping any plan whose review
     /// window has already closed. A daemon can serve searches for days; without
     /// this the pending store grows without bound and keeps stale consent alive.
-    fn stage_plan(&mut self, plan: Plan, staged: Option<StagedBuild>) -> Plan {
+    fn stage_plan(&mut self, plan: Plan, staged: Option<StagedAction>) -> Plan {
         self.purge_expired();
         self.pending_plans
             .insert(plan.plan_id.clone(), (plan.clone(), Instant::now(), staged));
@@ -469,7 +500,13 @@ impl Engine {
             blocked: None,
         };
 
-        let plan = self.stage_plan(plan, None);
+        let plan = self.stage_plan(
+            plan,
+            Some(StagedAction::Config {
+                key: key.to_string(),
+                value: value.to_string(),
+            }),
+        );
         Ok(plan)
     }
 
@@ -482,17 +519,10 @@ impl Engine {
         deps: &[String],
         smoke_args: &[String],
     ) -> Result<Plan, String> {
-        let inferred_name = name_opt.map(str::to_string).unwrap_or_else(|| {
-            if let Some(pos) = target.rfind('/') {
-                target[pos + 1..].to_string()
-            } else {
-                target.to_string()
-            }
-        });
-        let name = inferred_name
-            .strip_suffix(".deb")
-            .or_else(|| inferred_name.strip_suffix(".rpm"))
-            .unwrap_or(&inferred_name);
+        let inferred_name = name_opt
+            .map(str::to_string)
+            .unwrap_or_else(|| infer_target_name(target));
+        let name = inferred_name.as_str();
         let default_entry = sanitize_entry_name(name);
         let entry = entry_opt.unwrap_or(&default_entry);
         let version = ver_opt.unwrap_or("1.0.0");
@@ -500,6 +530,10 @@ impl Engine {
         let job_id = format!("job-{}", generate_plan_id("build", target));
         let job_dir = PathBuf::from(".archbridge").join("jobs").join(&job_id);
 
+        let mut source_layout = SourceLayout::Tarball;
+        // A PKGBUILD the user (or the AUR) wrote names its own binaries, so a
+        // smoke test only runs when an entry point is named explicitly.
+        let mut user_pkgbuild = false;
         let (mut snapshot, build_sys, pkgbuild, package_name) = if target.ends_with(".deb")
             || target.ends_with(".rpm")
         {
@@ -565,9 +599,44 @@ impl Engine {
         } else if target.ends_with("PKGBUILD") {
             let pkgbuild_content = fs::read_to_string(target)
                 .map_err(|e| format!("Failed to read PKGBUILD at '{}': {}", target, e))?;
-            let parent_dir = Path::new(target).parent().unwrap_or_else(|| Path::new("."));
+            let parent_dir = match Path::new(target).parent() {
+                Some(dir) if !dir.as_os_str().is_empty() => dir,
+                _ => Path::new("."),
+            };
+            // The PKGBUILD's local sources (patches, .install files) sit beside
+            // it, so the whole directory is pinned and unpacked into the job.
             let snap = snapshot_directory(parent_dir)?;
-            (snap, BuildSystem::Make, pkgbuild_content, name.to_string())
+            source_layout = SourceLayout::Tree { strip_prefix: None };
+            user_pkgbuild = true;
+            let pkg = name_opt
+                .map(str::to_string)
+                .or_else(|| pkgbuild_pkgname(&pkgbuild_content))
+                .unwrap_or_else(|| infer_target_name(&parent_dir.to_string_lossy()));
+            (snap, BuildSystem::Make, pkgbuild_content, pkg)
+        } else if target.starts_with("https://aur.archlinux.org/") {
+            let bytes = download_gzip_archive(target)?;
+            let snap = snapshot_tarball_bytes(&bytes)?;
+            // An AUR snapshot is `<pkgbase>/PKGBUILD` plus its local sources.
+            let pkgbuild_path = snap
+                .reviews
+                .iter()
+                .map(|review| review.path.as_str())
+                .find(|path| path.ends_with("/PKGBUILD") && path.matches('/').count() == 1)
+                .map(str::to_string)
+                .ok_or_else(|| format!("AUR snapshot '{}' does not contain a PKGBUILD", target))?;
+            let pkgbuild_bytes = read_tarball_entry(&bytes, &pkgbuild_path)?;
+            let pkgbuild_content = String::from_utf8(pkgbuild_bytes)
+                .map_err(|_| format!("PKGBUILD in '{}' is not valid UTF-8", target))?;
+            let root = pkgbuild_path.trim_end_matches("/PKGBUILD").to_string();
+            source_layout = SourceLayout::Tree {
+                strip_prefix: Some(root),
+            };
+            user_pkgbuild = true;
+            let pkg = name_opt
+                .map(str::to_string)
+                .or_else(|| pkgbuild_pkgname(&pkgbuild_content))
+                .unwrap_or_else(|| name.to_string());
+            (snap, BuildSystem::Make, pkgbuild_content, pkg)
         } else if Path::new(target).exists() && Path::new(target).is_dir() {
             let snap = snapshot_directory(Path::new(target))?;
             let bsys = detect_build_system(Path::new(target));
@@ -614,47 +683,9 @@ impl Engine {
             let upstream_version = upstream
                 .and_then(|r| r.candidates.first())
                 .and_then(|c| c.version.clone());
-            let step = Step::new(
-                "curl",
-                vec![
-                    "-fsSL",
-                    "--max-time",
-                    "120",
-                    "--max-filesize",
-                    &MAX_SOURCE_ARCHIVE_BYTES.to_string(),
-                    &url,
-                ],
-                "Download upstream source archive",
-                150,
-            );
-            let download = run_step_bytes(&step, None)?;
-            if download.exit_code != 0 {
-                return Err(format!(
-                    "Failed to download '{}' (curl exit {}): {}",
-                    url,
-                    download.exit_code,
-                    download.stderr.trim()
-                ));
-            }
-            if !download.bytes.starts_with(&[0x1F, 0x8B]) {
-                let head =
-                    String::from_utf8_lossy(&download.bytes[..download.bytes.len().min(200)])
-                        .trim()
-                        .to_string();
-                return Err(if head.starts_with('<') {
-                    format!(
-                        "'{}' returned a web page instead of a source archive; the release URL is not directly downloadable.",
-                        url
-                    )
-                } else {
-                    format!(
-                        "'{}' is not a gzip-compressed tar archive; ArchBridge builds upstream sources from .tar.gz only.",
-                        url
-                    )
-                });
-            }
+            let bytes = download_gzip_archive(&url)?;
 
-            let snap = snapshot_tarball_bytes(&download.bytes)?;
+            let snap = snapshot_tarball_bytes(&bytes)?;
             let (bsys, src_subdir) = detect_build_system_in_archive(&snap.reviews);
             let params = PkgbuildParams {
                 name: name.to_string(),
@@ -724,7 +755,8 @@ impl Engine {
             ),
         ];
 
-        let run_smoke_test = !matches!(&build_sys, BuildSystem::Imported) || entry_opt.is_some();
+        let run_smoke_test =
+            !(matches!(&build_sys, BuildSystem::Imported) || user_pkgbuild) || entry_opt.is_some();
         if run_smoke_test {
             steps.push(Step::new(
                 "systemd-nspawn",
@@ -762,10 +794,17 @@ impl Engine {
             protocol_version: "v1.0".to_string(),
             plan_id: plan_id.clone(),
             action: "build".to_string(),
-            summary: format!(
-                "Build '{}' with detected build system '{:?}': unprivileged makepkg first, isolated clean chroot as fallback",
-                package_name, build_sys
-            ),
+            summary: if user_pkgbuild {
+                format!(
+                    "Build '{}' from its own PKGBUILD: unprivileged makepkg first, isolated clean chroot as fallback",
+                    package_name
+                )
+            } else {
+                format!(
+                    "Build '{}' with detected build system '{:?}': unprivileged makepkg first, isolated clean chroot as fallback",
+                    package_name, build_sys
+                )
+            },
             steps,
             filesystem_changes,
             reviews: snapshot.reviews,
@@ -774,8 +813,12 @@ impl Engine {
                     "The native build needs no administrator rights; the clean chroot fallback does, and it is only used if the native build produces no package".to_string(),
                 ];
                 if run_smoke_test {
+                    notes
+                        .push("Built package is smoke tested in an isolated container".to_string());
+                } else if user_pkgbuild {
                     notes.push(
-                        "Built package is smoke tested in an isolated container".to_string(),
+                        "This PKGBUILD runs as written: review every line above before confirming. A runtime smoke test requires an explicit entry binary"
+                            .to_string(),
                     );
                 } else {
                     notes.push(
@@ -801,17 +844,22 @@ impl Engine {
             target: target.to_string(),
             pkgbuild,
             source_tarball: snapshot.tarball_bytes,
+            source_layout,
             entry: entry.to_string(),
             smoke_args: smoke_args.to_vec(),
             run_smoke_test,
             artifact_path: None,
         };
 
-        let plan = self.stage_plan(plan, Some(staged));
+        let plan = self.stage_plan(plan, Some(StagedAction::Build(staged)));
         Ok(plan)
     }
 
     pub fn prepare_install(&mut self, target: &str) -> Result<Plan, String> {
+        let target = target.trim();
+        if target.is_empty() {
+            return Err("Install requires a package name or file".to_string());
+        }
         if target.ends_with(".deb") || target.ends_with(".rpm") {
             return self.prepare_build(target, None, None, None, &[], &[]);
         }
@@ -822,27 +870,103 @@ impl Engine {
         }
 
         if target.contains(".pkg.tar.") {
-            let plan_id = generate_plan_id("install", target);
+            let (package, sha256, bytes) = pin_package_file(target)?;
+            let shown = package.to_string_lossy().to_string();
+            let plan_id = generate_plan_id("install", &shown);
             let steps = vec![Step::new(
                 "sudo",
-                vec!["-n", "pacman", "-U", "--noconfirm", target],
+                vec!["-n", "pacman", "-U", "--noconfirm", "--", shown.as_str()],
                 "Install prebuilt native package",
-                60,
+                120,
             )];
             let plan = Plan {
                 protocol_version: "v1.0".to_string(),
                 plan_id: plan_id.clone(),
                 action: "install".to_string(),
-                summary: format!("Install native Arch package '{}'", target),
+                summary: format!("Install native Arch package '{}'", shown),
                 steps,
                 filesystem_changes: vec![FilesystemChange {
                     path: "/".to_string(),
                     action: "modify".to_string(),
-                    description: format!("Install package '{}' to live system root", target),
+                    description: format!("Install package '{}' to live system root", shown),
+                }],
+                reviews: vec![FileReview {
+                    path: shown.clone(),
+                    sha256: sha256.clone(),
+                    bytes,
+                    executable: false,
+                    content: None,
+                }],
+                warnings: vec![
+                    "Modifies system packages on host".to_string(),
+                    "The package is re-hashed before pacman runs; any change since review aborts the install".to_string(),
+                ],
+                decision: None,
+                downstream: None,
+                blocked: None,
+            };
+            let plan = self.stage_plan(plan, Some(StagedAction::InstallFile { package, sha256 }));
+            return Ok(plan);
+        }
+
+        // Local sources and hosted repositories are built, not looked up.
+        if Path::new(target).exists()
+            || target.starts_with("https://github.com/")
+            || target.starts_with("https://gitlab.com/")
+            || target.starts_with("https://aur.archlinux.org/")
+        {
+            return self.prepare_build(target, None, None, None, &[], &[]);
+        }
+        if !is_package_name(target) {
+            return Err(format!(
+                "'{}' is not a package name, an existing path, or a supported repository URL",
+                target
+            ));
+        }
+
+        let report = search(target, None, &self.config);
+        let exact = |source: &str| {
+            report
+                .decision_table
+                .iter()
+                .find(|row| row.source == source && row.availability == "available")
+                .and_then(|row| row.candidates.iter().find(|c| c.name == target))
+                .cloned()
+        };
+
+        // `pacman -Ss` is a substring search: "foo" finds "libfoo". Only an
+        // exact name may become a `pacman -S` argument, or the plan installs
+        // nothing (or something else) after the user confirmed it.
+        if exact("official").is_some() {
+            let plan_id = generate_plan_id("install", target);
+            let steps = vec![Step::new(
+                "sudo",
+                vec![
+                    "-n",
+                    "pacman",
+                    "-S",
+                    "--needed",
+                    "--noconfirm",
+                    "--",
+                    target,
+                ],
+                "Install official Arch package",
+                600,
+            )];
+            let plan = Plan {
+                protocol_version: "v1.0".to_string(),
+                plan_id: plan_id.clone(),
+                action: "install".to_string(),
+                summary: format!("Install official package '{}' via pacman", target),
+                steps,
+                filesystem_changes: vec![FilesystemChange {
+                    path: "/".to_string(),
+                    action: "modify".to_string(),
+                    description: format!("Install package '{}' and its dependencies", target),
                 }],
                 reviews: vec![],
                 warnings: vec!["Modifies system packages on host".to_string()],
-                decision: None,
+                decision: Some(report),
                 downstream: None,
                 blocked: None,
             };
@@ -850,36 +974,21 @@ impl Engine {
             return Ok(plan);
         }
 
-        let report = search(target, None, &self.config);
-        let rec = report.recommended_source.clone();
-
-        match rec.as_deref() {
-            Some("official") => {
-                let plan_id = generate_plan_id("install", target);
-                let steps = vec![Step::new(
-                    "sudo",
-                    vec!["-n", "pacman", "-S", "--needed", "--noconfirm", target],
-                    "Install official Arch package",
-                    60,
-                )];
-                let plan = Plan {
-                    protocol_version: "v1.0".to_string(),
-                    plan_id: plan_id.clone(),
-                    action: "install".to_string(),
-                    summary: format!("Install official package '{}' via pacman", target),
-                    steps,
-                    filesystem_changes: vec![],
-                    reviews: vec![],
-                    warnings: vec![],
-                    decision: Some(report),
-                    downstream: None,
-                    blocked: None,
-                };
-                let plan = self.stage_plan(plan, None);
-                Ok(plan)
-            }
-            _ => self.prepare_build(target, None, None, None, &[], &[]),
+        if let Some(snapshot) = exact("aur").and_then(|c| c.source_url) {
+            return self.prepare_build(&snapshot, Some(target), None, None, &[], &[]);
         }
+
+        let reasons = report
+            .decision_table
+            .iter()
+            .filter(|row| row.availability != "disabled")
+            .map(|row| format!("{}: {}", row.source, row.reason))
+            .collect::<Vec<_>>()
+            .join("; ");
+        Err(format!(
+            "No source can install '{}' directly. Official repositories and the AUR have no package with exactly this name. Build it from a repository URL, a source directory or a PKGBUILD instead. ({})",
+            target, reasons
+        ))
     }
 
     pub fn prepare_uninstall(&mut self, target: &str) -> Result<Plan, String> {
@@ -932,28 +1041,53 @@ impl Engine {
         &mut self,
         pkg_path: &str,
         entry_opt: Option<&str>,
-        _smoke_args: &[String],
+        smoke_args: &[String],
     ) -> Result<Plan, String> {
-        let entry = entry_opt.unwrap_or_else(|| {
-            if let Some(pos) = pkg_path.rfind('/') {
-                &pkg_path[pos + 1..]
-            } else {
+        if !pkg_path.contains(".pkg.tar.") {
+            return Err(format!(
+                "'{}' is not a built Arch package (.pkg.tar.*); only those can be smoke tested",
                 pkg_path
-            }
-        });
+            ));
+        }
+        let (package, sha256, bytes) = pin_package_file(pkg_path)?;
+        let entry = match entry_opt {
+            Some(entry) => entry.to_string(),
+            None => package
+                .file_name()
+                .and_then(|name| package_name_from_file(&name.to_string_lossy()))
+                .ok_or_else(|| {
+                    format!(
+                        "Cannot infer the entry binary from '{}'; pass --entry",
+                        pkg_path
+                    )
+                })?,
+        };
+        if entry.is_empty() || entry.contains('/') || entry.starts_with('-') {
+            return Err(format!(
+                "Entry binary '{}' must be a plain file name inside the package",
+                entry
+            ));
+        }
+        let shown = package.to_string_lossy().to_string();
 
-        let plan_id = generate_plan_id("test", pkg_path);
+        let plan_id = generate_plan_id("test", &shown);
+        let mut args = vec![
+            "--private-users=pick".to_string(),
+            "--private-network".to_string(),
+            "--user".to_string(),
+            "65534".to_string(),
+            "-D".to_string(),
+            "<temporary root holding only this package>".to_string(),
+            entry.clone(),
+        ];
+        if smoke_args.is_empty() {
+            args.push("--version".to_string());
+        } else {
+            args.extend(smoke_args.iter().cloned());
+        }
         let steps = vec![Step::new(
             "systemd-nspawn",
-            vec![
-                "--private-users=pick",
-                "--private-network",
-                "--user",
-                "65534",
-                "-D",
-                "/tmp/disposable_test_root",
-                entry,
-            ],
+            args,
             "Execute runtime smoke test",
             30,
         )];
@@ -964,18 +1098,32 @@ impl Engine {
             action: "test".to_string(),
             summary: format!(
                 "Test package artifact '{}' with entry binary '{}'",
-                pkg_path, entry
+                shown, entry
             ),
             steps,
             filesystem_changes: vec![],
-            reviews: vec![],
+            reviews: vec![FileReview {
+                path: shown.clone(),
+                sha256: sha256.clone(),
+                bytes,
+                executable: false,
+                content: None,
+            }],
             warnings: vec!["Runs package binary in isolated container".to_string()],
             decision: None,
             downstream: None,
             blocked: None,
         };
 
-        let plan = self.stage_plan(plan, None);
+        let plan = self.stage_plan(
+            plan,
+            Some(StagedAction::Test {
+                package,
+                sha256,
+                entry,
+                smoke_args: smoke_args.to_vec(),
+            }),
+        );
         Ok(plan)
     }
 
@@ -1015,13 +1163,14 @@ impl Engine {
         // count if the chroot fallback is needed.
         let total_steps = match plan.action.as_str() {
             "build" => 1,
-            "install" | "uninstall" => plan.steps.len(),
+            "install" | "uninstall" | "test" => plan.steps.len(),
             _ => 0,
         };
         let label = match plan.action.as_str() {
             "build" => "Building package",
             "install" => "Installing package",
             "uninstall" => "Uninstalling package",
+            "test" => "Smoke testing package",
             other => other,
         };
         begin_phase(label, total_steps);
@@ -1034,7 +1183,7 @@ impl Engine {
         &mut self,
         plan_id: &str,
         plan: Plan,
-        staged_opt: Option<StagedBuild>,
+        staged_opt: Option<StagedAction>,
     ) -> Result<ExecutionResult, String> {
         // Privileged plans can run for many minutes; refresh the cached sudo
         // timestamp in the background so later `sudo -n` steps keep working.
@@ -1059,17 +1208,10 @@ impl Engine {
                 next_plan: None,
             }),
             "config.set" => {
-                let change = plan
-                    .filesystem_changes
-                    .first()
-                    .ok_or("config.set plan carries no recorded change")?;
-                let (k, v) = change
-                    .description
-                    .strip_prefix("Update configuration key '")
-                    .and_then(|s| s.split_once("' = '"))
-                    .ok_or("config.set plan recorded an unreadable change")?;
-                let val = v.trim_end_matches('\'');
-                self.config.set(k, val)?;
+                let Some(StagedAction::Config { key: k, value: val }) = staged_opt else {
+                    return Err("config.set plan carries no staged change".to_string());
+                };
+                self.config.set(&k, &val)?;
                 self.config.save()?;
                 // Every other staged plan was reviewed under the old preferences:
                 // its recommendation, pinned sources and step list can all change
@@ -1084,12 +1226,16 @@ impl Engine {
                 })
             }
             "build" => {
-                if let Some(staged) = staged_opt {
+                if let Some(StagedAction::Build(staged)) = staged_opt {
                     let job_dir = PathBuf::from(".archbridge")
                         .join("jobs")
                         .join(&staged.job_id);
-                    let art_path =
-                        execute_chroot_build(&job_dir, &staged.pkgbuild, &staged.source_tarball)?;
+                    let art_path = execute_chroot_build(
+                        &job_dir,
+                        &staged.pkgbuild,
+                        &staged.source_tarball,
+                        &staged.source_layout,
+                    )?;
                     // The install plan shells out to `pacman -U` in a later RPC, and the
                     // job directory is recorded relative to the CWD that built it. Store
                     // the absolute path so the install works from any working directory.
@@ -1102,11 +1248,18 @@ impl Engine {
                             format!("{e}; the build itself succeeded at {}", art_path.display())
                         })?;
 
+                    let mut smoke_note = None;
                     if staged.run_smoke_test {
                         bump_phase_total(1);
                         let smoke_res: SmokeTestReport =
                             run_runtime_smoke_test(&art_path, &staged.entry, &staged.smoke_args)?;
-                        if !smoke_res.passed {
+                        if smoke_res.inconclusive {
+                            // The package could not be exercised in isolation (it
+                            // needs the host's loader and libraries). That is no
+                            // evidence against it, so the install hand-off stays,
+                            // but the result says plainly that nothing ran.
+                            smoke_note = Some(smoke_res.stderr.clone());
+                        } else if !smoke_res.passed {
                             return Ok(ExecutionResult {
                                 ok: false,
                                 plan_id: plan_id.to_string(),
@@ -1123,7 +1276,9 @@ impl Engine {
                         }
                     }
 
-                    // Create next_plan for install
+                    // Create next_plan for install, pinned to the artifact's bytes.
+                    let artifact_sha = sha256_file(&art_path)?;
+                    let artifact_bytes = fs::metadata(&art_path).map(|m| m.len()).unwrap_or(0);
                     let install_plan_id = generate_plan_id("install", &staged.target);
                     let next_plan = Plan {
                         protocol_version: "v1.0".to_string(),
@@ -1137,10 +1292,11 @@ impl Engine {
                                 "pacman".to_string(),
                                 "-U".to_string(),
                                 "--noconfirm".to_string(),
+                                "--".to_string(),
                                 art_path.to_string_lossy().to_string(),
                             ],
                             "Install package to host",
-                            120,
+                            300,
                         )],
                         filesystem_changes: vec![FilesystemChange {
                             path: "/".to_string(),
@@ -1150,24 +1306,48 @@ impl Engine {
                                 art_path.display()
                             ),
                         }],
-                        reviews: vec![],
+                        reviews: vec![FileReview {
+                            path: art_path.to_string_lossy().to_string(),
+                            sha256: artifact_sha.clone(),
+                            bytes: artifact_bytes,
+                            executable: false,
+                            content: None,
+                        }],
                         warnings: vec!["Modifies system packages on host".to_string()],
                         decision: None,
                         downstream: None,
                         blocked: None,
                     };
 
-                    self.stage_plan(next_plan.clone(), None);
+                    self.stage_plan(
+                        next_plan.clone(),
+                        Some(StagedAction::InstallFile {
+                            package: art_path.clone(),
+                            sha256: artifact_sha,
+                        }),
+                    );
 
+                    let message = match (&smoke_note, staged.run_smoke_test) {
+                        (Some(_), _) => format!(
+                            "Build succeeded for '{}'; the runtime smoke test could not run in isolation",
+                            art_path.display()
+                        ),
+                        (None, true) => {
+                            format!("Build and smoke test passed for '{}'", art_path.display())
+                        }
+                        (None, false) => {
+                            format!("Package built successfully at {}", art_path.display())
+                        }
+                    };
+                    let mut output = format!("Artifact produced at {}", art_path.display());
+                    if let Some(note) = smoke_note {
+                        output.push_str(&format!("\nSmoke test skipped: {note}"));
+                    }
                     Ok(ExecutionResult {
                         ok: true,
                         plan_id: plan_id.to_string(),
-                        message: if staged.run_smoke_test {
-                            format!("Build and smoke test passed for '{}'", art_path.display())
-                        } else {
-                            format!("Package repackaged successfully at {}", art_path.display())
-                        },
-                        output: Some(format!("Artifact produced at {}", art_path.display())),
+                        message,
+                        output: Some(output),
                         next_plan: Some(next_plan),
                     })
                 } else {
@@ -1175,6 +1355,19 @@ impl Engine {
                 }
             }
             "install" | "uninstall" => {
+                // A package file is installed only if it still holds the bytes
+                // that were reviewed; the output folder is user-writable.
+                if let Some(StagedAction::InstallFile { package, sha256 }) = &staged_opt {
+                    let current = sha256_file(package)?;
+                    if &current != sha256 {
+                        return Err(format!(
+                            "Package '{}' changed after it was reviewed (expected sha256 {}, found {}). Prepare the install again.",
+                            package.display(),
+                            sha256,
+                            current
+                        ));
+                    }
+                }
                 let mut last_out = String::new();
                 for step in &plan.steps {
                     let out = run_step(step, None)?;
@@ -1182,11 +1375,8 @@ impl Engine {
                         return Ok(ExecutionResult {
                             ok: false,
                             plan_id: plan_id.to_string(),
-                            message: format!(
-                                "Step '{}' failed with code {}",
-                                step.purpose, out.exit_code
-                            ),
-                            output: Some(out.stderr),
+                            message: step_failure_message(step, &out),
+                            output: Some(format!("{}{}", out.stdout, out.stderr)),
                             next_plan: None,
                         });
                     }
@@ -1204,13 +1394,49 @@ impl Engine {
                     next_plan: None,
                 })
             }
-            "test" => Ok(ExecutionResult {
-                ok: true,
-                plan_id: plan_id.to_string(),
-                message: "Test execution completed".to_string(),
-                output: None,
-                next_plan: None,
-            }),
+            "test" => {
+                // This used to report success without running anything.
+                let Some(StagedAction::Test {
+                    package,
+                    sha256,
+                    entry,
+                    smoke_args,
+                }) = staged_opt
+                else {
+                    return Err("Test plan carries no staged package".to_string());
+                };
+                let current = sha256_file(&package)?;
+                if current != sha256 {
+                    return Err(format!(
+                        "Package '{}' changed after it was reviewed. Prepare the test again.",
+                        package.display()
+                    ));
+                }
+                let report = run_runtime_smoke_test(&package, &entry, &smoke_args)?;
+                let message = if report.passed {
+                    format!("Smoke test passed: '{}' exited 0", report.entry_point)
+                } else if report.inconclusive {
+                    format!(
+                        "Smoke test inconclusive for '{}': it could not run in isolation",
+                        report.entry_point
+                    )
+                } else {
+                    format!(
+                        "Smoke test failed: '{}' exited {}",
+                        report.entry_point, report.exit_code
+                    )
+                };
+                Ok(ExecutionResult {
+                    ok: report.passed,
+                    plan_id: plan_id.to_string(),
+                    message,
+                    output: Some(format!(
+                        "Exit code: {}\nStdout: {}\nStderr: {}",
+                        report.exit_code, report.stdout, report.stderr
+                    )),
+                    next_plan: None,
+                })
+            }
             _ => Err(format!("Unknown action '{}'", plan.action)),
         }
     }
@@ -1288,11 +1514,170 @@ fn sha256_file(path: &Path) -> Result<String, String> {
     Ok(format!("{:x}", Sha256::digest(&bytes)))
 }
 
+/// Plan ids are bearer tokens for consent: anyone who can name a staged plan
+/// can execute it. A digest of the action, target and a monotonic timestamp
+/// alone is guessable and collides for two plans prepared in the same clock
+/// tick, so kernel randomness and a process-wide counter are mixed in.
 fn generate_plan_id(action: &str, target: &str) -> String {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
     let mut hasher = Sha256::new();
     hasher.update(action.as_bytes());
     hasher.update(target.as_bytes());
     hasher.update(format!("{:?}", Instant::now()).as_bytes());
+    if let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        hasher.update(now.as_nanos().to_le_bytes());
+    }
+    hasher.update(COUNTER.fetch_add(1, Ordering::Relaxed).to_le_bytes());
+    hasher.update(std::process::id().to_le_bytes());
+    let mut random = [0u8; 32];
+    if let Ok(mut urandom) = fs::File::open("/dev/urandom") {
+        use std::io::Read;
+        let _ = urandom.read_exact(&mut random);
+    }
+    hasher.update(random);
     let hash = format!("{:x}", hasher.finalize());
-    format!("{}-{}", action, &hash[..12])
+    format!("{}-{}", action, &hash[..32])
+}
+
+/// A failed step's own explanation: "failed with code 1" alone hid the
+/// "a password is required" that tells the caller to re-authenticate.
+fn step_failure_message(step: &Step, out: &ProcessOutput) -> String {
+    let detail = sanitize_sudo_stderr(&out.stderr);
+    let needs_auth = out.stderr.contains("password is required");
+    let mut message = format!("Step '{}' failed with code {}", step.purpose, out.exit_code);
+    if needs_auth {
+        message.push_str(": sudo: a password is required — authorize the session and retry");
+    } else if !detail.is_empty() {
+        let short: String = detail.chars().take(400).collect();
+        message.push_str(&format!(": {short}"));
+    }
+    message
+}
+
+/// Download a `.tar.gz` source archive into memory, bounded in size.
+fn download_gzip_archive(url: &str) -> Result<Vec<u8>, String> {
+    let max = MAX_SOURCE_ARCHIVE_BYTES.to_string();
+    let step = Step::new(
+        "curl",
+        vec![
+            "-fsSL",
+            "--proto",
+            "=https",
+            "--max-time",
+            "120",
+            "--max-filesize",
+            &max,
+            "--",
+            url,
+        ],
+        "Download source archive",
+        150,
+    );
+    let download = run_step_bytes(&step, None)?;
+    if download.exit_code != 0 {
+        return Err(format!(
+            "Failed to download '{}' (curl exit {}): {}",
+            url,
+            download.exit_code,
+            download.stderr.trim()
+        ));
+    }
+    if download.bytes.len() as u64 > MAX_SOURCE_ARCHIVE_BYTES {
+        return Err(format!(
+            "'{}' exceeds the {} MiB source archive limit",
+            url,
+            MAX_SOURCE_ARCHIVE_BYTES / 1024 / 1024
+        ));
+    }
+    if !download.bytes.starts_with(&[0x1F, 0x8B]) {
+        let head = String::from_utf8_lossy(&download.bytes[..download.bytes.len().min(200)])
+            .trim()
+            .to_string();
+        return Err(if head.starts_with('<') {
+            format!(
+                "'{}' returned a web page instead of a source archive; the release URL is not directly downloadable.",
+                url
+            )
+        } else {
+            format!(
+                "'{}' is not a gzip-compressed tar archive; ArchBridge builds upstream sources from .tar.gz only.",
+                url
+            )
+        });
+    }
+    Ok(download.bytes)
+}
+
+/// Resolve, hash and size a package file at review time.
+fn pin_package_file(path: &str) -> Result<(PathBuf, String, u64), String> {
+    let package = Path::new(path);
+    if !package.is_file() {
+        return Err(format!("Package file does not exist: '{}'", path));
+    }
+    let package = package
+        .canonicalize()
+        .map_err(|e| format!("Cannot resolve '{}': {}", path, e))?;
+    let sha256 = sha256_file(&package)?;
+    let bytes = fs::metadata(&package).map(|m| m.len()).unwrap_or(0);
+    Ok((package, sha256, bytes))
+}
+
+/// `name-pkgver-pkgrel-arch.pkg.tar.*` → `name`.
+pub fn package_name_from_file(file_name: &str) -> Option<String> {
+    let stem = &file_name[..file_name.find(".pkg.tar.")?];
+    let parts: Vec<&str> = stem.rsplitn(4, '-').collect();
+    (parts.len() == 4 && !parts[3].is_empty()).then(|| parts[3].to_string())
+}
+
+/// What a package installed by name may look like. Anything else (a leading
+/// dash in particular) must never reach a pacman argument list.
+fn is_package_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 128
+        && !name.starts_with(['-', '.'])
+        && name
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || b"@._+-".contains(&c))
+}
+
+/// The first `pkgname` a PKGBUILD declares, for naming the plan and job.
+pub fn pkgbuild_pkgname(pkgbuild: &str) -> Option<String> {
+    let line = pkgbuild
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with("pkgname="))?;
+    let value = line.trim_start_matches("pkgname=").trim();
+    let value = value.trim_start_matches('(');
+    let first = value
+        .split(|c: char| c.is_whitespace() || c == ')')
+        .find(|s| !s.is_empty())?;
+    let name = first.trim_matches(|c| c == '\'' || c == '"');
+    is_package_name(name).then(|| name.to_string())
+}
+
+/// A readable default package name for a build target: the last path or URL
+/// segment, without a trailing slash, `.git` or archive suffix. `.` and an
+/// empty segment resolve through the real directory name.
+pub fn infer_target_name(target: &str) -> String {
+    let trimmed = target.trim().trim_end_matches('/');
+    let last = trimmed.rsplit('/').next().unwrap_or(trimmed);
+    let mut name = last.to_string();
+    for suffix in [".git", ".tar.gz", ".tgz", ".deb", ".rpm"] {
+        if let Some(stripped) = name.strip_suffix(suffix) {
+            name = stripped.to_string();
+            break;
+        }
+    }
+    if name.is_empty() || name == "." || name == ".." {
+        let dir = if trimmed.is_empty() { "." } else { trimmed };
+        if let Some(real) = Path::new(dir)
+            .canonicalize()
+            .ok()
+            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+        {
+            return real;
+        }
+        return "package".to_string();
+    }
+    name
 }
