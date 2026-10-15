@@ -384,7 +384,11 @@ pub fn rpc_call(engine: &SharedEngine, method: &str, params: Value) -> Result<Va
         method: method.to_string(),
         params,
     };
-    let mut srv = engine.lock().map_err(|e| e.to_string())?;
+    // A panic inside one engine call must not brick every later call: the
+    // engine's state is plain data that stays consistent between requests.
+    let mut srv = engine
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let resp = srv.handle_request(req);
     if let Some(err) = resp.error {
         Err(err.message)

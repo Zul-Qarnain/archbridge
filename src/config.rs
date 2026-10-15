@@ -93,6 +93,8 @@ impl Config {
         Ok(config)
     }
 
+    /// Written to a sibling temp file and renamed into place, so a crash or a
+    /// full disk mid-write can never leave a truncated config.json behind.
     pub fn save(&self) -> Result<(), String> {
         let path = &self.path;
         if let Some(parent) = path.parent() {
@@ -101,8 +103,15 @@ impl Config {
         }
         let content = serde_json::to_string_pretty(self)
             .map_err(|e| format!("Failed to serialize config: {}", e))?;
-        fs::write(path, content)
-            .map_err(|e| format!("Failed to write config file '{:?}': {}", path, e))?;
+        let mut tmp = path.clone().into_os_string();
+        tmp.push(format!(".tmp-{}", std::process::id()));
+        let tmp = PathBuf::from(tmp);
+        fs::write(&tmp, content)
+            .map_err(|e| format!("Failed to write config file '{:?}': {}", tmp, e))?;
+        fs::rename(&tmp, path).map_err(|e| {
+            let _ = fs::remove_file(&tmp);
+            format!("Failed to write config file '{:?}': {}", path, e)
+        })?;
         Ok(())
     }
 
@@ -171,6 +180,23 @@ impl Config {
             _ => false,
         }
     }
+}
+
+/// Where build jobs (PKGBUILD, pinned sources, chroot, logs) live:
+/// `$ARCHBRIDGE_JOBS_DIR`, else `$XDG_CACHE_HOME/archbridge/jobs`, else
+/// `~/.cache/archbridge/jobs`. It used to be `.archbridge/jobs` under whatever
+/// the working directory happened to be — `$HOME` when launched from a desktop
+/// entry — and the install plan then depended on that directory too.
+pub fn jobs_root() -> PathBuf {
+    if let Some(dir) = env::var_os("ARCHBRIDGE_JOBS_DIR").filter(|d| !d.is_empty()) {
+        return PathBuf::from(dir);
+    }
+    let cache = env::var_os("XDG_CACHE_HOME")
+        .filter(|d| !d.is_empty() && Path::new(d).is_absolute())
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
+        .unwrap_or_else(|| env::temp_dir().join("archbridge-cache"));
+    cache.join("archbridge").join("jobs")
 }
 
 fn parse_bool(val: &str) -> Result<bool, String> {

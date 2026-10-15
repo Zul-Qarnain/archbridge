@@ -85,8 +85,8 @@ substituted for Flatpak's own application sandbox.
 
 Normal build/test completion and handled failures remove the disposable root.
 Cleanup failure is reported, never hidden; a failed test cleanup blocks live
-installation. Inputs and packages remain in the displayed `.archbridge/jobs/<id>`
-directory for diagnosis. These are explicit build outputs, not outcome telemetry.
+installation. Inputs and packages remain in the displayed job directory
+(`~/.cache/archbridge/jobs/<id>` by default; see `ARCHBRIDGE_JOBS_DIR`) for diagnosis. These are explicit build outputs, not outcome telemetry.
 
 SIGKILL, power loss, lost sudo credentials, kernel/container failures or frontend
 termination can leave a root. Verify no nspawn process/mount uses that particular

@@ -1,6 +1,5 @@
 use crate::process::{run_step, Step};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::Path;
 use tempfile::TempDir;
@@ -41,10 +40,12 @@ pub fn inspect_package(file_path: &str) -> Result<InspectionReport, String> {
         return Err(format!("File not found: '{}'", file_path));
     }
 
-    let bytes = fs::read(path).map_err(|e| format!("Failed to read file '{:?}': {}", path, e))?;
-    let size_bytes = bytes.len() as u64;
-    let sha256 = format!("{:x}", Sha256::digest(&bytes));
-    drop(bytes);
+    // Streamed: foreign packages run to hundreds of megabytes and only the
+    // digest is kept, so the payload is never held in memory.
+    let file =
+        fs::File::open(path).map_err(|e| format!("Failed to read file '{:?}': {}", path, e))?;
+    let (sha256, size_bytes, _) = crate::archive::digest_reader(file)
+        .map_err(|e| format!("Failed to read file '{:?}': {}", path, e))?;
 
     let file_str = file_path.to_lowercase();
     if file_str.ends_with(".deb") {

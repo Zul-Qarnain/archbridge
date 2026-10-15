@@ -423,7 +423,14 @@ where
     checks.push(check_user_namespaces());
 
     // 5. Free disk space for the build workspace
-    checks.push(check_disk_space(Path::new(".")));
+    // Measured where builds actually run, not wherever the CLI was started.
+    let jobs = crate::config::jobs_root();
+    let _ = fs::create_dir_all(&jobs);
+    checks.push(check_disk_space(if jobs.is_dir() {
+        &jobs
+    } else {
+        Path::new(".")
+    }));
 
     // 6. Compiler toolchain (gcc / cargo)
     let step_gcc = Step::new("gcc", vec!["--version"], "Check compiler toolchain", 5);

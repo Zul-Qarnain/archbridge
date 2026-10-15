@@ -140,6 +140,36 @@ fn tracker_finish(id: u64, purpose: &str, started: Instant, ok: bool) {
 
 static NEXT_STEP_ID: AtomicU64 = AtomicU64::new(1);
 
+/// Stop a timed-out step and everything it started. SIGTERM goes to the whole
+/// process group first: `sudo` relays it to its root-owned command, which an
+/// unprivileged SIGKILL could never reach. Whatever survives a grace period is
+/// killed.
+fn terminate_tree(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        let group = format!("-{}", child.id());
+        let signal = |sig: &str| {
+            let _ = Command::new("kill")
+                .args([sig, "--", group.as_str()])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        };
+        signal("-TERM");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            if matches!(child.try_wait(), Ok(Some(_))) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        signal("-KILL");
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 /// Human-readable elapsed duration for UI display.
 pub fn format_elapsed(ms: u64) -> String {
     let secs = ms / 1000;
@@ -256,6 +286,13 @@ fn run_captured_inner(
     }
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
+    // Own process group, so a timeout can stop the whole tree (makepkg ->
+    // make -> cc ...), not just the direct child.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
 
     let mut child = cmd
         .spawn()
@@ -317,8 +354,7 @@ fn run_captured_inner(
             Ok(Some(status)) => break status,
             Ok(None) => {
                 if start.elapsed() >= timeout {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    terminate_tree(&mut child);
                     finish(false);
                     return Err(format!(
                         "Process '{}' timed out after {}s",
@@ -329,8 +365,7 @@ fn run_captured_inner(
                 std::thread::sleep(Duration::from_millis(50));
             }
             Err(e) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                terminate_tree(&mut child);
                 finish(false);
                 return Err(format!(
                     "Error waiting for process '{}': {}",

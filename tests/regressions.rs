@@ -327,3 +327,100 @@ fn config_set_from_the_cli_takes_a_key_and_a_value() {
     let saved = fs::read_to_string(temp.path().join("archbridge/config.json")).unwrap();
     assert!(saved.contains("\"aur\": false"), "{saved}");
 }
+
+#[test]
+fn a_timed_out_step_takes_its_children_with_it() {
+    use archbridge::process::{run_step, Step};
+    let temp = TempDir::new().unwrap();
+    let marker = temp.path().join("survived");
+    // The grandchild would create the marker after the step's timeout.
+    let script = format!("(sleep 3; touch '{}') & wait", marker.display());
+    let step = Step::new("sh", vec!["-c", script.as_str()], "timeout tree", 1);
+    let err = run_step(&step, None).unwrap_err();
+    assert!(err.contains("timed out"), "{err}");
+    std::thread::sleep(Duration::from_secs(4));
+    assert!(!marker.exists(), "the grandchild outlived the timeout");
+}
+
+#[test]
+fn elf_interpreters_are_read_without_running_anything() {
+    use archbridge::build::elf_interpreter;
+    // A real dynamically linked binary on the test host.
+    let sh = fs::read(fs::canonicalize("/bin/sh").unwrap()).unwrap();
+    let interp = elf_interpreter(&sh).expect("/bin/sh is ELF");
+    assert!(
+        interp.unwrap_or_default().contains("ld-"),
+        "dynamic ELF has PT_INTERP"
+    );
+    assert_eq!(elf_interpreter(b"#!/bin/sh\necho hi\n"), None);
+    assert_eq!(elf_interpreter(b"\x7fELF"), None);
+}
+
+#[test]
+fn foreign_architectures_map_to_pacman_and_foreign_cpus_are_refused() {
+    use archbridge::engine::arch_for_payload;
+    assert_eq!(arch_for_payload("all").unwrap(), "any");
+    assert_eq!(arch_for_payload("noarch").unwrap(), "any");
+    let host = std::env::consts::ARCH;
+    if host == "x86_64" {
+        assert_eq!(arch_for_payload("amd64").unwrap(), "x86_64");
+        let err = arch_for_payload("arm64").unwrap_err();
+        assert!(err.contains("Exec format error"), "{err}");
+    }
+    assert!(arch_for_payload("sparc64").is_err());
+}
+
+#[test]
+fn an_imported_payload_is_moved_under_usr_for_the_arch_filesystem_layout() {
+    // Arch's `filesystem` package owns /bin, /sbin, /lib, /lib64 and /usr/sbin
+    // as symlinks; a package shipping real files there fails `pacman -U`.
+    if std::process::Command::new("bash")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        return;
+    }
+    let temp = TempDir::new().unwrap();
+    let srcdir = temp.path().join("src");
+    let pkgdir = temp.path().join("pkg");
+    fs::create_dir_all(&srcdir).unwrap();
+    fs::create_dir_all(&pkgdir).unwrap();
+    let payload = gz_tar(&[
+        ("bin/tool", b"#!/bin/sh\n"),
+        ("lib/libx.so", b"x"),
+        ("usr/sbin/daemon", b"#!/bin/sh\n"),
+        ("usr/lib64/liby.so", b"y"),
+    ]);
+    fs::write(srcdir.join("src.tar.gz"), payload).unwrap();
+    let params = PkgbuildParams {
+        name: "tool".to_string(),
+        version: "1".to_string(),
+        source_tarball: "src.tar.gz".to_string(),
+        sha256_hash: "0".repeat(64),
+        dependencies: vec![],
+        entry_binary: Some("tool".to_string()),
+        src_subdir: None,
+    };
+    let pkgbuild = generate_pkgbuild(&BuildSystem::Imported, &params).unwrap();
+    fs::write(temp.path().join("PKGBUILD"), pkgbuild).unwrap();
+    let status = std::process::Command::new("bash")
+        .args(["-ec", "source ./PKGBUILD; package"])
+        .current_dir(temp.path())
+        .env("srcdir", &srcdir)
+        .env("pkgdir", &pkgdir)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    for gone in ["bin", "lib", "usr/sbin", "usr/lib64"] {
+        assert!(!pkgdir.join(gone).exists(), "{gone} must not be packaged");
+    }
+    for kept in [
+        "usr/bin/tool",
+        "usr/lib/libx.so",
+        "usr/bin/daemon",
+        "usr/lib/liby.so",
+    ] {
+        assert!(pkgdir.join(kept).is_file(), "{kept} missing");
+    }
+}

@@ -528,9 +528,12 @@ impl Engine {
         let version = ver_opt.unwrap_or("1.0.0");
 
         let job_id = format!("job-{}", generate_plan_id("build", target));
-        let job_dir = PathBuf::from(".archbridge").join("jobs").join(&job_id);
+        let job_dir = crate::config::jobs_root().join(&job_id);
 
         let mut source_layout = SourceLayout::Tarball;
+        // Dependencies a foreign package declares in its own distribution's
+        // names; they cannot be translated reliably, so they are surfaced.
+        let mut foreign_deps: Vec<String> = Vec::new();
         // A PKGBUILD the user (or the AUR) wrote names its own binaries, so a
         // smoke test only runs when an entry point is named explicitly.
         let mut user_pkgbuild = false;
@@ -590,7 +593,23 @@ impl Engine {
                 entry_binary: Some(entry.to_string()),
                 src_subdir: None,
             };
-            let pkgb = generate_pkgbuild(&BuildSystem::Imported, &params)?;
+            let mut pkgb = generate_pkgbuild(&BuildSystem::Imported, &params)?;
+            // The payload carries machine code for one CPU. Declaring it
+            // x86_64 regardless produced packages that install and then fail
+            // with "Exec format error".
+            let declared = inspected
+                .as_ref()
+                .map(|rep| rep.architecture.as_str())
+                .unwrap_or("unknown");
+            match arch_for_payload(declared) {
+                Ok(arch) => {
+                    pkgb = pkgb.replacen("arch=('x86_64')", &format!("arch=('{arch}')"), 1);
+                }
+                Err(reason) => return Ok(blocked_build_plan(target, snap.reviews, reason)),
+            }
+            if let Some(rep) = inspected.as_ref().filter(|r| !r.dependencies.is_empty()) {
+                foreign_deps = rep.dependencies.clone();
+            }
             (snap, BuildSystem::Imported, pkgb, sanitized_name)
         } else if target.ends_with(".db") {
             return Err(
@@ -825,6 +844,12 @@ impl Engine {
                         "Foreign payload will be repackaged; runtime smoke test requires an explicit entry binary"
                             .to_string(),
                     );
+                }
+                if !foreign_deps.is_empty() && deps.is_empty() {
+                    notes.push(format!(
+                        "The foreign package depends on {} (its own distribution's names). They are not translated: pass the Arch equivalents with --dependency, or the package may install without its libraries",
+                        foreign_deps.join(", ")
+                    ));
                 }
                 notes
             },
@@ -1227,9 +1252,7 @@ impl Engine {
             }
             "build" => {
                 if let Some(StagedAction::Build(staged)) = staged_opt {
-                    let job_dir = PathBuf::from(".archbridge")
-                        .join("jobs")
-                        .join(&staged.job_id);
+                    let job_dir = crate::config::jobs_root().join(&staged.job_id);
                     let art_path = execute_chroot_build(
                         &job_dir,
                         &staged.pkgbuild,
@@ -1510,8 +1533,35 @@ pub fn publish_artifact(artifact: &Path, output_dir: &str) -> Result<PathBuf, St
 }
 
 fn sha256_file(path: &Path) -> Result<String, String> {
-    let bytes = fs::read(path).map_err(|e| format!("Cannot read '{}': {}", path.display(), e))?;
-    Ok(format!("{:x}", Sha256::digest(&bytes)))
+    // Streamed: a package can be gigabytes and is hashed twice per publish.
+    crate::archive::sha256_path(path)
+}
+
+/// Map a DEB/RPM architecture onto pacman's, refusing payloads this machine
+/// cannot run.
+pub fn arch_for_payload(declared: &str) -> Result<&'static str, String> {
+    let arch = match declared.to_ascii_lowercase().as_str() {
+        "all" | "noarch" | "any" => return Ok("any"),
+        "amd64" | "x86_64" | "x86-64" => "x86_64",
+        "arm64" | "aarch64" => "aarch64",
+        "armhf" | "armv7hl" | "armv7h" => "armv7h",
+        "i386" | "i486" | "i586" | "i686" => "i686",
+        "riscv64" => "riscv64",
+        other => {
+            return Err(format!(
+                "The package declares architecture '{other}', which ArchBridge cannot map to a pacman architecture"
+            ))
+        }
+    };
+    let host = std::env::consts::ARCH;
+    let host = if host == "arm" { "armv7h" } else { host };
+    if arch == host {
+        Ok(arch)
+    } else {
+        Err(format!(
+            "The package contains {arch} machine code but this system is {host}; it would install and then fail with 'Exec format error'. Find a {host} build instead."
+        ))
+    }
 }
 
 /// Plan ids are bearer tokens for consent: anyone who can name a staged plan

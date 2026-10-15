@@ -411,6 +411,24 @@ noextract=('{source_tar}')\n\
 sha256sums=('{sha256}')\n\n\
 package() {{\n\
   {extract_cmd}\n\
+  # Arch symlinks /bin, /sbin, /lib, /lib64 and /usr/sbin into /usr (owned by\n\
+  # the filesystem package); a payload shipping them as real paths conflicts.\n\
+  for d in bin sbin usr/sbin; do\n\
+    if [ -L \"$pkgdir/$d\" ]; then rm -f \"$pkgdir/$d\"\n\
+    elif [ -d \"$pkgdir/$d\" ]; then\n\
+      mkdir -p \"$pkgdir/usr/bin\"\n\
+      cp -a \"$pkgdir/$d\"/. \"$pkgdir/usr/bin/\"\n\
+      rm -rf \"$pkgdir/$d\"\n\
+    fi\n\
+  done\n\
+  for d in lib lib64 usr/lib64; do\n\
+    if [ -L \"$pkgdir/$d\" ]; then rm -f \"$pkgdir/$d\"\n\
+    elif [ -d \"$pkgdir/$d\" ]; then\n\
+      mkdir -p \"$pkgdir/usr/lib\"\n\
+      cp -a \"$pkgdir/$d\"/. \"$pkgdir/usr/lib/\"\n\
+      rm -rf \"$pkgdir/$d\"\n\
+    fi\n\
+  done\n\
   mkdir -p \"$pkgdir/usr/bin\"\n\
   if [ -d \"$pkgdir/usr/share/applications\" ]; then\n\
     for df in \"$pkgdir\"/usr/share/applications/*.desktop; do\n\

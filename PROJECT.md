@@ -189,8 +189,9 @@ flags are generated. Automatically generated debug split packages are disabled.
 1. `prepare` downloads/reads a bounded source snapshot, reviews files, generates
    a recipe if supported, and returns an immutable in-memory plan.
 2. The frontend displays the plan before consent. No disk staging happens yet.
-3. Execution creates a private `.archbridge/jobs/<id>` under the current working
-   directory and writes the approved input bytes there.
+3. Execution creates a private job directory under `$ARCHBRIDGE_JOBS_DIR`, else
+   `$XDG_CACHE_HOME/archbridge/jobs/<id>` (default `~/.cache/archbridge/jobs/<id>`),
+   and writes the approved input bytes there.
 4. `sudo -n mkarchroot` creates a new root containing base/base-devel/sudo.
 5. `systemd-nspawn` initializes an unprivileged builder and copies the reviewed
    inputs through a read-only bind. No writable host mounts are supplied.

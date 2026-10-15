@@ -19,6 +19,54 @@ pub struct SourceSnapshot {
     pub reviews: Vec<FileReview>,
 }
 
+/// Bytes of a file kept verbatim in a review so a human can read it.
+const PREVIEW_LIMIT: usize = 10_000;
+
+/// Upper bound on what a source snapshot may hold once unpacked. Snapshots
+/// live in memory until the build runs; a gzip bomb or a forgotten multi-GB
+/// asset directory must fail with a message instead of exhausting RAM.
+pub const MAX_SNAPSHOT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Hash a stream without holding it: returns the digest, the byte count and
+/// the first bytes for a human-readable preview.
+pub fn digest_reader<R: Read>(mut reader: R) -> std::io::Result<(String, u64, Vec<u8>)> {
+    let mut hasher = Sha256::new();
+    let mut total = 0u64;
+    let mut preview = Vec::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        let bytes: &[u8] = &buf[..n];
+        hasher.update(bytes);
+        if preview.len() <= PREVIEW_LIMIT {
+            let take = (PREVIEW_LIMIT + 1 - preview.len()).min(n);
+            preview.extend_from_slice(&bytes[..take]);
+        }
+        total += n as u64;
+    }
+    Ok((format!("{:x}", hasher.finalize()), total, preview))
+}
+
+/// SHA-256 of a file, streamed.
+pub fn sha256_path(path: &Path) -> Result<String, String> {
+    let file =
+        fs::File::open(path).map_err(|e| format!("Cannot read '{}': {}", path.display(), e))?;
+    digest_reader(file)
+        .map(|(digest, _, _)| digest)
+        .map_err(|e| format!("Cannot read '{}': {}", path.display(), e))
+}
+
+fn preview_text(preview: Vec<u8>, total: u64) -> Option<String> {
+    if total as usize > PREVIEW_LIMIT || total as usize != preview.len() || preview.contains(&0) {
+        None
+    } else {
+        String::from_utf8(preview).ok()
+    }
+}
+
 /// Review every regular file under `root`, addressed by its path relative to
 /// `root`. Each entry hashes the file's own bytes, so the manifest states what
 /// a later step can verify rather than a value derived from the file name.
@@ -40,51 +88,66 @@ pub fn walk_tree(root: &Path) -> Result<Vec<FileReview>, String> {
             if meta.is_dir() {
                 stack.push(path);
             } else if meta.file_type().is_symlink() {
-                // A link carries no bytes of its own, so the manifest records the
-                // target instead of pretending to hash content.
-                let target = fs::read_link(&path)
-                    .map(|t| t.to_string_lossy().to_string())
-                    .unwrap_or_default();
-                let mut hasher = Sha256::new();
-                hasher.update(target.as_bytes());
-                reviews.push(FileReview {
-                    path: rel_str,
-                    sha256: format!("{:x}", hasher.finalize()),
-                    bytes: 0,
-                    executable: false,
-                    content: Some(format!("symlink -> {}", target)),
-                });
+                reviews.push(symlink_review(rel_str, &path));
             } else if meta.is_file() {
-                let mut bytes = Vec::new();
-                fs::File::open(&path)
-                    .and_then(|mut f| f.read_to_end(&mut bytes))
+                let file = fs::File::open(&path)
                     .map_err(|e| format!("Failed to read file '{}': {}", rel_str, e))?;
-                let mut hasher = Sha256::new();
-                hasher.update(&bytes);
-                #[cfg(unix)]
-                let is_exec = {
-                    use std::os::unix::fs::PermissionsExt;
-                    (meta.permissions().mode() & 0o111) != 0
-                };
-                #[cfg(not(unix))]
-                let is_exec = false;
-                let content = if bytes.len() < 10_000 && !bytes.contains(&0) {
-                    String::from_utf8(bytes.clone()).ok()
-                } else {
-                    None
-                };
+                let (sha256, bytes, preview) = digest_reader(file)
+                    .map_err(|e| format!("Failed to read file '{}': {}", rel_str, e))?;
                 reviews.push(FileReview {
                     path: rel_str,
-                    sha256: format!("{:x}", hasher.finalize()),
-                    bytes: bytes.len() as u64,
-                    executable: is_exec,
-                    content,
+                    sha256,
+                    bytes,
+                    executable: is_executable(&meta),
+                    content: preview_text(preview, bytes),
                 });
             }
         }
     }
     reviews.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(reviews)
+}
+
+/// A link carries no bytes of its own, so the manifest records the target
+/// instead of pretending to hash content.
+fn symlink_review(rel_str: String, path: &Path) -> FileReview {
+    let target = fs::read_link(path)
+        .map(|t| t.to_string_lossy().to_string())
+        .unwrap_or_default();
+    FileReview {
+        path: rel_str,
+        sha256: format!("{:x}", Sha256::digest(target.as_bytes())),
+        bytes: 0,
+        executable: false,
+        content: Some(format!("symlink -> {}", target)),
+    }
+}
+
+fn is_executable(meta: &fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        meta.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = meta;
+        false
+    }
+}
+
+/// Top-level entries that are never part of a source snapshot: VCS metadata,
+/// ArchBridge's own job workspace, and build output trees.
+fn excluded_from_snapshot(rel: &Path) -> bool {
+    let first = rel
+        .components()
+        .next()
+        .map(|c| c.as_os_str().to_string_lossy().to_string())
+        .unwrap_or_default();
+    matches!(
+        first.as_str(),
+        ".git" | ".hg" | ".svn" | ".archbridge" | "target" | "graphify-out"
+    )
 }
 
 pub fn snapshot_directory(dir_path: &Path) -> Result<SourceSnapshot, String> {
@@ -97,6 +160,7 @@ pub fn snapshot_directory(dir_path: &Path) -> Result<SourceSnapshot, String> {
 
     let mut tar_builder = tar::Builder::new(Vec::new());
     let mut reviews = Vec::new();
+    let mut total: u64 = 0;
 
     let mut stack = vec![dir_path.to_path_buf()];
     while let Some(current_dir) = stack.pop() {
@@ -108,15 +172,18 @@ pub fn snapshot_directory(dir_path: &Path) -> Result<SourceSnapshot, String> {
             let rel_path = path.strip_prefix(dir_path).map_err(|e| e.to_string())?;
             let rel_str = rel_path.to_string_lossy().to_string();
 
-            if rel_str.starts_with(".git")
-                || rel_str.starts_with(".archbridge")
-                || rel_str.contains("target/")
-            {
+            // Matched per path component: a prefix test also dropped
+            // `.github/` and `.gitmodules`, and a substring test dropped any
+            // directory merely ending in "target".
+            if excluded_from_snapshot(rel_path) {
                 continue;
             }
 
             // Path safety check
-            if rel_str.contains("..") || rel_path.is_absolute() {
+            if rel_path
+                .components()
+                .any(|c| !matches!(c, std::path::Component::Normal(_)))
+            {
                 return Err(format!(
                     "Unsafe path detected in source directory: '{}'",
                     rel_str
@@ -132,34 +199,39 @@ pub fn snapshot_directory(dir_path: &Path) -> Result<SourceSnapshot, String> {
                         rel_str, target
                     ));
                 }
+                // In-tree links are part of the source (shared headers, version
+                // aliases); dropping them silently broke builds that use them.
+                let mut header = tar::Header::new_gnu();
+                header.set_entry_type(tar::EntryType::Symlink);
+                header.set_size(0);
+                header.set_mode(0o777);
+                tar_builder
+                    .append_link(&mut header, &rel_str, &target)
+                    .map_err(|e| format!("Failed to archive link '{}': {}", rel_str, e))?;
+                reviews.push(symlink_review(rel_str, &path));
             } else if meta.is_dir() {
                 stack.push(path);
             } else if meta.is_file() {
-                let bytes = fs::read(&path).map_err(|e| e.to_string())?;
-                let mut hasher = Sha256::new();
-                hasher.update(&bytes);
-                let sha256 = format!("{:x}", hasher.finalize());
-
-                #[cfg(unix)]
-                let is_exec = {
-                    use std::os::unix::fs::PermissionsExt;
-                    (meta.permissions().mode() & 0o111) != 0
-                };
-                #[cfg(not(unix))]
-                let is_exec = false;
-
-                let content_preview = if bytes.len() < 10_000 && !bytes.contains(&0) {
-                    String::from_utf8(bytes.clone()).ok()
-                } else {
-                    None
-                };
+                total += meta.len();
+                if total > MAX_SNAPSHOT_BYTES {
+                    return Err(format!(
+                        "Source directory '{}' holds more than {} GiB; point the build at the \
+                         project itself, not a parent directory",
+                        dir_path.display(),
+                        MAX_SNAPSHOT_BYTES / 1024 / 1024 / 1024
+                    ));
+                }
+                let file = fs::File::open(&path)
+                    .map_err(|e| format!("Failed to read file '{}': {}", rel_str, e))?;
+                let (sha256, bytes, preview) = digest_reader(file)
+                    .map_err(|e| format!("Failed to read file '{}': {}", rel_str, e))?;
 
                 reviews.push(FileReview {
                     path: rel_str.clone(),
                     sha256,
-                    bytes: bytes.len() as u64,
-                    executable: is_exec,
-                    content: content_preview,
+                    bytes,
+                    executable: is_executable(&meta),
+                    content: preview_text(preview, bytes),
                 });
 
                 tar_builder
@@ -181,9 +253,8 @@ pub fn snapshot_directory(dir_path: &Path) -> Result<SourceSnapshot, String> {
         .finish()
         .map_err(|e| format!("Failed to finalize gzip tarball: {}", e))?;
 
-    let mut hasher = Sha256::new();
-    hasher.update(&tarball_bytes);
-    let sha256_hash = format!("{:x}", hasher.finalize());
+    let sha256_hash = format!("{:x}", Sha256::digest(&tarball_bytes));
+    reviews.sort_by(|a, b| a.path.cmp(&b.path));
 
     Ok(SourceSnapshot {
         tarball_bytes,
@@ -193,53 +264,76 @@ pub fn snapshot_directory(dir_path: &Path) -> Result<SourceSnapshot, String> {
 }
 
 pub fn snapshot_tarball_bytes(bytes: &[u8]) -> Result<SourceSnapshot, String> {
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    let sha256_hash = format!("{:x}", hasher.finalize());
+    let sha256_hash = format!("{:x}", Sha256::digest(bytes));
 
     let gz_decoder = flate2::read::GzDecoder::new(bytes);
     let mut archive = tar::Archive::new(gz_decoder);
 
     let mut reviews = Vec::new();
+    let mut total: u64 = 0;
     let entries = archive
         .entries()
         .map_err(|e| format!("Failed to parse tar archive entries: {}", e))?;
 
     for entry_res in entries {
-        let mut entry = entry_res.map_err(|e| format!("Failed to read archive entry: {}", e))?;
+        let entry = entry_res.map_err(|e| format!("Failed to read archive entry: {}", e))?;
         let path = entry
             .path()
-            .map_err(|e| format!("Invalid path in archive entry: {}", e))?;
+            .map_err(|e| format!("Invalid path in archive entry: {}", e))?
+            .into_owned();
         let path_str = path.to_string_lossy().to_string();
 
-        if path_str.contains("..") || path.is_absolute() {
+        if path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+            || path.is_absolute()
+        {
             return Err(format!("Unsafe path in source archive: '{}'", path_str));
         }
-
-        let mut file_bytes = Vec::new();
-        entry
-            .read_to_end(&mut file_bytes)
-            .map_err(|e| format!("Failed to read archive file '{}': {}", path_str, e))?;
-
-        let mut file_hasher = Sha256::new();
-        file_hasher.update(&file_bytes);
-        let file_sha = format!("{:x}", file_hasher.finalize());
-
+        let kind = entry.header().entry_type();
+        if kind.is_dir() {
+            continue;
+        }
         let mode = entry.header().mode().unwrap_or(0);
-        let is_exec = (mode & 0o111) != 0;
+        if kind.is_symlink() {
+            let target = entry
+                .link_name()
+                .ok()
+                .flatten()
+                .map(|t| t.to_string_lossy().to_string())
+                .unwrap_or_default();
+            reviews.push(FileReview {
+                path: path_str,
+                sha256: format!("{:x}", Sha256::digest(target.as_bytes())),
+                bytes: 0,
+                executable: false,
+                content: Some(format!("symlink -> {}", target)),
+            });
+            continue;
+        }
+        if !kind.is_file() {
+            continue;
+        }
 
-        let content_preview = if file_bytes.len() < 10_000 && !file_bytes.contains(&0) {
-            String::from_utf8(file_bytes.clone()).ok()
-        } else {
-            None
-        };
+        // Streamed with a running cap: the compressed size says nothing about
+        // what an archive expands to.
+        let remaining = MAX_SNAPSHOT_BYTES.saturating_sub(total);
+        let (file_sha, size, preview) = digest_reader(entry.take(remaining + 1))
+            .map_err(|e| format!("Failed to read archive file '{}': {}", path_str, e))?;
+        total += size;
+        if total > MAX_SNAPSHOT_BYTES {
+            return Err(format!(
+                "Source archive expands beyond {} GiB; refusing to review it",
+                MAX_SNAPSHOT_BYTES / 1024 / 1024 / 1024
+            ));
+        }
 
         reviews.push(FileReview {
             path: path_str,
             sha256: file_sha,
-            bytes: file_bytes.len() as u64,
-            executable: is_exec,
-            content: content_preview,
+            bytes: size,
+            executable: (mode & 0o111) != 0,
+            content: preview_text(preview, size),
         });
     }
 

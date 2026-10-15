@@ -115,10 +115,11 @@ fn native_package_review_uses_pinned_bytes() {
     assert_contains(&build, "walk_tree(&root)", "build.rs");
     assert_absent(&build, "hasher.update(path_str.as_bytes())", "build.rs");
     assert_absent(&build, "\"-tvf\".to_string()", "build.rs");
-    assert_contains(&source("archive.rs"), "hasher.update(&bytes)", "archive.rs");
+    assert_contains(&source("archive.rs"), "hasher.update(bytes)", "archive.rs");
 
     let inspect = source("inspect.rs");
-    assert_contains(&inspect, "Sha256::digest(&bytes)", "inspect.rs");
+    // The digest covers the file's real bytes, streamed rather than buffered.
+    assert_contains(&inspect, "digest_reader(file)", "inspect.rs");
     // The report carries a digest, never the payload: a foreign package can be
     // hundreds of megabytes and would be copied into every plan review.
     assert_absent(&inspect, "package_bytes", "inspect.rs");

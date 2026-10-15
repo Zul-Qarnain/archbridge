@@ -101,7 +101,7 @@
   `1. Prepare Plan` $\rightarrow$ `2. Snapshot & PKGBUILD Review` $\rightarrow$ `3. Clean Chroot Build` $\rightarrow$ `4. Smoke Test & Install`
 - **Interactive Dry-Run Plan Review**:
   - Displays generated `PKGBUILD` with syntax highlighting.
-  - Filesystem change previews (`.archbridge/jobs/job-<id>`).
+  - Filesystem change previews (`~/.cache/archbridge/jobs/job-<id>`).
   - Input file hashes (`SHA-256`) and safety review manifest.
 - **Execution Terminal Console**:
   - Real-time stream of `mkarchroot`, `makechrootpkg`, and container smoke tests.

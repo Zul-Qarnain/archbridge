@@ -458,12 +458,22 @@ pub fn run_runtime_smoke_test(
     )?;
     let reviews = walk_tree(&test_root)?;
     let program = resolve_entry(&reviews, entry_point)?;
-    if !reviews.iter().any(|review| {
-        review.path.starts_with("usr/lib/ld-linux") || review.path.starts_with("lib/ld-linux")
-    }) {
-        // The test root is this package alone: no dynamic loader, no system
-        // libraries. Running the binary would fail for reasons that say nothing
-        // about the package, so the finding is reported instead.
+    // The test root is this package alone: no dynamic loader, no system
+    // libraries, no shell. A dynamically linked binary or a script would fail
+    // for reasons that say nothing about the package, so only binaries that can
+    // actually start in it (static ELF) are run; for the rest the finding is
+    // reported as inconclusive. The ELF header is parsed as data, never run.
+    let program_bytes = fs::read(test_root.join(program.trim_start_matches('/')))
+        .map_err(|e| format!("Cannot read entry '{}': {}", program, e))?;
+    let runnable = matches!(elf_interpreter(&program_bytes), Some(None))
+        || reviews.iter().any(|review| {
+            review.path.starts_with("usr/lib/ld-linux") || review.path.starts_with("lib/ld-linux")
+        });
+    if !runnable {
+        let why = match elf_interpreter(&program_bytes) {
+            Some(Some(interp)) => format!("is dynamically linked (needs {interp})"),
+            _ => "is not a native executable (likely a script needing an interpreter)".to_string(),
+        };
         return Ok(SmokeTestReport {
             passed: false,
             inconclusive: true,
@@ -471,25 +481,57 @@ pub fn run_runtime_smoke_test(
             exit_code: -1,
             stdout: String::new(),
             stderr: format!(
-                "The isolated test root contains only '{}' and its own files, so the dynamic \
-                 loader and system libraries '{}' needs are absent. Install the package, or run \
-                 the smoke test inside a full Arch root, to check runtime behaviour.",
-                pkg_path.display(),
-                entry_point
+                "'{}' {} and the isolated test root contains only '{}'. Install the package, \
+                 or run the smoke test inside a full Arch root, to check runtime behaviour.",
+                entry_point,
+                why,
+                pkg_path.display()
             ),
         });
+    }
+    // nspawn resolves `--user` inside the container and wants an OS tree.
+    for (path, content) in [
+        (
+            "etc/passwd",
+            "root:x:0:0::/root:/usr/bin/nologin\nnobody:x:65534:65534:Nobody:/:/usr/bin/nologin\n",
+        ),
+        ("etc/group", "root:x:0:\nnobody:x:65534:\n"),
+        (
+            "usr/lib/os-release",
+            "NAME=\"ArchBridge smoke root\"\nID=arch\n",
+        ),
+    ] {
+        let target = test_root.join(path);
+        if !target.exists() {
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            }
+            fs::write(&target, content).map_err(|e| e.to_string())?;
+        }
     }
 
     let mut smoke = SmokeConfig { timeout_seconds: 0 };
     smoke.timeout_seconds = 30;
 
+    // systemd-nspawn only starts as root, so it runs through the cached sudo
+    // credential (`-n`: never prompt). --ephemeral runs on a throwaway
+    // snapshot, so the UID shift from --private-users=pick never chowns files
+    // the unprivileged caller then cannot delete; --register=no needs no
+    // systemd-machined; --as-pid2 gives the binary a real init to reap it.
     let mut args = vec![
+        "-n".to_string(),
+        "systemd-nspawn".to_string(),
+        "--quiet".to_string(),
+        "--register=no".to_string(),
+        "--ephemeral".to_string(),
+        "--as-pid2".to_string(),
         "--private-users=pick".to_string(),
         "--private-network".to_string(),
         "--user".to_string(),
         "65534".to_string(),
         "-D".to_string(),
-        test_root.to_str().unwrap().to_string(),
+        test_root.to_string_lossy().to_string(),
+        "--".to_string(),
         program.clone(),
     ];
 
@@ -500,13 +542,29 @@ pub fn run_runtime_smoke_test(
     }
 
     let step = Step::new(
-        "systemd-nspawn",
+        "sudo",
         args,
         "Execute runtime smoke test",
         smoke.timeout_seconds,
     );
 
-    match run_step(&step, None) {
+    let result = run_step(&step, None);
+    if let Ok(out) = &result {
+        if out.exit_code != 0 && out.stderr.contains("password is required") {
+            return Ok(SmokeTestReport {
+                passed: false,
+                inconclusive: true,
+                entry_point: program,
+                exit_code: out.exit_code,
+                stdout: String::new(),
+                stderr: "systemd-nspawn needs administrator rights and no cached sudo \
+                         credential was available; authorize the session to smoke test"
+                    .to_string(),
+            });
+        }
+    }
+
+    match result {
         Ok(out) => Ok(SmokeTestReport {
             passed: out.exit_code == 0,
             inconclusive: false,
@@ -524,4 +582,56 @@ pub fn run_runtime_smoke_test(
             stderr: format!("Runtime test execution failed: {}", e),
         }),
     }
+}
+
+/// The `PT_INTERP` of a 64/32-bit little/big-endian ELF image: `None` if it is
+/// not ELF, `Some(None)` for a static executable, `Some(Some(path))` for one
+/// that needs a dynamic loader. Pure parsing; nothing is executed.
+pub fn elf_interpreter(bytes: &[u8]) -> Option<Option<String>> {
+    if bytes.len() < 52 || &bytes[..4] != b"\x7fELF" {
+        return None;
+    }
+    let is64 = match bytes[4] {
+        1 => false,
+        2 => true,
+        _ => return None,
+    };
+    let le = match bytes[5] {
+        1 => true,
+        2 => false,
+        _ => return None,
+    };
+    let rd = |off: usize, len: usize| -> Option<u64> {
+        let slice = bytes.get(off..off.checked_add(len)?)?;
+        let mut value = 0u64;
+        for i in 0..len {
+            let b = if le { slice[len - 1 - i] } else { slice[i] } as u64;
+            value = (value << 8) | b;
+        }
+        Some(value)
+    };
+    let (phoff, phentsize, phnum) = if is64 {
+        (rd(0x20, 8)?, rd(0x36, 2)?, rd(0x38, 2)?)
+    } else {
+        (rd(0x1C, 4)?, rd(0x2A, 2)?, rd(0x2C, 2)?)
+    };
+    for i in 0..phnum.min(512) {
+        let base = usize::try_from(phoff.checked_add(i.checked_mul(phentsize)?)?).ok()?;
+        if rd(base, 4)? != 3 {
+            continue; // not PT_INTERP
+        }
+        let (offset, size) = if is64 {
+            (rd(base + 0x08, 8)?, rd(base + 0x20, 8)?)
+        } else {
+            (rd(base + 0x04, 4)?, rd(base + 0x10, 4)?)
+        };
+        let start = usize::try_from(offset).ok()?;
+        let end = start.checked_add(usize::try_from(size).ok()?)?;
+        let raw = bytes.get(start..end)?;
+        let path = String::from_utf8_lossy(raw)
+            .trim_end_matches('\0')
+            .to_string();
+        return Some(Some(path));
+    }
+    Some(None)
 }
